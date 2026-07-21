@@ -32,6 +32,11 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             OldX = WireGuard.ReadCoordinate(reader); OldY = WireGuard.ReadCoordinate(reader); OldZ = WireGuard.ReadCoordinate(reader);
             NewX = WireGuard.ReadCoordinate(reader); NewY = WireGuard.ReadCoordinate(reader); NewZ = WireGuard.ReadCoordinate(reader);
             RotX = WireGuard.ReadFinite(reader); RotY = WireGuard.ReadFinite(reader); RotZ = WireGuard.ReadFinite(reader); RotW = WireGuard.ReadFinite(reader);
+            float rotationLengthSq = RotX * RotX + RotY * RotY + RotZ * RotZ + RotW * RotW;
+            if (rotationLengthSq < 0.25f || rotationLengthSq > 2.25f)
+                throw new ProtocolException("Implausible move rotation length " + rotationLengthSq + ".");
+            if (reader.Remaining != 0)
+                throw new ProtocolException("Trailing bytes in object-move command: " + reader.Remaining + ".");
         }
 
         public byte[] Encode()

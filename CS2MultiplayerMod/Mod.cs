@@ -126,9 +126,18 @@ namespace CS2MultiplayerMod
             // that points channel, the local spend and the host's deduction keep pace whether
             // the game is paused or not.
             updateSystem.UpdateAt<Game.Sync.Systems.DevTreeSyncSystem>(SystemUpdatePhase.UIUpdate);
+            // The visual menu mutates render/building state directly and is usable while paused.
+            // Observe it after SelectedInfoUISystem so the resulting state is captured, not UI intent.
+            updateSystem.UpdateAfter<Game.Sync.Systems.VisualCustomizationSyncSystem,
+                global::Game.UI.InGame.SelectedInfoUISystem>(SystemUpdatePhase.UIUpdate);
             // Realization must run at ToolUpdate: definition entities are consumed at
             // Modification1 and their Updated tag is stripped at Cleanup, so a definition
             // spawned at ModificationEnd is never realized (see SyncRealizeSystem).
+            // Repair stranded movers at the front of ToolUpdate, before the default tool can
+            // hover/select an invalid legacy instance. The sweep is one-shot per world load and
+            // internally frame-budgeted for large cities.
+            updateSystem.UpdateBefore<Game.Sync.Systems.WorldRepairSystem>(
+                SystemUpdatePhase.ToolUpdate);
             // Complete remote terrain GPU readback at the very start of ToolUpdate, before a local
             // road/object tool can generate a preview from stale CPU heights.
             updateSystem.UpdateBefore<Game.Sync.Systems.TerrainReadbackBarrierSystem>(

@@ -44,6 +44,7 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
                 {
                     WarnThrottled("[MP] Dropping oversized command id " + command.CommandId +
                                   " body=" + command.Body.Length + " > " + MaxBodyBytes + ".");
+                    SyncInbox.RequestResync("oversized sync command rejected");
                     return;
                 }
                 SyncInbox.Push(_sink, command);

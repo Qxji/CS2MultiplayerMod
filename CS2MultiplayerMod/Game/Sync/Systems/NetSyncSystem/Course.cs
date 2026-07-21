@@ -219,7 +219,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// mirrors the minimum tool definition for fallback/system-captured curves. It always routes
         /// through Temp + ApplyTool so late contacts and splits cannot bypass native commit handling.
         /// </summary>
-        private void CreateCourse(Entity prefab, Bezier4x3 bez, float length,
+        private Entity CreateCourse(Entity prefab, Bezier4x3 bez, float length,
             Entity startSnap, float startT, Entity endSnap, float endT,
             float2 startElevation, float2 endElevation)
         {
@@ -228,137 +228,137 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // ApplyNetSystem crashes natively on a stale split reference, so drop to a fresh node. We
             // reject a target that no longer exists OR has been tagged Deleted (destruction in progress
             // but the entity still lingers) — the second half is the spam build↔bulldoze crash guard.
-            if (startSnap != Entity.Null && (!EntityManager.Exists(startSnap) || EntityManager.HasComponent<Deleted>(startSnap))) { startSnap = Entity.Null; startT = 0f; }
-            if (endSnap != Entity.Null && (!EntityManager.Exists(endSnap) || EntityManager.HasComponent<Deleted>(endSnap))) { endSnap = Entity.Null; endT = 0f; }
+            if (CourseTargetIsStale(startSnap)) { startSnap = Entity.Null; startT = 0f; }
+            if (CourseTargetIsStale(endSnap)) { endSnap = Entity.Null; endT = 0f; }
 
             Entity definition = EntityManager.CreateEntity();
-            EntityManager.AddComponentData(definition, new CreationDefinition
+            bool completed = false;
+            try
             {
-                m_Prefab = prefab,
-                // Seed from the (shared) geometry so procedural detail (wear/props) looks identical on
-                // every machine.
-                m_RandomSeed = math.asint(bez.a.x) ^ math.asint(bez.a.z) ^ math.asint(bez.d.x) ^ math.asint(bez.d.z),
-                // SubElevation matches the net tool's straight-line recipe (CreateStraightLine);
-                // without it the generated edge's sub-elevation isn't set up the way the game expects.
-                m_Flags = CreationFlags.SubElevation,
-            });
-            EntityManager.AddComponentData(definition, new NetCourse
+                EntityManager.AddComponentData(definition, new CreationDefinition
+                {
+                    m_Prefab = prefab,
+                    // Seed from the (shared) geometry so procedural detail (wear/props) looks identical on
+                    // every machine.
+                    m_RandomSeed = math.asint(bez.a.x) ^ math.asint(bez.a.z) ^ math.asint(bez.d.x) ^ math.asint(bez.d.z),
+                    // SubElevation matches the net tool's straight-line recipe (CreateStraightLine);
+                    // without it the generated edge's sub-elevation isn't set up the way the game expects.
+                    m_Flags = CreationFlags.SubElevation,
+                });
+                EntityManager.AddComponentData(definition, new NetCourse
+                {
+                    m_Curve = bez,
+                    m_Length = length,
+                    m_FixedIndex = -1,
+                    m_StartPosition = new CoursePos
+                    {
+                        m_Entity = startSnap,
+                        m_Position = bez.a,
+                        // Real node rotation from the curve tangent — the net tool uses GetNodeRotation, NOT
+                        // identity. A wrong node rotation yields an edge that renders but mis-connects.
+                        m_Rotation = NetUtils.GetNodeRotation(MathUtils.Tangent(bez, 0f)),
+                        // Height above/below the surface (see EndElevation) — the ONLY source of the
+                        // committed node's Game.Net.Elevation. Without it an elevated net (power line,
+                        // pipe, bridge) commits as a GROUND net at this Y: the ground terraforms up/down
+                        // to meet it and the prefab's poles stack on top of the already-raised curve.
+                        m_Elevation = startElevation,
+                        m_CourseDelta = 0f,
+                        m_SplitPosition = startT,
+                        // IsLeft|IsRight: a non-parallel single course occupies both sides (CreateStraightLine
+                        // sets these whenever m_ParallelCount is 0).
+                        m_Flags = CoursePosFlags.IsFirst | CoursePosFlags.IsLeft | CoursePosFlags.IsRight,
+                        m_ParentMesh = -1, // free-standing road, no owning object (0 is a valid mesh index!)
+                    },
+                    m_EndPosition = new CoursePos
+                    {
+                        m_Entity = endSnap,
+                        m_Position = bez.d,
+                        m_Rotation = NetUtils.GetNodeRotation(MathUtils.Tangent(bez, 1f)),
+                        m_Elevation = endElevation,
+                        m_CourseDelta = 1f,
+                        m_SplitPosition = endT,
+                        m_Flags = CoursePosFlags.IsLast | CoursePosFlags.IsLeft | CoursePosFlags.IsRight,
+                        m_ParentMesh = -1,
+                    },
+                });
+                EntityManager.AddComponent<Updated>(definition);
+                EntityManager.AddComponent<Deleted>(definition);
+                completed = true;
+                return definition;
+            }
+            finally
             {
-                m_Curve = bez,
-                m_Length = length,
-                m_FixedIndex = -1,
-                m_StartPosition = new CoursePos
-                {
-                    m_Entity = startSnap,
-                    m_Position = bez.a,
-                    // Real node rotation from the curve tangent — the net tool uses GetNodeRotation, NOT
-                    // identity. A wrong node rotation yields an edge that renders but mis-connects.
-                    m_Rotation = NetUtils.GetNodeRotation(MathUtils.Tangent(bez, 0f)),
-                    // Height above/below the surface (see EndElevation) — the ONLY source of the
-                    // committed node's Game.Net.Elevation. Without it an elevated net (power line,
-                    // pipe, bridge) commits as a GROUND net at this Y: the ground terraforms up/down
-                    // to meet it and the prefab's poles stack on top of the already-raised curve.
-                    m_Elevation = startElevation,
-                    m_CourseDelta = 0f,
-                    m_SplitPosition = startT,
-                    // IsLeft|IsRight: a non-parallel single course occupies both sides (CreateStraightLine
-                    // sets these whenever m_ParallelCount is 0).
-                    m_Flags = CoursePosFlags.IsFirst | CoursePosFlags.IsLeft | CoursePosFlags.IsRight,
-                    m_ParentMesh = -1, // free-standing road, no owning object (0 is a valid mesh index!)
-                },
-                m_EndPosition = new CoursePos
-                {
-                    m_Entity = endSnap,
-                    m_Position = bez.d,
-                    m_Rotation = NetUtils.GetNodeRotation(MathUtils.Tangent(bez, 1f)),
-                    m_Elevation = endElevation,
-                    m_CourseDelta = 1f,
-                    m_SplitPosition = endT,
-                    m_Flags = CoursePosFlags.IsLast | CoursePosFlags.IsLeft | CoursePosFlags.IsRight,
-                    m_ParentMesh = -1,
-                },
-            });
-            EntityManager.AddComponent<Updated>(definition);
-            EntityManager.AddComponent<Deleted>(definition);
-            ConstructionCharger.ChargeNet(EntityManager, prefab, length, _prefabSystem.GetPrefabName(prefab));
+                if (!completed && EntityManager.Exists(definition)) EntityManager.DestroyEntity(definition);
+            }
         }
 
         /// <summary>Create a Temp-routed definition from captured native course intent.</summary>
-        private void CreateNativeCourse(Entity prefab, NetPlacementCommand command, Bezier4x3 bez,
+        private Entity CreateNativeCourse(Entity prefab, NetPlacementCommand command, Bezier4x3 bez,
             Entity startSnap, float startT, int startKind,
             Entity endSnap, float endT, int endKind)
         {
-            if (startSnap != Entity.Null && (!EntityManager.Exists(startSnap) ||
-                EntityManager.HasComponent<Deleted>(startSnap))) startSnap = Entity.Null;
-            if (endSnap != Entity.Null && (!EntityManager.Exists(endSnap) ||
-                EntityManager.HasComponent<Deleted>(endSnap))) endSnap = Entity.Null;
+            if (CourseTargetIsStale(startSnap)) startSnap = Entity.Null;
+            if (CourseTargetIsStale(endSnap)) endSnap = Entity.Null;
 
             CreationFlags flags = (CreationFlags)command.CreationFlags;
-            // A placement transaction always creates a fresh course. Destructive/selection modes
-            // have dedicated sync systems and must never be smuggled through this command.
-            flags &= CreationFlags.Invert | CreationFlags.Align | CreationFlags.Hidden |
-                     CreationFlags.Optional | CreationFlags.Lowered | CreationFlags.Native |
-                     CreationFlags.Construction | CreationFlags.SubElevation;
-            flags |= CreationFlags.SubElevation;
 
-            NetPrefabInfo prefabInfo = NetInfoOf(prefab);
-            float2 courseElevation = ClampNativeElevation(prefabInfo,
-                new float2(command.CourseElevationLeft, command.CourseElevationRight));
+            float2 courseElevation =
+                new float2(command.CourseElevationLeft, command.CourseElevationRight);
 
-            Entity definition = EntityManager.CreateEntity();
             Entity subPrefab = Entity.Null;
             if (!string.IsNullOrEmpty(command.SubPrefabName) &&
                 !_prefabIndex.TryResolve(command.SubPrefabName, out subPrefab))
             {
-                EntityManager.DestroyEntity(definition);
                 throw new System.InvalidOperationException("Unknown net sub-prefab '" +
                                                            command.SubPrefabName + "'.");
             }
             if (subPrefab != Entity.Null && !EntityManager.HasComponent<NetLaneData>(subPrefab))
             {
-                EntityManager.DestroyEntity(definition);
                 throw new System.InvalidOperationException("Net sub-prefab '" +
                     command.SubPrefabName + "' is not a lane prefab.");
             }
-            EntityManager.AddComponentData(definition, new CreationDefinition
+            Entity definition = EntityManager.CreateEntity();
+            bool completed = false;
+            try
             {
-                m_Prefab = prefab,
-                m_SubPrefab = subPrefab,
-                m_RandomSeed = command.RandomSeed,
-                m_Flags = flags,
-            });
-            EntityManager.AddComponentData(definition, new NetCourse
+                EntityManager.AddComponentData(definition, new CreationDefinition
+                {
+                    m_Prefab = prefab,
+                    m_SubPrefab = subPrefab,
+                    m_RandomSeed = command.RandomSeed,
+                    m_Flags = flags,
+                });
+                EntityManager.AddComponentData(definition, new NetCourse
+                {
+                    m_Curve = bez,
+                    m_Elevation = courseElevation,
+                    m_Length = command.Length,
+                    m_FixedIndex = command.FixedIndex,
+                    m_StartPosition = MakeNativeCoursePos(command.Start, startSnap, startT, startKind),
+                    m_EndPosition = MakeNativeCoursePos(command.End, endSnap, endT, endKind),
+                });
+                EntityManager.AddComponent<Updated>(definition);
+                EntityManager.AddComponent<Deleted>(definition);
+                completed = true;
+                return definition;
+            }
+            finally
             {
-                m_Curve = bez,
-                m_Elevation = courseElevation,
-                m_Length = command.Length,
-                m_FixedIndex = command.FixedIndex,
-                m_StartPosition = MakeNativeCoursePos(command.Start, prefabInfo, startSnap, startT, startKind),
-                m_EndPosition = MakeNativeCoursePos(command.End, prefabInfo, endSnap, endT, endKind),
-            });
-            EntityManager.AddComponent<Updated>(definition);
-            EntityManager.AddComponent<Deleted>(definition);
-            if ((((CoursePosFlags)command.Start.Flags | (CoursePosFlags)command.End.Flags) &
-                 CoursePosFlags.DontCreate) == 0)
-            {
-                ConstructionCharger.ChargeNet(EntityManager, prefab, command.Length,
-                    _prefabSystem.GetPrefabName(prefab));
+                if (!completed && EntityManager.Exists(definition)) EntityManager.DestroyEntity(definition);
             }
         }
 
-        private static CoursePos MakeNativeCoursePos(NetEndpointIntent intent, NetPrefabInfo prefabInfo,
+        private static CoursePos MakeNativeCoursePos(NetEndpointIntent intent,
             Entity target, float resolvedT, int resolvedKind)
         {
-            float4 rotation = math.normalizesafe(
-                new float4(intent.RotX, intent.RotY, intent.RotZ, intent.RotW),
-                new float4(0f, 0f, 0f, 1f));
             return new CoursePos
             {
                 m_Entity = target,
                 m_Position = new float3(intent.PosX, intent.PosY, intent.PosZ),
-                m_Rotation = new quaternion(rotation),
-                m_Elevation = ClampNativeElevation(prefabInfo,
-                    new float2(intent.ElevationLeft, intent.ElevationRight)),
+                // The wire carries the source quaternion's exact float bits. Re-normalizing here
+                // perturbs those bits and gives different node orientation input to generation.
+                m_Rotation = new quaternion(intent.RotX, intent.RotY, intent.RotZ, intent.RotW),
+                m_Elevation = new float2(intent.ElevationLeft, intent.ElevationRight),
                 m_CourseDelta = intent.CourseDelta,
                 m_SplitPosition = resolvedKind == KindSplit ? resolvedT : intent.SplitPosition,
                 m_Flags = (CoursePosFlags)intent.Flags,
@@ -366,11 +366,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             };
         }
 
-        private static float2 ClampNativeElevation(NetPrefabInfo prefabInfo, float2 elevation)
+        private bool CourseTargetIsStale(Entity target)
         {
-            return prefabInfo.Placeable
-                ? math.clamp(elevation, new float2(prefabInfo.ElevMin), new float2(prefabInfo.ElevMax))
-                : elevation;
+            return target != Entity.Null &&
+                   (!EntityManager.Exists(target) || EntityManager.HasComponent<Deleted>(target) ||
+                    EntityManager.HasComponent<Node>(target) && IsNodeBeingDeleted(target));
+        }
+
+        private static bool NativeElevationIsValid(NetPrefabInfo prefabInfo, float2 elevation)
+        {
+            if (!math.all(math.isfinite(elevation))) return false;
+            if (!prefabInfo.Placeable) return true;
+            const float tolerance = 0.01f;
+            return math.all(elevation >= new float2(prefabInfo.ElevMin - tolerance)) &&
+                   math.all(elevation <= new float2(prefabInfo.ElevMax + tolerance));
         }
 
         /// <summary>

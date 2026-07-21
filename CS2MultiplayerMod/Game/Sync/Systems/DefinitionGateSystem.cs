@@ -61,6 +61,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // armed: the next Apply frame publishes this preview rather than inferring from
                 // its final Created edges.
                 _netSync.ObserveLocalNetDefinitions(definitions);
+                World.GetOrCreateSystemManaged<BuildSyncSystem>()
+                    .ObserveLocalObjectDefinitions(definitions);
 
                 if (!_netSync.HasArmedNetCommit) return;
                 for (int i = 0; i < definitions.Length; i++)

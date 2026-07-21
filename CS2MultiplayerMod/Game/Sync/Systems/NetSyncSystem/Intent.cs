@@ -21,8 +21,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
         /// <summary>
         /// Refresh the active net tool's cached course definitions. An empty steady-state frame keeps
-        /// the prior cache because a motionless preview does not necessarily regenerate definitions;
-        /// a Clear frame or a different active tool invalidates it.
+        /// the prior cache because a motionless preview does not necessarily regenerate definitions.
+        /// The net tool also uses Clear while replacing a moving cursor preview, so Clear by itself
+        /// is not cancellation and must not erase the last complete native operation. Switching away
+        /// from the net tool still invalidates it.
         /// </summary>
         public void ObserveLocalNetDefinitions(NativeArray<Entity> definitions)
         {
@@ -72,10 +74,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             {
                 _cachedLocalCourses.Clear();
                 _cachedLocalCourses.AddRange(next);
-            }
-            else if (active.applyMode == global::Game.Tools.ApplyMode.Clear)
-            {
-                _cachedLocalCourses.Clear();
             }
         }
 
@@ -146,9 +144,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
 
             _cachedLocalCourses.Clear();
-            if (sent > 0) _nativeApplyCapturedFrame = _realizeFrame;
+            // A partial native envelope is deliberately not considered captured. The receiver will
+            // expire those fragments as one incomplete operation, while final-edge capture remains
+            // enabled to provide a complete geometry fallback for this local apply.
+            if (sent == count) _nativeApplyCapturedFrame = _realizeFrame;
             if (sent > 0)
-                Diagnostics.FlightRecorder.Note("net intent apply op=" + operationId + " courses=" + sent);
+                Diagnostics.FlightRecorder.Note("net intent apply op=" + operationId + " courses=" +
+                                                  sent + "/" + count);
         }
 
         /// <summary>
@@ -179,17 +181,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (string.IsNullOrEmpty(prefabName) || prefabName.StartsWith("Invisible")) return null;
 
             Bezier4x3 curve = course.m_Curve;
-            return new NetPlacementCommand
+            var command = new NetPlacementCommand
             {
                 CourseIndex = 0,
                 CourseCount = 1,
                 HasNativeCourse = true,
                 PrefabName = prefabName,
                 SubPrefabName = PrefabNameOf(definition.m_SubPrefab),
-                Ax = curve.a.x, Ay = curve.a.y, Az = curve.a.z,
-                Bx = curve.b.x, By = curve.b.y, Bz = curve.b.z,
-                Cx = curve.c.x, Cy = curve.c.y, Cz = curve.c.z,
-                Dx = curve.d.x, Dy = curve.d.y, Dz = curve.d.z,
+                Ax = curve.a.x,
+                Ay = curve.a.y,
+                Az = curve.a.z,
+                Bx = curve.b.x,
+                By = curve.b.y,
+                Bz = curve.b.z,
+                Cx = curve.c.x,
+                Cy = curve.c.y,
+                Cz = curve.c.z,
+                Dx = curve.d.x,
+                Dy = curve.d.y,
+                Dz = curve.d.z,
                 Length = course.m_Length,
                 RandomSeed = definition.m_RandomSeed,
                 CreationFlags = (uint)definition.m_Flags,
@@ -199,6 +209,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 Start = CaptureEndpoint(course.m_StartPosition),
                 End = CaptureEndpoint(course.m_EndPosition),
             };
+            if ((command.Start.Kind == NetEndpointTargetKind.OwnedNode ||
+                 command.Start.Kind == NetEndpointTargetKind.OwnedEdge) &&
+                string.IsNullOrEmpty(command.Start.OwnerPrefabName)) return null;
+            if ((command.End.Kind == NetEndpointTargetKind.OwnedNode ||
+                 command.End.Kind == NetEndpointTargetKind.OwnedEdge) &&
+                string.IsNullOrEmpty(command.End.OwnerPrefabName)) return null;
+            return command;
         }
 
         private NetEndpointIntent CaptureEndpoint(CoursePos position)
@@ -229,9 +246,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             Entity target = position.m_Entity;
             if (target == Entity.Null || !EntityManager.Exists(target)) return result;
 
-            result.TargetPrefabName = EntityManager.HasComponent<PrefabRef>(target)
-                ? PrefabNameOf(EntityManager.GetComponentData<PrefabRef>(target).m_Prefab)
-                : null;
+            Entity targetPrefab = EntityManager.HasComponent<PrefabRef>(target)
+                ? EntityManager.GetComponentData<PrefabRef>(target).m_Prefab
+                : Entity.Null;
+            result.TargetPrefabName = PrefabNameOf(targetPrefab);
+            if (targetPrefab != Entity.Null && EntityManager.HasComponent<NetData>(targetPrefab))
+            {
+                NetData data = EntityManager.GetComponentData<NetData>(targetPrefab);
+                result.TargetRequiredLayers = (uint)data.m_RequiredLayers;
+                result.TargetConnectLayers = (uint)data.m_ConnectLayers;
+            }
 
             if (EntityManager.HasComponent<Node>(target))
             {
@@ -255,7 +279,35 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 result.TargetCx = targetCurve.c.x; result.TargetCy = targetCurve.c.y; result.TargetCz = targetCurve.c.z;
                 result.TargetDx = targetCurve.d.x; result.TargetDy = targetCurve.d.y; result.TargetDz = targetCurve.d.z;
             }
+            if (result.Kind == NetEndpointTargetKind.OwnedNode ||
+                result.Kind == NetEndpointTargetKind.OwnedEdge)
+                CaptureEndpointOwner(target, ref result);
             return result;
+        }
+
+        private void CaptureEndpointOwner(Entity target, ref NetEndpointIntent result)
+        {
+            Entity cursor = target;
+            Entity top = Entity.Null;
+            for (int depth = 0; depth < 64 && EntityManager.HasComponent<Owner>(cursor); depth++)
+            {
+                Entity next = EntityManager.GetComponentData<Owner>(cursor).m_Owner;
+                if (next == Entity.Null || next == cursor || !EntityManager.Exists(next)) return;
+                top = next;
+                cursor = next;
+            }
+            if (top == Entity.Null || !EntityManager.HasComponent<PrefabRef>(top) ||
+                !EntityManager.HasComponent<global::Game.Objects.Transform>(top)) return;
+            result.OwnerPrefabName = PrefabNameOf(EntityManager.GetComponentData<PrefabRef>(top).m_Prefab);
+            global::Game.Objects.Transform transform =
+                EntityManager.GetComponentData<global::Game.Objects.Transform>(top);
+            result.OwnerX = transform.m_Position.x;
+            result.OwnerY = transform.m_Position.y;
+            result.OwnerZ = transform.m_Position.z;
+            result.OwnerRotX = transform.m_Rotation.value.x;
+            result.OwnerRotY = transform.m_Rotation.value.y;
+            result.OwnerRotZ = transform.m_Rotation.value.z;
+            result.OwnerRotW = transform.m_Rotation.value.w;
         }
 
         private string PrefabNameOf(Entity prefab)
@@ -267,7 +319,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
         private void RecordPlacementOriginals(long now)
         {
-            NativeArray<Entity> temps = _tempNetEntities.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> temps = _netTransactionTemps.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < temps.Length; i++)

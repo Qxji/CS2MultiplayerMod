@@ -11,8 +11,8 @@ using CS2MultiplayerMod.Game.Sync.Infrastructure;
 namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 {
     // Commit orchestration for NetSyncSystem. Remote net Temps are applied through the net domain
-    // alone; local net and brush previews are temporarily Disabled so an unrelated tool can remain
-    // selected without either transaction consuming the other one's entities.
+    // alone; the complete local preview graph is temporarily Disabled so an unrelated tool can
+    // remain selected without either transaction consuming the other one's entities.
     public partial class NetSyncSystem
     {
         /// <summary>How long an armed batch may wait for its commit before it is discarded and re-queued.</summary>
@@ -33,6 +33,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // Last frame's commit-frame capture skip has served its purpose (the one-frame
             // Created tags it targeted are gone); a commit this frame re-sets it below.
             _suppressCaptureThisFrame = false;
+            _objectCommitThisFrame = false;
             ProtectRemoteBatchForLocalToolOutput();
         }
 
@@ -44,6 +45,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         public bool HasArmedNetCommit => _pendingApply;
 
+        /// <summary>True only on the ToolUpdate frame an isolated object graph was committed.</summary>
+        public bool DidCommitObjectGraphThisFrame => _objectCommitThisFrame;
+
         /// <summary>
         /// Called by <see cref="SyncRealizeSystem"/> during the ToolUpdate phase, where the
         /// NetCourse definition is consumed by <c>GenerateNodesSystem</c>/<c>GenerateEdgesSystem</c>
@@ -53,18 +57,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         public void RealizePending()
         {
             // Definitions created on the prior ToolUpdate have now become remote Temp net entities.
-            // A quiet local-tool frame applies only that enabled net set. On a local Apply/Clear frame,
-            // BeginRealizeFrame protected the remote set instead and this transaction waits intact.
+            // A quiet/preview-clear frame applies only that enabled net set. On a local Apply frame,
+            // BeginRealizeFrame protects the remote set instead and this transaction waits intact.
             if (_pendingApply && !_localToolOutputProtectedThisFrame)
             {
-                int isolatedCount = _tempNetEntities.CalculateEntityCount();
-                if (isolatedCount > 0 && ArmedBatchReferencesVanishedOriginal())
+                EntityQuery transactionQuery = ActiveTransactionQuery();
+                int isolatedCount = transactionQuery.CalculateEntityCount();
+                string invalidReason;
+                bool valid = _pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph
+                    ? ValidateArmedObjectTransaction(out invalidReason)
+                    : ValidateArmedNetTransaction(out invalidReason);
+                if (isolatedCount > 0 && !valid)
                 {
-                    InvalidateArmedBatch("a referenced original vanished between arm and commit", isolatedCount);
+                    InvalidateArmedBatch(invalidReason, isolatedCount);
                 }
                 else if (isolatedCount > 0)
                 {
-                    CommitRemoteNetTemps(isolatedCount);
+                    CommitRemoteTemps(transactionQuery, isolatedCount);
                 }
                 else if (System.Environment.TickCount - _armTick > ApplyWindowMs)
                 {
@@ -76,16 +85,27 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 _drainFrames++;
                 if (!CommittedRemoteTempsRemain())
                 {
+                    ChargeCommittedNetConstruction();
                     _committingRemoteNetTemps.Clear();
                     _awaitingDrain = false;
+                    _committingTransactionKind = RemoteToolTransactionKind.None;
+                    System.Action completed = _onCommitComplete;
+                    _onCommitComplete = null;
+                    if (completed != null) completed();
+                    Diagnostics.FlightRecorder.Note("remote transaction drain completed");
                 }
                 else if (System.Environment.TickCount - _drainArmTick > DrainWindowMs)
                 {
                     ClearTrackedTemps(_committingRemoteNetTemps, clearPreview: true);
                     _committingRemoteNetTemps.Clear();
+                    _committingNetConstructionCharge = 0;
+                    _committingNetConstructionChargeCourses = 0;
                     _awaitingDrain = false;
+                    _committingTransactionKind = RemoteToolTransactionKind.None;
+                    _onCommitComplete = null;
                     Mod.log.Warn("[MP] NetApply: isolated remote commit did not drain; stale Temps cleared.");
                     Diagnostics.FlightRecorder.Note("net isolated commit did not drain; stale temps cleared");
+                    SyncInbox.RequestResync("remote transaction failed to drain");
                 }
             }
 
@@ -113,8 +133,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         public bool HasPlacementBacklog => !_incoming.IsEmpty || _remoteDeferred.Count > 0 || IsCommitBusy;
 
         /// <summary>
-        /// True when a feeder may create Temp-backed work. An interactive tool may stay selected;
-        /// only its actual Apply/Clear frame gets priority. Quiet preview frames are isolated below.
+        /// True when a feeder may create Temp-backed work. An interactive tool may stay selected and
+        /// may continuously regenerate/clear its preview; only an actual city Apply gets priority.
         /// </summary>
         public bool CanBuildDefinitions
         {
@@ -122,25 +142,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             {
                 if (_pendingApply || _awaitingDrain) return false;
                 global::Game.Tools.ToolBaseSystem tool = _toolSystem != null ? _toolSystem.activeTool : null;
+                // Clear is preview maintenance/cancellation, not a permanent city edit. Net tools
+                // use it repeatedly while the cursor moves, so blocking here would starve remote
+                // roads until the other player stopped drawing. Only an actual Apply gets priority.
                 return tool == null || tool is global::Game.Tools.DefaultToolSystem ||
-                       tool.applyMode == global::Game.Tools.ApplyMode.None;
+                       tool.applyMode != global::Game.Tools.ApplyMode.Apply;
             }
         }
 
         /// <summary>
-        /// Isolate the local net portion of the active preview before remote definitions materialise.
-        /// Disabled preview entities are excluded from generation and from the isolated remote apply;
-        /// other preview domains remain visible and untouched.
+        /// Isolate the complete active preview before remote definitions materialise. A building or
+        /// network preview may span object, node, edge, and lane entities owned by one another; it
+        /// must be frozen and restored as a unit.
         /// </summary>
         public void PrepareDefinitionFrame()
         {
             if (_prepDoneThisFrame) return;
             _prepDoneThisFrame = true;
 
-            if (_isolatedLocalNetTemps.Count > 0) ReleaseTrackedTemps(_isolatedLocalNetTemps);
-            DisableQueryEntities(_tempNetEntities, _isolatedLocalNetTemps);
-            if (_isolatedLocalNetTemps.Count > 0)
-                Diagnostics.FlightRecorder.Note("net preview isolated=" + _isolatedLocalNetTemps.Count);
+            if (_isolatedLocalTemps.Count > 0) ReleaseTrackedTemps(_isolatedLocalTemps);
+            DisableQueryEntities(_standingTemps, _isolatedLocalTemps);
+            if (_isolatedLocalTemps.Count > 0)
+                Diagnostics.FlightRecorder.Note("tool preview isolated=" + _isolatedLocalTemps.Count);
         }
 
         private void DisableQueryEntities(EntityQuery query, List<Entity> destination)
@@ -193,7 +216,27 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 !EntityManager.HasComponent<Temp>(e)) return false;
 
             Temp temp = EntityManager.GetComponentData<Temp>(e);
-            if (temp.m_Original != Entity.Null && EntityManager.Exists(temp.m_Original)
+            bool handledSubObject = false;
+            Entity owner = Entity.Null;
+            if (EntityManager.HasComponent<Owner>(e))
+            {
+                owner = EntityManager.GetComponentData<Owner>(e).m_Owner;
+                handledSubObject = EntityManager.HasComponent<Lane>(e) ||
+                    (EntityManager.HasComponent<global::Game.Objects.Object>(e) &&
+                     !EntityManager.HasComponent<global::Game.Vehicles.Vehicle>(e) &&
+                     !EntityManager.HasComponent<global::Game.Creatures.Creature>(e) &&
+                     !EntityManager.HasComponent<global::Game.Buildings.Building>(e) &&
+                     !EntityManager.HasComponent<global::Game.Buildings.ServiceUpgrade>(e));
+            }
+
+            // Match the normal tool-clear ownership rule. Non-essential lane/object children of a
+            // Temp owner are removed with that owner; independently tagging both sides can make
+            // cleanup process the child after its ownership graph has already vanished.
+            bool deleteEntity = !handledSubObject || (temp.m_Flags & TempFlags.Essential) != 0 ||
+                                owner == Entity.Null || !EntityManager.Exists(owner) ||
+                                !EntityManager.HasComponent<Temp>(owner);
+
+            if (deleteEntity && temp.m_Original != Entity.Null && EntityManager.Exists(temp.m_Original)
                 && EntityManager.HasComponent<Hidden>(temp.m_Original))
             {
                 EntityManager.RemoveComponent<Hidden>(temp.m_Original);
@@ -220,8 +263,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     elements.Dispose();
                 }
             }
-            EntityManager.AddComponent<Deleted>(e);
-            return true;
+            if (deleteEntity) EntityManager.AddComponent<Deleted>(e);
+            return deleteEntity;
         }
 
         /// <summary>
@@ -255,51 +298,31 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (!_pendingApply) return;
 
             global::Game.Tools.ToolBaseSystem tool = _toolSystem != null ? _toolSystem.activeTool : null;
-            if (tool == null || (tool.applyMode != global::Game.Tools.ApplyMode.Apply &&
-                                 tool.applyMode != global::Game.Tools.ApplyMode.Clear)) return;
+            if (tool == null || tool.applyMode != global::Game.Tools.ApplyMode.Apply) return;
 
             _protectedRemoteNetTemps.Clear();
-            DisableQueryEntities(_tempNetEntities, _protectedRemoteNetTemps);
-            ReleaseLocalNetTempsForTool(tool);
+            DisableQueryEntities(ActiveTransactionQuery(), _protectedRemoteNetTemps);
+            // A local Apply owns its complete standing preview, regardless of the selected
+            // tool. Releasing only the road-shaped portion can commit a building without its owned
+            // driveway, or clear a subnet while leaving its owner behind.
+            ReleaseTrackedTemps(_isolatedLocalTemps);
             _localToolOutputProtectedThisFrame = true;
             Diagnostics.FlightRecorder.Note("net remote batch protected for local " + tool.applyMode +
                 " (remote=" + _protectedRemoteNetTemps.Count + ")");
         }
 
-        private void ReleaseLocalNetTempsForTool(global::Game.Tools.ToolBaseSystem tool)
-        {
-            if (tool is global::Game.Tools.NetToolSystem)
-            {
-                ReleaseTrackedTemps(_isolatedLocalNetTemps);
-                return;
-            }
-            if (!(tool is global::Game.Tools.BulldozeToolSystem)) return;
+        private EntityQuery ActiveTransactionQuery() =>
+            _pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph
+                ? _objectTransactionTemps : _netTransactionTemps;
 
-            // A bulldozer Apply/Clear only owns delete previews. A disabled create/replace preview
-            // can be left behind by a prior road tool and must not ride along with this click.
-            for (int i = _isolatedLocalNetTemps.Count - 1; i >= 0; i--)
-            {
-                Entity entity = _isolatedLocalNetTemps[i];
-                if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<Temp>(entity))
-                {
-                    _isolatedLocalNetTemps.RemoveAt(i);
-                    continue;
-                }
-                Temp temp = EntityManager.GetComponentData<Temp>(entity);
-                if ((temp.m_Flags & TempFlags.Delete) == 0) continue;
-                if (EntityManager.HasComponent<Disabled>(entity))
-                    EntityManager.RemoveComponent<Disabled>(entity);
-                _isolatedLocalNetTemps.RemoveAt(i);
-            }
-        }
-
-        private void CommitRemoteNetTemps(int count)
+        private void CommitRemoteTemps(EntityQuery transactionQuery, int count)
         {
             MultiplayerService currentService = Mod.Service;
-            RecordPlacementOriginals(currentService != null ? currentService.NowMs : 0);
+            if (_pendingTransactionKind == RemoteToolTransactionKind.Net)
+                RecordPlacementOriginals(currentService != null ? currentService.NowMs : 0);
 
             _committingRemoteNetTemps.Clear();
-            NativeArray<Entity> remoteTemps = _tempNetEntities.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> remoteTemps = transactionQuery.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < remoteTemps.Length; i++)
@@ -312,7 +335,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
             try
             {
-                _applyNetSystem.Update();
+                if (_pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph)
+                {
+                    // Preserve the native ApplyTool domain order. Owner resolution in the object
+                    // pass must run before its owned connector nets and lot areas are committed.
+                    _applyObjectsSystem.Update();
+                    _applyNetSystem.Update();
+                    _applyAreasSystem.Update();
+                    _objectCommitThisFrame = true;
+                }
+                else
+                {
+                    _applyNetSystem.Update();
+                }
             }
             catch (System.Exception ex)
             {
@@ -322,9 +357,34 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 return;
             }
 
+            // A moving tool commonly drives the global Clear pass every frame to replace its
+            // preview. The isolated apply jobs have already consumed this remote graph; hide it
+            // until ToolOutputBarrier so the later generic clear cannot cancel the same transaction.
+            global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
+            if (active != null && active.applyMode == global::Game.Tools.ApplyMode.Clear)
+            {
+                _protectedRemoteNetTemps.Clear();
+                for (int i = 0; i < _committingRemoteNetTemps.Count; i++)
+                {
+                    Entity entity = _committingRemoteNetTemps[i];
+                    if (!EntityManager.Exists(entity) || EntityManager.HasComponent<Disabled>(entity))
+                        continue;
+                    EntityManager.AddComponent<Disabled>(entity);
+                    _protectedRemoteNetTemps.Add(entity);
+                }
+                Diagnostics.FlightRecorder.Note("net commit shielded from preview clear temps=" +
+                                                  _protectedRemoteNetTemps.Count);
+            }
+
             _pendingApply = false;
+            _committingTransactionKind = _pendingTransactionKind;
+            _pendingTransactionKind = RemoteToolTransactionKind.None;
+            _committingNetConstructionCharge = _pendingNetConstructionCharge;
+            _committingNetConstructionChargeCourses = _pendingNetConstructionChargeCourses;
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
             _onCommitLost = null;
-            _expiryReplays = 0;
+            _applyReplayBudget.Reset();
             _awaitingDrain = true;
             _drainArmTick = System.Environment.TickCount;
             _drainFrames = 0;
@@ -348,24 +408,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             _pendingApply = false;
             _awaitingDrain = false;
-            if (count > 0) DiscardStaleNetTemps(reason);
-            ReleaseTrackedTemps(_isolatedLocalNetTemps);
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
+            if (count > 0) DiscardStaleTransactionTemps(reason);
+            _pendingTransactionKind = RemoteToolTransactionKind.None;
+            _committingTransactionKind = RemoteToolTransactionKind.None;
+            ReleaseTrackedTemps(_isolatedLocalTemps);
 
             System.Action replay = _onCommitLost;
             _onCommitLost = null;
-            if (replay != null && _expiryReplays < 3)
+            _onCommitComplete = null;
+            if (replay != null && _applyReplayBudget.TryConsume())
             {
-                _expiryReplays++;
                 Mod.log.Warn("[MP] NetApply: " + reason + "; re-queueing batch (attempt " +
-                             _expiryReplays + "/3).");
-                Diagnostics.FlightRecorder.Note("net batch invalidated; replay " + _expiryReplays + "/3");
+                             _applyReplayBudget.AttemptsUsed + "/" +
+                             _applyReplayBudget.MaximumAttempts + ").");
+                Diagnostics.FlightRecorder.Note("net batch invalidated; replay " +
+                    _applyReplayBudget.AttemptsUsed + "/" + _applyReplayBudget.MaximumAttempts);
                 replay();
             }
             else
             {
                 Mod.log.Warn("[MP] NetApply: " + reason + "; batch dropped" +
-                             (replay != null ? " after " + _expiryReplays + " replays." : "."));
+                             (replay != null ? " after " + _applyReplayBudget.AttemptsUsed +
+                                               " replays." : "."));
                 Diagnostics.FlightRecorder.Note("net batch invalidated; dropped");
+                SyncInbox.RequestResync("remote transaction exhausted bounded replays");
             }
         }
 
@@ -377,8 +445,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
             if (_clearLocalNetIsolationAfterBarrier)
             {
-                int cleared = ClearTrackedTemps(_isolatedLocalNetTemps, clearPreview: true);
-                _isolatedLocalNetTemps.Clear();
+                int cleared = ClearTrackedTemps(_isolatedLocalTemps, clearPreview: true);
+                _isolatedLocalTemps.Clear();
                 _clearLocalNetIsolationAfterBarrier = false;
                 if (cleared > 0) ForceActiveToolUpdate();
             }
@@ -393,7 +461,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private void ReleaseAllIsolation()
         {
             ReleaseTrackedTemps(_protectedRemoteNetTemps);
-            ReleaseTrackedTemps(_isolatedLocalNetTemps);
+            ReleaseTrackedTemps(_isolatedLocalTemps);
             ReleaseTrackedTemps(_isolatedLocalBrushTemps);
             _localToolOutputProtectedThisFrame = false;
             _clearLocalNetIsolationAfterBarrier = false;
@@ -404,9 +472,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             get
             {
                 if (_pendingApply || _awaitingDrain) return false;
-                global::Game.Tools.ToolBaseSystem tool = _toolSystem != null ? _toolSystem.activeTool : null;
-                return tool == null || tool is global::Game.Tools.DefaultToolSystem ||
-                       tool.applyMode == global::Game.Tools.ApplyMode.None;
+                // Match ToolOutputSystem's own dispatch source. Clear only cleans Temp previews and
+                // is safe after the isolated brush pass; Apply would run ApplyBrushesSystem again.
+                return _toolSystem == null ||
+                       _toolSystem.applyMode != global::Game.Tools.ApplyMode.Apply;
             }
         }
 
@@ -417,39 +486,489 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         /// <summary>
-        /// True when any live net Temp references an original entity that no longer exists or is
-        /// being torn down. Split targets and reuse nodes were resolved when the batch was built —
-        /// a frame before the commit — and ApplyNetSystem dereferences originals unchecked, so a
-        /// batch this has gone stale under must be discarded, never committed. Runs only on frames
-        /// with an armed commit; cost is a component read per standing Temp.
+        /// Validate the exact union consumed by the object, net, and area apply passes. The checks
+        /// intentionally run on the main thread immediately before scheduling those jobs because
+        /// their observed runtime behaviour assumes owner/original/buffer references are live.
         /// </summary>
-        private bool ArmedBatchReferencesVanishedOriginal()
+        private bool ValidateArmedObjectTransaction(out string reason)
         {
-            NativeArray<Entity> temps = _tempNetEntities.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> temps = _objectTransactionTemps.ToEntityArray(Allocator.Temp);
             try
             {
+                if (temps.Length == 0)
+                {
+                    reason = "the generated object transaction was empty";
+                    return false;
+                }
+
+                var members = new HashSet<Entity>();
                 for (int i = 0; i < temps.Length; i++)
                 {
-                    if (!EntityManager.HasComponent<Temp>(temps[i])) continue;
-                    Entity original = EntityManager.GetComponentData<Temp>(temps[i]).m_Original;
-                    if (original == Entity.Null) continue;
-                    if (!EntityManager.Exists(original) || EntityManager.HasComponent<Deleted>(original))
-                        return true;
+                    Entity entity = temps[i];
+                    if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<Temp>(entity) ||
+                        EntityManager.HasComponent<Deleted>(entity) ||
+                        EntityManager.HasComponent<Disabled>(entity))
+                    {
+                        reason = "the generated object transaction became partial before commit";
+                        return false;
+                    }
+                    members.Add(entity);
                 }
+
+                int objectRoots = 0;
+                for (int i = 0; i < temps.Length; i++)
+                {
+                    Entity entity = temps[i];
+                    Temp temp = EntityManager.GetComponentData<Temp>(entity);
+                    bool isObject = EntityManager.HasComponent<global::Game.Objects.Object>(entity);
+                    bool isNode = EntityManager.HasComponent<Node>(entity);
+                    bool isEdge = EntityManager.HasComponent<Edge>(entity);
+                    bool isLane = EntityManager.HasComponent<Lane>(entity);
+                    bool isAggregate = EntityManager.HasComponent<Aggregate>(entity);
+                    bool isArea = EntityManager.HasComponent<global::Game.Areas.Area>(entity);
+                    if (!isObject && !isNode && !isEdge && !isLane && !isAggregate && !isArea)
+                    {
+                        reason = "the generated object transaction contains an unsupported Temp shape";
+                        return false;
+                    }
+
+                    if (!ValidateTransactionOwner(entity, members, out reason)) return false;
+                    if (!ValidateOwnedBuffers(entity, members, out reason)) return false;
+
+                    if (isObject)
+                    {
+                        if (!EntityManager.HasComponent<Owner>(entity) ||
+                            !members.Contains(EntityManager.GetComponentData<Owner>(entity).m_Owner))
+                            objectRoots++;
+                        if ((temp.m_Flags & TempFlags.Delete) == 0 &&
+                            !ValidateObjectPrefabReference(entity, out reason)) return false;
+                        if (!ValidateObjectOriginal(temp, out reason)) return false;
+                        if (!ValidateAttachment(entity, members, out reason)) return false;
+                    }
+
+                    if (isNode || isEdge)
+                    {
+                        if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge, out reason))
+                            return false;
+                        if (isNode && !ValidateTempNode(entity, temp, out reason)) return false;
+                        if (isEdge && !ValidateTempEdge(entity, temp, members, out reason)) return false;
+                    }
+
+                    if (isArea && !ValidateAreaEntity(entity, temp, out reason)) return false;
+
+                    bool missingReplacementOriginal =
+                        isEdge && (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) != 0 ||
+                        isLane && (temp.m_Flags & TempFlags.Replace) != 0;
+                    if (missingReplacementOriginal && temp.m_Original == Entity.Null)
+                    {
+                        reason = "a generated object-graph replacement has no original entity";
+                        return false;
+                    }
+                }
+
+                if (objectRoots == 0)
+                {
+                    reason = "the generated object transaction has no top-level object";
+                    return false;
+                }
+
+                reason = null;
+                Diagnostics.FlightRecorder.Note("object transaction validated temps=" + temps.Length);
+                return true;
             }
             finally
             {
                 temps.Dispose();
             }
-            return false;
         }
 
-        private void DiscardStaleNetTemps(string why)
+        private bool ValidateObjectPrefabReference(Entity entity, out string reason)
         {
-            int cleared = ClearTempEntities(_tempNetEntities);
+            reason = null;
+            if (!EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(entity))
+            {
+                reason = "a generated object has no prefab reference";
+                return false;
+            }
+            Entity prefab = EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(entity).m_Prefab;
+            if (prefab == Entity.Null || !EntityManager.Exists(prefab) ||
+                !EntityManager.HasComponent<global::Game.Prefabs.PrefabData>(prefab) ||
+                !EntityManager.HasComponent<global::Game.Prefabs.ObjectData>(prefab))
+            {
+                reason = "a generated object references an invalid object prefab";
+                return false;
+            }
+            return true;
+        }
+
+        private bool ValidateObjectOriginal(Temp temp, out string reason)
+        {
+            reason = null;
+            if (temp.m_Original == Entity.Null) return true;
+            Entity original = temp.m_Original;
+            if (!EntityManager.Exists(original) || EntityManager.HasComponent<Deleted>(original) ||
+                EntityManager.HasComponent<Temp>(original) ||
+                !EntityManager.HasComponent<global::Game.Objects.Object>(original))
+            {
+                reason = "an object definition references a stale or non-object original";
+                return false;
+            }
+            return ValidateOwnedBuffers(original, null, out reason);
+        }
+
+        private bool ValidateAttachment(Entity entity, HashSet<Entity> members, out string reason)
+        {
+            reason = null;
+            if (!EntityManager.HasComponent<global::Game.Objects.Attached>(entity)) return true;
+            global::Game.Objects.Attached attached =
+                EntityManager.GetComponentData<global::Game.Objects.Attached>(entity);
+            return ValidateLiveOrMemberReference(attached.m_Parent, members, "attachment parent", out reason) &&
+                   ValidateLiveOrMemberReference(attached.m_OldParent, members, "old attachment parent", out reason);
+        }
+
+        private bool ValidateAreaEntity(Entity entity, Temp temp, out string reason)
+        {
+            reason = null;
+            if ((temp.m_Flags & TempFlags.Delete) == 0)
+            {
+                if (!EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(entity))
+                {
+                    reason = "a generated area has no prefab reference";
+                    return false;
+                }
+                Entity prefab = EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(entity).m_Prefab;
+                if (prefab == Entity.Null || !EntityManager.Exists(prefab) ||
+                    !EntityManager.HasComponent<global::Game.Prefabs.AreaData>(prefab) ||
+                    !EntityManager.HasBuffer<global::Game.Areas.Node>(entity))
+                {
+                    reason = "a generated area is missing prefab or node data";
+                    return false;
+                }
+            }
+            if (temp.m_Original != Entity.Null &&
+                (!EntityManager.Exists(temp.m_Original) ||
+                 EntityManager.HasComponent<Deleted>(temp.m_Original) ||
+                 !EntityManager.HasComponent<global::Game.Areas.Area>(temp.m_Original) ||
+                 !EntityManager.HasBuffer<global::Game.Areas.Node>(temp.m_Original)))
+            {
+                reason = "an area definition references a stale original";
+                return false;
+            }
+            return true;
+        }
+
+        private bool ValidateOwnedBuffers(Entity entity, HashSet<Entity> members, out string reason)
+        {
+            reason = null;
+            if (EntityManager.HasBuffer<global::Game.Objects.SubObject>(entity))
+            {
+                DynamicBuffer<global::Game.Objects.SubObject> buffer =
+                    EntityManager.GetBuffer<global::Game.Objects.SubObject>(entity, isReadOnly: true);
+                for (int i = 0; i < buffer.Length; i++)
+                    if (!ValidateLiveOrMemberReference(buffer[i].m_SubObject, members,
+                            "SubObject", out reason)) return false;
+            }
+            if (EntityManager.HasBuffer<global::Game.Net.SubNet>(entity))
+            {
+                DynamicBuffer<global::Game.Net.SubNet> buffer =
+                    EntityManager.GetBuffer<global::Game.Net.SubNet>(entity, isReadOnly: true);
+                for (int i = 0; i < buffer.Length; i++)
+                    if (!ValidateLiveOrMemberReference(buffer[i].m_SubNet, members,
+                            "SubNet", out reason)) return false;
+            }
+            if (EntityManager.HasBuffer<global::Game.Areas.SubArea>(entity))
+            {
+                DynamicBuffer<global::Game.Areas.SubArea> buffer =
+                    EntityManager.GetBuffer<global::Game.Areas.SubArea>(entity, isReadOnly: true);
+                for (int i = 0; i < buffer.Length; i++)
+                    if (!ValidateLiveOrMemberReference(buffer[i].m_Area, members,
+                            "SubArea", out reason)) return false;
+            }
+            return true;
+        }
+
+        private bool ValidateLiveOrMemberReference(Entity referenced, HashSet<Entity> members,
+            string label, out string reason)
+        {
+            reason = null;
+            if (referenced == Entity.Null) return true;
+            if (!EntityManager.Exists(referenced) || EntityManager.HasComponent<Deleted>(referenced))
+            {
+                reason = label + " contains a stale entity reference";
+                return false;
+            }
+            if (EntityManager.HasComponent<Temp>(referenced) &&
+                (members == null || !members.Contains(referenced) ||
+                 EntityManager.HasComponent<Disabled>(referenced)))
+            {
+                reason = label + " points outside the enabled transaction";
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Verify the complete generated net transaction immediately before scheduling its apply.
+        /// Split targets and reuse nodes were resolved a frame earlier; a concurrent local edit may
+        /// have invalidated an original, endpoint, owner, or connectivity buffer in the meantime.
+        /// Partial work is discarded and rebuilt rather than passed to an unchecked apply path.
+        /// </summary>
+        private bool ValidateArmedNetTransaction(out string reason)
+        {
+            NativeArray<Entity> temps = _netTransactionTemps.ToEntityArray(Allocator.Temp);
+            try
+            {
+                if (temps.Length == 0)
+                {
+                    reason = "the generated net transaction was empty";
+                    return false;
+                }
+
+                var members = new HashSet<Entity>();
+                for (int i = 0; i < temps.Length; i++)
+                {
+                    Entity entity = temps[i];
+                    if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<Temp>(entity) ||
+                        EntityManager.HasComponent<Deleted>(entity) ||
+                        EntityManager.HasComponent<Disabled>(entity))
+                    {
+                        reason = "the generated net transaction became partial before commit";
+                        return false;
+                    }
+                    members.Add(entity);
+                }
+
+                int structuralEntities = 0;
+                for (int i = 0; i < temps.Length; i++)
+                {
+                    Entity entity = temps[i];
+                    Temp temp = EntityManager.GetComponentData<Temp>(entity);
+                    bool isNode = EntityManager.HasComponent<Node>(entity);
+                    bool isEdge = EntityManager.HasComponent<Edge>(entity);
+                    bool isLane = EntityManager.HasComponent<Lane>(entity);
+                    bool isAggregate = EntityManager.HasComponent<Aggregate>(entity);
+                    if (!isNode && !isEdge && !isLane && !isAggregate)
+                    {
+                        reason = "the generated net transaction contains an unknown entity shape";
+                        return false;
+                    }
+                    if (isNode || isEdge) structuralEntities++;
+
+                    if (!ValidateTransactionOwner(entity, members, out reason)) return false;
+                    if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge, out reason)) return false;
+                    if (isNode && !ValidateTempNode(entity, temp, out reason)) return false;
+                    if (isEdge && !ValidateTempEdge(entity, temp, members, out reason)) return false;
+
+                    bool missingReplacementOriginal =
+                        isEdge && (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) != 0 ||
+                        isLane && (temp.m_Flags & TempFlags.Replace) != 0;
+                    if (missingReplacementOriginal && temp.m_Original == Entity.Null)
+                    {
+                        reason = "a generated replacement has no original entity";
+                        return false;
+                    }
+                }
+
+                if (structuralEntities == 0)
+                {
+                    reason = "the generated net transaction has no node/edge root";
+                    return false;
+                }
+
+                reason = null;
+                return true;
+            }
+            finally
+            {
+                temps.Dispose();
+            }
+        }
+
+        private bool ValidateTransactionOwner(Entity entity, HashSet<Entity> members, out string reason)
+        {
+            reason = null;
+            if (!EntityManager.HasComponent<Owner>(entity)) return true;
+
+            Entity owner = EntityManager.GetComponentData<Owner>(entity).m_Owner;
+            if (owner == Entity.Null || !EntityManager.Exists(owner) ||
+                EntityManager.HasComponent<Deleted>(owner))
+            {
+                reason = "a generated net entity has a missing owner";
+                return false;
+            }
+            if (EntityManager.HasComponent<Temp>(owner) &&
+                (!members.Contains(owner) || EntityManager.HasComponent<Disabled>(owner)))
+            {
+                reason = "a generated net entity is separated from its Temp owner";
+                return false;
+            }
+            return true;
+        }
+
+        private bool ValidateTransactionOriginal(Entity entity, Temp temp, bool isNode, bool isEdge,
+            out string reason)
+        {
+            reason = null;
+            Entity original = temp.m_Original;
+            if (original == Entity.Null) return true;
+            if (!EntityManager.Exists(original) || EntityManager.HasComponent<Deleted>(original) ||
+                EntityManager.HasComponent<Temp>(original))
+            {
+                reason = "a referenced original vanished between arm and commit";
+                return false;
+            }
+            if (isNode && (!EntityManager.HasComponent<Node>(original) || IsNodeBeingDeleted(original)))
+            {
+                reason = "a referenced original node is being torn down";
+                return false;
+            }
+            if (isEdge && !EntityManager.HasComponent<Edge>(original))
+            {
+                reason = "a generated edge references a non-edge original";
+                return false;
+            }
+
+            bool updatesOriginal = (temp.m_Flags & (TempFlags.Delete | TempFlags.Replace |
+                                                    TempFlags.Combine)) == 0;
+            if (updatesOriginal && (isNode || isEdge) &&
+                !ValidateNetPrefabReference(entity, out reason)) return false;
+
+            // The connectivity repair pass reads every edge referenced by an updated node without
+            // checking whether the entity still carries Edge.
+            if (isNode && updatesOriginal && EntityManager.HasBuffer<ConnectedEdge>(original))
+            {
+                DynamicBuffer<ConnectedEdge> edges =
+                    EntityManager.GetBuffer<ConnectedEdge>(original, isReadOnly: true);
+                for (int i = 0; i < edges.Length; i++)
+                {
+                    Entity edge = edges[i].m_Edge;
+                    if (!EntityManager.Exists(edge) || !EntityManager.HasComponent<Edge>(edge))
+                    {
+                        reason = "an original node contains a stale connected-edge reference";
+                        return false;
+                    }
+                }
+            }
+
+            if (isEdge && updatesOriginal &&
+                !EntityManager.HasBuffer<ConnectedNode>(original))
+            {
+                reason = "an original edge has no connected-node buffer";
+                return false;
+            }
+            return true;
+        }
+
+        private bool ValidateTempNode(Entity entity, Temp temp, out string reason)
+        {
+            reason = null;
+            if ((temp.m_Flags & TempFlags.Delete) == 0 &&
+                !ValidateNetPrefabReference(entity, out reason)) return false;
+            return true;
+        }
+
+        private bool ValidateTempEdge(Entity entity, Temp temp, HashSet<Entity> members,
+            out string reason)
+        {
+            reason = null;
+            if ((temp.m_Flags & TempFlags.Delete) != 0) return true;
+            if (!ValidateNetPrefabReference(entity, out reason)) return false;
+            if (!EntityManager.HasBuffer<ConnectedNode>(entity))
+            {
+                reason = "a generated edge has no connected-node buffer";
+                return false;
+            }
+
+            Edge edge = EntityManager.GetComponentData<Edge>(entity);
+            if (!ValidateTempEndpoint(edge.m_Start, members, out reason) ||
+                !ValidateTempEndpoint(edge.m_End, members, out reason)) return false;
+
+            DynamicBuffer<ConnectedNode> nodes =
+                EntityManager.GetBuffer<ConnectedNode>(entity, isReadOnly: true);
+            for (int i = 0; i < nodes.Length; i++)
+                if (!ValidateConnectedNodeForApply(nodes[i].m_Node, out reason)) return false;
+
+            if (temp.m_Original != Entity.Null &&
+                (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) == 0)
+            {
+                DynamicBuffer<ConnectedNode> originalNodes =
+                    EntityManager.GetBuffer<ConnectedNode>(temp.m_Original, isReadOnly: true);
+                for (int i = 0; i < originalNodes.Length; i++)
+                {
+                    Entity node = originalNodes[i].m_Node;
+                    if (!EntityManager.Exists(node) || !EntityManager.HasBuffer<ConnectedEdge>(node))
+                    {
+                        reason = "an original edge contains a stale connected-node reference";
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+
+        private bool ValidateTempEndpoint(Entity node, HashSet<Entity> members, out string reason)
+        {
+            if (node == Entity.Null || !members.Contains(node) || !EntityManager.Exists(node) ||
+                !EntityManager.HasComponent<Temp>(node) || !EntityManager.HasComponent<Node>(node) ||
+                EntityManager.HasComponent<Deleted>(node) || EntityManager.HasComponent<Disabled>(node) ||
+                !EntityManager.HasBuffer<ConnectedEdge>(node))
+            {
+                reason = "a generated edge endpoint is outside the enabled Temp transaction";
+                return false;
+            }
+            return ValidateConnectedNodeForApply(node, out reason);
+        }
+
+        private bool ValidateConnectedNodeForApply(Entity node, out string reason)
+        {
+            reason = null;
+            if (!EntityManager.Exists(node) || !EntityManager.HasComponent<Node>(node))
+            {
+                reason = "a generated edge contains a missing connected node";
+                return false;
+            }
+
+            Entity effective = node;
+            if (EntityManager.HasComponent<Temp>(node))
+            {
+                Temp nodeTemp = EntityManager.GetComponentData<Temp>(node);
+                if (nodeTemp.m_Original != Entity.Null &&
+                    (nodeTemp.m_Flags & (TempFlags.Delete | TempFlags.Replace)) == 0)
+                    effective = nodeTemp.m_Original;
+            }
+            if (!EntityManager.Exists(effective) || EntityManager.HasComponent<Deleted>(effective) ||
+                !EntityManager.HasBuffer<ConnectedEdge>(effective))
+            {
+                reason = "a generated edge resolves to a node without connectivity data";
+                return false;
+            }
+            return true;
+        }
+
+        private bool ValidateNetPrefabReference(Entity entity, out string reason)
+        {
+            reason = null;
+            if (!EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(entity))
+            {
+                reason = "a generated net entity has no prefab reference";
+                return false;
+            }
+            Entity prefab = EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(entity).m_Prefab;
+            if (prefab == Entity.Null || !EntityManager.Exists(prefab) ||
+                !EntityManager.HasComponent<global::Game.Prefabs.PrefabData>(prefab))
+            {
+                reason = "a generated net entity references a missing prefab";
+                return false;
+            }
+            return true;
+        }
+
+        private void DiscardStaleTransactionTemps(string why)
+        {
+            int cleared = ClearTempEntities(ActiveTransactionQuery());
             if (cleared <= 0) return;
-            Mod.log.Warn("[MP] NetApply: discarded " + cleared + " uncommitted net Temp(s) - " + why + ".");
-            Diagnostics.FlightRecorder.Note("net temps discarded=" + cleared + " (" + why + ")");
+            Mod.log.Warn("[MP] SyncApply: discarded " + cleared + " uncommitted Temp(s) - " + why + ".");
+            Diagnostics.FlightRecorder.Note("transaction temps discarded=" + cleared + " (" + why + ")");
         }
 
         /// <summary>
@@ -465,9 +984,53 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             if (_pendingApply || _awaitingDrain) return;
             _pendingApply = true;
+            _pendingTransactionKind = RemoteToolTransactionKind.Net;
             _armTick = System.Environment.TickCount;
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
             _onCommitLost = onCommitLost;
+            _onCommitComplete = null;
             Diagnostics.FlightRecorder.Note("net " + source + " batch armed");
+        }
+
+        /// <summary>
+        /// Arm one object graph. Its Object, owned Node/Edge/Lane/Aggregate, and Area Temps are
+        /// validated and consumed together. The source callback is retained until drain completes.
+        /// </summary>
+        public bool ArmObjectCommit(System.Action onCommitLost, System.Action onCommitComplete,
+            string source)
+        {
+            if (_pendingApply || _awaitingDrain) return false;
+            _pendingApply = true;
+            _pendingTransactionKind = RemoteToolTransactionKind.ObjectGraph;
+            _armTick = System.Environment.TickCount;
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
+            _onCommitLost = onCommitLost;
+            _onCommitComplete = onCommitComplete;
+            Diagnostics.FlightRecorder.Note("object " + source + " operation armed");
+            return true;
+        }
+
+        private void ChargeCommittedNetConstruction()
+        {
+            long amount = _committingNetConstructionCharge;
+            int courses = _committingNetConstructionChargeCourses;
+            _committingNetConstructionCharge = 0;
+            _committingNetConstructionChargeCourses = 0;
+            if (amount <= 0) return;
+
+            try
+            {
+                ConstructionCharger.ChargeAmount(EntityManager, amount,
+                    "remote net operation (" + courses + " course(s))");
+            }
+            catch (System.Exception ex)
+            {
+                // Charging is accounting, not geometry. Never destabilize a successfully committed
+                // network transaction merely because the money singleton changed unexpectedly.
+                Mod.log.Warn("[MP] NetSync: remote net charge failed: " + ex.Message);
+            }
         }
 
         /// <summary>

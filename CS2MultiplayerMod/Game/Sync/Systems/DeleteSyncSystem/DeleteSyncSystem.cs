@@ -251,6 +251,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // tool only blocks on its actual Apply/Clear frame. Object deletes (a raw Deleted tag on
             // a real entity) always proceed.
             bool netBusy = DeferNetForTerrain || _netSync == null || !_netSync.CanBuildDefinitions;
+            // Object deletion also tears down SubObject/SubNet/SubArea ownership. Keep it behind the
+            // same graph lock as network work so it cannot invalidate an original while an isolated
+            // building/connector transaction is being generated, applied, or drained.
+            if (netBusy) return;
             long now = service.NowMs;
             long freshDeadline = now + DeleteRetryWindowMs;
             List<(ObjectDeleteCommand cmd, long deadline)> objects = null;

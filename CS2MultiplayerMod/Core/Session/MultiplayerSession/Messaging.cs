@@ -178,6 +178,15 @@ namespace CS2MultiplayerMod.Core.Session
             }
         }
 
+        /// <summary>
+        /// Re-dispatch a command that this client already authenticated and journaled while its
+        /// world was being replaced. This is local-only: it never relays or writes to the transport.
+        /// </summary>
+        internal void DispatchBufferedCommand(SimulationCommandMessage command)
+        {
+            if (command != null) NotifyCommand(command);
+        }
+
         private void HandleCommand(ConnectionId from, Peer peer, SimulationCommandMessage command)
         {
             // Only command ids the game layer registered are legitimate; anything else

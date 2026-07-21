@@ -47,7 +47,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void RealizeIncoming(MultiplayerSession session, long now)
         {
-            if (_incoming.IsEmpty && _attachRetry.Count == 0) return;
+            if (_incoming.IsEmpty && _attachRetry.Count == 0 && !_hasBlockedNativeObject) return;
+
+            PruneNativeObjectOperations(now);
+            if (_nativeNetCoordinator.IsCommitBusy) return;
+            if (!TryRealizeBlockedNativeObject(now)) return;
 
             _rzFrameSpawned = 0;
             _rzFrameDuplicates = 0;
@@ -89,6 +93,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // Our own placement coming back to us — already built locally.
                 if (message.OriginPlayerId == session.LocalPlayerId) continue;
 
+                if (message.CommandId == ObjectToolOperationCommand.Id)
+                {
+                    Diagnostics.FlightRecorder.Note("object command received origin=" +
+                                                      message.OriginPlayerId);
+                    NativeObjectResult result = TryRealizeNativeObject(message, now);
+                    if (result == NativeObjectResult.Retry)
+                    {
+                        BlockNativeObject(message, now);
+                        break;
+                    }
+                    if (result == NativeObjectResult.Armed) break;
+                    continue;
+                }
+
                 ObjectPlacementCommand command;
                 try { command = ObjectPlacementCommand.Decode(message.Body); }
                 catch (System.Exception ex) { Mod.log.Warn("[MP] BuildSync: dropping malformed command: " + ex.Message); continue; }
@@ -101,17 +119,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     continue;
                 }
 
+                // A standalone definition cannot establish the ownership links required by
+                // movers, and zone growables are created by the zoning simulation rather than
+                // a player placement. Refuse both before any game definition is allocated.
+                if (IsSimulationOnlyPlacementPrefab(prefab))
+                {
+                    RecordRefused(command.PrefabName);
+                    continue;
+                }
+
                 // A net object placed on a road that has not reached us yet has nothing to hang off.
                 // Placing it now would strand it as an inert prop, so wait for the road instead.
                 if (command.AttachKind != ObjectAttachKind.None && FindAttachTarget(command) == Entity.Null)
                 {
                     if (_attachRetry.Count >= MaxPendingAttachments)
                     {
-                        // A peer cannot be allowed to grow this without bound; the oldest waiter
-                        // has had the most time to find its node, so it is the one to force through.
-                        var oldest = _attachRetry[0];
-                        _attachRetry.RemoveAt(0);
-                        RealizeCommand(oldest.command, oldest.prefab, oldest.originPlayerId, now);
+                        _attachRetry.Clear();
+                        SyncInbox.RequestResync("building attachment retry queue overflow");
+                        Mod.log.Warn("[MP] BuildSync: attachment retry queue overflowed; " +
+                                     "requesting world recovery instead of placing unattached objects.");
+                        return;
                     }
                     _attachRetry.Add((command, prefab, message.OriginPlayerId, now + AttachRetryWindowMs));
                     continue;
@@ -138,9 +165,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 {
                     _attachRetry.RemoveAt(i);
                     Mod.log.Warn("[MP] BuildSync realize: no local road for '" + pending.command.PrefabName +
-                                 "' after " + (AttachRetryWindowMs / 1000) + " s; placing it unattached " +
-                                 "(it will have no effect on the road).");
-                    RealizeCommand(pending.command, pending.prefab, pending.originPlayerId, now);
+                                 "' after " + (AttachRetryWindowMs / 1000) +
+                                 " s; rejecting it and requesting world recovery.");
+                    SyncInbox.RequestResync("building attachment target did not resolve");
                 }
             }
         }
@@ -148,7 +175,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private void RealizeCommand(ObjectPlacementCommand command, Entity prefab, int originPlayerId, long now)
         {
             var position = new float3(command.PosX, command.PosY, command.PosZ);
-            var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
+            var rotation = new quaternion(math.normalizesafe(
+                new float4(command.RotX, command.RotY, command.RotZ, command.RotW),
+                new float4(0f, 0f, 0f, 1f)));
 
             // The same placement arriving twice (a replayed message, a lagged echo) would stack a
             // second building exactly inside the first — geometry the sender's own validation can
@@ -615,6 +644,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             course.m_FixedIndex = -1;
             course.m_StartPosition.m_Flags |= CoursePosFlags.IsFirst;
             course.m_EndPosition.m_Flags |= CoursePosFlags.IsLast;
+            // Owned subnet endpoints must remain distinct from coincident road/utility previews;
+            // ownership resolution, not proximity merging, links the native graph.
+            course.m_StartPosition.m_Flags |= CoursePosFlags.DisableMerge;
+            course.m_EndPosition.m_Flags |= CoursePosFlags.DisableMerge;
             if (course.m_StartPosition.m_Position.Equals(course.m_EndPosition.m_Position))
             {
                 course.m_StartPosition.m_Flags |= CoursePosFlags.IsLast;

@@ -40,6 +40,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly Dictionary<byte, PendingEdit> _pendingEdits = new Dictionary<byte, PendingEdit>();
 
         private Observer _observer;
+        private TreeStateChannel _treeStateChannel;
         private long _lastSnapshotMs;
         private long _lastEditScanMs;
         private long _lastLogMs;
@@ -65,6 +66,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Register(new StatisticsStateChannel());
             Register(new WeatherStateChannel());
             Register(new GameClockStateChannel());
+            _treeStateChannel = new TreeStateChannel();
+            Register(_treeStateChannel);
 
             // Player-editable settings: every player may change them; the host arbitrates.
             RegisterEditable(new TaxStateChannel());
@@ -88,7 +91,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (_observer != null && Mod.Service != null)
                 Mod.Service.Session.RemoveObserver(_observer);
+            if (_treeStateChannel != null) _treeStateChannel.Dispose();
             base.OnDestroy();
+        }
+
+        /// <summary>Ensure a newly placed host tree is included in the next bounded snapshot.</summary>
+        internal void PrioritizeTree(Entity entity)
+        {
+            if (_treeStateChannel != null) _treeStateChannel.Prioritize(entity);
         }
 
         private void Register(IStateChannel channel) => _channels[channel.ChannelId] = channel;

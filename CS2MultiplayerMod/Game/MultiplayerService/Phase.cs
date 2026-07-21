@@ -2,6 +2,7 @@ using System;
 using Game.SceneFlow;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 
 namespace CS2MultiplayerMod.Game
 {
@@ -29,6 +30,14 @@ namespace CS2MultiplayerMod.Game
         public void Update()
         {
             _session.Update(_clock.ElapsedMilliseconds);
+            string recoveryReason;
+            if (_session.Status == SessionStatus.Connected &&
+                SyncInbox.TryTakeResyncRequest(out recoveryReason))
+            {
+                _log.Warn("[MP] Requesting world recovery: " + recoveryReason + ".");
+                Diagnostics.FlightRecorder.Note("resync requested: " + recoveryReason);
+                _session.RequestWorldSync();
+            }
             PumpWorldPhase();
         }
 
@@ -52,11 +61,13 @@ namespace CS2MultiplayerMod.Game
             {
                 SetPhase(ClientWorldPhase.InSession);
                 _log.Info("[MP] Host world loaded - gameplay sync active.");
+                CompletePostLoadCommandCatchup();
                 return;
             }
 
             if (NowMs - _phaseChangedMs > MapLoadTimeoutMs)
             {
+                _postLoadCommands.Clear();
                 // The load never started (failed staging, asset index miss, …). Recover
                 // to a defined state instead of idling half-connected forever.
                 SetPhase(ClientWorldPhase.WaitingForMap);
@@ -70,6 +81,8 @@ namespace CS2MultiplayerMod.Game
             if (_phase == phase) return;
             _phase = phase;
             _phaseChangedMs = NowMs;
+            if (phase == ClientWorldPhase.None || phase == ClientWorldPhase.Connecting)
+                _postLoadCommands.Clear();
             if (phase != ClientWorldPhase.LoadingMap) _sawLoading = false;
             _log.Info("[MP] World phase: " + phase);
             Diagnostics.FlightRecorder.Note("phase " + phase);

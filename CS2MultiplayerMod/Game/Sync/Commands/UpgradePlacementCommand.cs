@@ -38,6 +38,9 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             OwnerX = WireGuard.ReadCoordinate(reader); OwnerY = WireGuard.ReadCoordinate(reader); OwnerZ = WireGuard.ReadCoordinate(reader);
             PosX = WireGuard.ReadCoordinate(reader); PosY = WireGuard.ReadCoordinate(reader); PosZ = WireGuard.ReadCoordinate(reader);
             RotX = WireGuard.ReadFinite(reader); RotY = WireGuard.ReadFinite(reader); RotZ = WireGuard.ReadFinite(reader); RotW = WireGuard.ReadFinite(reader);
+            float rotationLengthSq = RotX * RotX + RotY * RotY + RotZ * RotZ + RotW * RotW;
+            if (rotationLengthSq < 0.25f || rotationLengthSq > 2.25f)
+                throw new ProtocolException("Implausible upgrade rotation length " + rotationLengthSq + ".");
             RandomSeed = reader.ReadInt();
             if (RandomSeed < 0 || RandomSeed > ushort.MaxValue)
                 throw new ProtocolException("Upgrade random seed is outside ushort range.");

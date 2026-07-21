@@ -164,12 +164,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return;
             }
             long now = service.NowMs;
-            RealizePendingOwnedElements(now);
             RealizeIncoming(session, now);
         }
 
         private void CaptureNewUpgrades(MultiplayerSession session, long now)
         {
+            if (_buildSync.NativeLifecycleCapturedThisFrame ||
+                World.GetOrCreateSystemManaged<Net.NetSyncSystem>().DidCommitObjectGraphThisFrame) return;
             if (_createdUpgrades.IsEmptyIgnoreFilter) return;
 
             NativeArray<Entity> entities = _createdUpgrades.ToEntityArray(Allocator.Temp);
@@ -351,9 +352,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             if (EntityManager.HasBuffer<SubNet>(prefab) || EntityManager.HasBuffer<SubArea>(prefab))
             {
-                if (_ownedElementRetry.Count >= MaxPendingOwners) _ownedElementRetry.RemoveAt(0);
-                long now = Mod.Service != null ? Mod.Service.NowMs : 0;
-                _ownedElementRetry.Add((prefab, position, randomSeed, now + OwnerRetryWindowMs));
+                var upgradeOwner = new OwnerDefinition
+                {
+                    m_Prefab = prefab,
+                    m_Position = position,
+                    m_Rotation = rotation,
+                };
+                var random = new Unity.Mathematics.Random((uint)math.max(1, randomSeed));
+                _buildSync.RealizeOwnedSubElements(prefab, upgradeOwner, ref random);
             }
         }
 

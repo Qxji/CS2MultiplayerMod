@@ -50,6 +50,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private long _diagStartMs = -1;
         private int _diagTotal;
 
+        // Commands refused because their prefab belongs to simulation spawning rather than
+        // player placement. Aggregate them: a bad peer can otherwise produce hundreds of
+        // warnings per second while we are protecting the world from the flood.
+        private readonly Dictionary<string, int> _refused = new Dictionary<string, int>();
+        private int _refusedTotal;
+
         // Diagnostic probes: how many entities each successive filter sees, so a quiet log
         // pinpoints whether the update phase is even seeing freshly-Created entities.
         private int _hbUpdates, _hbAnyCreated, _hbCreatedPrefab, _hbCreatedTransform, _hbFiltered;
@@ -57,6 +63,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
+        private CityStateSyncSystem _cityStateSync;
         private ToolSystem _toolSystem;
         private bool _localObjectApplyThisFrame;
         private EntityQuery _createdObjects;
@@ -79,6 +86,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             Mod.log.Info(nameof(BuildSyncSystem) + " ready.");
             _prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
+            _cityStateSync = World.GetOrCreateSystemManaged<CityStateSyncSystem>();
             _toolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
             _prefabIndex = new PrefabIndex(_prefabSystem, GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
 
@@ -102,6 +110,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     ComponentType.ReadOnly<Owner>(),
                     ComponentType.ReadOnly<Deleted>(),
                     ComponentType.ReadOnly<global::Game.Net.Edge>(),
+                    ComponentType.ReadOnly<global::Game.Objects.Moving>(),
+                    ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
+                    ComponentType.ReadOnly<global::Game.Creatures.Creature>(),
                 },
             });
 
@@ -152,9 +163,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _diagCreatedTransform = GetEntityQuery(
                 ComponentType.ReadOnly<Created>(), ComponentType.ReadOnly<PrefabRef>(), ComponentType.ReadOnly<Transform>());
 
+            InitializeNativeObjectOperations();
+
             if (Mod.Service != null)
             {
-                _observer = new CommandObserver(_incoming, ObjectPlacementCommand.Id);
+                _observer = new CommandObserver(_incoming,
+                    ObjectPlacementCommand.Id, ObjectToolOperationCommand.Id)
+                {
+                    MaxBodyBytes = ObjectToolOperationCommand.MaxEncodedBytes,
+                };
                 Mod.Service.Session.AddObserver(_observer);
             }
             SyncInbox.RegisterDrain(DrainQueue);
@@ -172,8 +189,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             SyncInbox.Clear(_incoming);
             _attachRetry.Clear();
+            DrainNativeObjectOperations();
+            _cachedLocalObjectOperation = null;
+            _nativeLifecycleCapturedThisFrame = false;
             _localObjectApplyThisFrame = false;
             DeferForTerrain = false;
+            _refused.Clear();
+            _refusedTotal = 0;
         }
 
         protected override void OnUpdate()
@@ -181,23 +203,45 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             MultiplayerService service = Mod.Service;
             if (service == null) return;
 
-            // Diagnostic sampling runs every frame so the 5 s summary reflects peak visibility.
+            bool ready = service.GameplaySyncReady;
             _hbUpdates++;
-            _hbAnyCreated = System.Math.Max(_hbAnyCreated, _diagAnyCreated.CalculateEntityCount());
-            _hbCreatedPrefab = System.Math.Max(_hbCreatedPrefab, _diagCreatedPrefab.CalculateEntityCount());
-            _hbCreatedTransform = System.Math.Max(_hbCreatedTransform, _diagCreatedTransform.CalculateEntityCount());
-            _hbFiltered = System.Math.Max(_hbFiltered, _createdObjects.CalculateEntityCount());
+            // These probes walk broad Created queries. They are troubleshooting-only work,
+            // so keep them off the normal frame path unless their verbose summary is enabled.
+            if (ready && Mod.Setting != null && Mod.Setting.VerboseLogging)
+            {
+                _hbAnyCreated = System.Math.Max(_hbAnyCreated, _diagAnyCreated.CalculateEntityCount());
+                _hbCreatedPrefab = System.Math.Max(_hbCreatedPrefab, _diagCreatedPrefab.CalculateEntityCount());
+                _hbCreatedTransform = System.Math.Max(_hbCreatedTransform, _diagCreatedTransform.CalculateEntityCount());
+                _hbFiltered = System.Math.Max(_hbFiltered, _createdObjects.CalculateEntityCount());
+            }
 
             long now = service.NowMs;
             MultiplayerSession session = service.Session;
-            if (service.GameplaySyncReady)
+            if (ready)
             {
+                PrioritizeCreatedTrees(session);
                 _guard.Prune(now);
                 CaptureNewObjects(session, now);
             }
             else DrainQueue();
             _localObjectApplyThisFrame = false;
-            FlushDiagnostics(now, service.GameplaySyncReady);
+            FlushDiagnostics(now, ready);
+        }
+
+        private void PrioritizeCreatedTrees(MultiplayerSession session)
+        {
+            if (session.Role != SessionRole.Host || _createdObjects.IsEmptyIgnoreFilter) return;
+            NativeArray<Entity> entities = _createdObjects.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                    if (EntityManager.HasComponent<Tree>(entities[i]))
+                        _cityStateSync.PrioritizeTree(entities[i]);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
         }
 
         /// <summary>
@@ -237,6 +281,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _diag[prefabName] = count + 1;
         }
 
+        private void RecordRefused(string prefabName)
+        {
+            _refusedTotal++;
+            int count;
+            _refused.TryGetValue(prefabName, out count);
+            _refused[prefabName] = count + 1;
+        }
+
         private void FlushDiagnostics(long now, bool connected)
         {
             if (_diagStartMs < 0) { _diagStartMs = now; return; }
@@ -266,6 +318,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Mod.Verbose(sb.ToString());
             }
 
+            if (_refusedTotal > 0)
+            {
+                var sb = new StringBuilder();
+                sb.Append("[MP] BuildSync realize: refused ").Append(_refusedTotal)
+                  .Append(" simulation-only placement(s) in the last 5s [");
+                int n = 0;
+                foreach (KeyValuePair<string, int> pair in _refused)
+                {
+                    if (n > 0) sb.Append(", ");
+                    sb.Append(pair.Key).Append(" x").Append(pair.Value);
+                    if (++n >= 10) { sb.Append(", ..."); break; }
+                }
+                sb.Append(']');
+                Mod.log.Warn(sb.ToString());
+                _refused.Clear();
+                _refusedTotal = 0;
+            }
+
             _diag.Clear();
             _diagTotal = 0;
             _diagStartMs = now;
@@ -274,7 +344,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureNewObjects(MultiplayerSession session, long now)
         {
-            if (_createdObjects.IsEmptyIgnoreFilter) return;
+            if (_createdObjects.IsEmptyIgnoreFilter || _nativeLifecycleCapturedThisFrame ||
+                (_nativeNetCoordinator != null && _nativeNetCoordinator.DidCommitObjectGraphThisFrame)) return;
 
             // Narrow capture to genuine player placements: tool-applied objects appear
             // on frames where the object tool is active. Simulation-spawned objects
@@ -291,6 +362,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
                     string name = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(name)) continue;
+
+                    // The final-entity path is only a compatibility fallback. Simulation
+                    // movers and zone-grown buildings can be Created on the same frame as a
+                    // real tool apply, but they are not part of that player action.
+                    if (IsSimulationOnlyPlacementPrefab(prefab)) continue;
 
                     Transform transform = EntityManager.GetComponentData<Transform>(entity);
                     int randomSeed = EntityManager.HasComponent<PseudoRandomSeed>(entity)
@@ -356,6 +432,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 default: age = growth / 2560f; break;
             }
             return math.clamp(age, 0f, 1f);
+        }
+
+        /// <summary>
+        /// True for prefabs whose live instances must be created by simulation ownership
+        /// machinery, never by a standalone multiplayer placement definition.
+        /// </summary>
+        private bool IsSimulationOnlyPlacementPrefab(Entity prefab)
+        {
+            if (prefab == Entity.Null || !EntityManager.Exists(prefab)) return true;
+            if (EntityManager.HasComponent<MovingObjectData>(prefab)) return true;
+            return EntityManager.HasComponent<SpawnableBuildingData>(prefab) &&
+                   !EntityManager.HasComponent<SignatureBuildingData>(prefab);
         }
 
 

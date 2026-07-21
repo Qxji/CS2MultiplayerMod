@@ -83,6 +83,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
                     if (best != Entity.Null)
                     {
+                        string invalidReason;
+                        if (!ValidateObjectDeleteGraph(best, out invalidReason))
+                        {
+                            if (now < commands[t].deadline)
+                            {
+                                if (_objectRetry.Count >= MaxPendingDeletes)
+                                {
+                                    _objectRetry.Clear();
+                                    SyncInbox.RequestResync("object delete retry queue overflow");
+                                }
+                                else _objectRetry.Add(commands[t]);
+                                waiting++;
+                            }
+                            else
+                            {
+                                expired++;
+                                SyncInbox.RequestResync("object delete graph validation failed");
+                                Mod.log.Warn("[MP] DeleteSync: rejected stale building graph: " +
+                                             invalidReason + ".");
+                            }
+                            continue;
+                        }
                         // Mark with the VICTIM's prefab name — that is the key our own capture
                         // derives from the entity next frame. Marking the command's name instead
                         // left a cross-prefab victim unguarded, so its delete was re-broadcast
@@ -120,6 +142,57 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (deleted > 0 || waiting > 0 || expired > 0)
                 Mod.Verbose("[MP] DeleteSync: removed " + deleted + " object(s); " + waiting +
                              " awaiting a local match, " + expired + " gave up (already gone, or geometry diverged).");
+        }
+
+        private bool ValidateObjectDeleteGraph(Entity root, out string reason)
+        {
+            if (!EntityManager.Exists(root) || EntityManager.HasComponent<Deleted>(root) ||
+                EntityManager.HasComponent<Temp>(root))
+            {
+                reason = "root is no longer live";
+                return false;
+            }
+            if (EntityManager.HasBuffer<global::Game.Objects.SubObject>(root))
+            {
+                DynamicBuffer<global::Game.Objects.SubObject> children =
+                    EntityManager.GetBuffer<global::Game.Objects.SubObject>(root, isReadOnly: true);
+                for (int i = 0; i < children.Length; i++)
+                    if (!ValidateOwnedDeleteElement(root, children[i].m_SubObject, out reason)) return false;
+            }
+            if (EntityManager.HasBuffer<global::Game.Net.SubNet>(root))
+            {
+                DynamicBuffer<global::Game.Net.SubNet> children =
+                    EntityManager.GetBuffer<global::Game.Net.SubNet>(root, isReadOnly: true);
+                for (int i = 0; i < children.Length; i++)
+                    if (!ValidateOwnedDeleteElement(root, children[i].m_SubNet, out reason)) return false;
+            }
+            if (EntityManager.HasBuffer<global::Game.Areas.SubArea>(root))
+            {
+                DynamicBuffer<global::Game.Areas.SubArea> children =
+                    EntityManager.GetBuffer<global::Game.Areas.SubArea>(root, isReadOnly: true);
+                for (int i = 0; i < children.Length; i++)
+                    if (!ValidateOwnedDeleteElement(root, children[i].m_Area, out reason)) return false;
+            }
+            reason = null;
+            return true;
+        }
+
+        private bool ValidateOwnedDeleteElement(Entity expectedOwner, Entity child, out string reason)
+        {
+            reason = null;
+            if (child == Entity.Null || !EntityManager.Exists(child) ||
+                EntityManager.HasComponent<Deleted>(child) || EntityManager.HasComponent<Temp>(child))
+            {
+                reason = "owned buffer contains a stale entity";
+                return false;
+            }
+            if (!EntityManager.HasComponent<Owner>(child) ||
+                EntityManager.GetComponentData<Owner>(child).m_Owner != expectedOwner)
+            {
+                reason = "owned buffer and Owner component disagree";
+                return false;
+            }
+            return true;
         }
 
         // Endpoint-to-curve match tolerance (metres, XZ). The two cities' roads share the same XZ

@@ -22,6 +22,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     /// </summary>
     public partial class MoveSyncSystem : GameSystemBase
     {
+        private const long MoveRetryWindowMs = 10000;
         public bool DeferForTerrain;
         private readonly ConcurrentQueue<SimulationCommandMessage> _incoming =
             new ConcurrentQueue<SimulationCommandMessage>();
@@ -32,6 +33,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private EntityQuery _movedObjects;
         private EntityQuery _liveObjects;
         private CommandObserver _observer;
+        private bool _hasBlockedMove;
+        private SimulationCommandMessage _blockedMove;
+        private long _blockedMoveDeadline;
 
         protected override void OnCreate()
         {
@@ -82,13 +86,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _observer = new CommandObserver(_incoming, ObjectMoveCommand.Id);
                 Mod.Service.Session.AddObserver(_observer);
             }
+            SyncInbox.RegisterDrain(DrainQueue);
         }
 
         protected override void OnDestroy()
         {
+            SyncInbox.UnregisterDrain(DrainQueue);
             if (_observer != null && Mod.Service != null)
                 Mod.Service.Session.RemoveObserver(_observer);
             base.OnDestroy();
+        }
+
+        private void DrainQueue()
+        {
+            SyncInbox.Clear(_incoming);
+            _hasBlockedMove = false;
+            _blockedMove = null;
+            _blockedMoveDeadline = 0;
+            DeferForTerrain = false;
         }
 
         protected override void OnUpdate()
@@ -113,11 +128,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             MultiplayerSession session = service.Session;
             if (!service.GameplaySyncReady) return;
             if (DeferForTerrain) return;
+            Net.NetSyncSystem coordinator = World.GetOrCreateSystemManaged<Net.NetSyncSystem>();
+            if (!coordinator.CanBuildDefinitions) return;
             RealizeIncoming(session, service.NowMs);
         }
 
         private void CaptureMoves(MultiplayerSession session, long now)
         {
+            BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+            if (buildSync.NativeLifecycleCapturedThisFrame ||
+                World.GetOrCreateSystemManaged<Net.NetSyncSystem>().DidCommitObjectGraphThisFrame) return;
             if (_movedObjects.IsEmptyIgnoreFilter) return;
 
             NativeArray<Entity> entities = _movedObjects.ToEntityArray(Allocator.Temp);
@@ -156,35 +176,63 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void RealizeIncoming(MultiplayerSession session, long now)
         {
+            if (_hasBlockedMove)
+            {
+                if (!TryRealizeMove(_blockedMove, now))
+                {
+                    if (now < _blockedMoveDeadline) return;
+                    Mod.log.Warn("[MP] MoveSync: relocation target did not resolve within the retry window; " +
+                                 "requesting world recovery.");
+                    SyncInbox.RequestResync("building relocation target did not resolve");
+                    _hasBlockedMove = false;
+                    _blockedMove = null;
+                    return;
+                }
+                _hasBlockedMove = false;
+                _blockedMove = null;
+            }
+
             SimulationCommandMessage message;
             while (_incoming.TryDequeue(out message))
             {
                 if (message.OriginPlayerId == session.LocalPlayerId) continue;
 
-                ObjectMoveCommand command;
-                try { command = ObjectMoveCommand.Decode(message.Body); }
-                catch (System.Exception ex) { Mod.log.Warn("[MP] MoveSync: dropping malformed command: " + ex.Message); continue; }
+                if (TryRealizeMove(message, now)) continue;
+                _hasBlockedMove = true;
+                _blockedMove = message;
+                _blockedMoveDeadline = now + MoveRetryWindowMs;
+                Diagnostics.FlightRecorder.Note("legacy move target retrying");
+                return;
+            }
+        }
 
-                Entity prefab;
-                if (!_prefabIndex.TryResolve(command.PrefabName, out prefab))
-                {
-                    Mod.log.Warn("[MP] MoveSync realize: unknown prefab '" + command.PrefabName + "'; skipping.");
-                    continue;
-                }
+        private bool TryRealizeMove(SimulationCommandMessage message, long now)
+        {
+            ObjectMoveCommand command;
+            try { command = ObjectMoveCommand.Decode(message.Body); }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] MoveSync: dropping malformed command: " + ex.Message);
+                SyncInbox.RequestResync("malformed building relocation command");
+                return true;
+            }
 
-                var oldPos = new float3(command.OldX, command.OldY, command.OldZ);
-                var newPos = new float3(command.NewX, command.NewY, command.NewZ);
-                Entity original = FindAt(prefab, oldPos);
-                if (original == Entity.Null)
-                {
-                    Mod.log.Warn("[MP] MoveSync realize: no local '" + command.PrefabName + "' near (" +
-                                 oldPos.x.ToString("F0") + "," + oldPos.z.ToString("F0") + ") to move; skipping.");
-                    continue;
-                }
+            Entity prefab;
+            if (!_prefabIndex.TryResolve(command.PrefabName, out prefab)) return false;
 
-                _guard.Mark(MoveKey(command.PrefabName, newPos), now);
-                try
-                {
+            var oldPos = new float3(command.OldX, command.OldY, command.OldZ);
+            var newPos = new float3(command.NewX, command.NewY, command.NewZ);
+            Entity original = FindAt(prefab, oldPos);
+            if (original == Entity.Null)
+            {
+                // A reliable replay may arrive after this same move already committed.
+                if (FindAt(prefab, newPos) != Entity.Null) return true;
+                return false;
+            }
+
+            _guard.Mark(MoveKey(command.PrefabName, newPos), now);
+            try
+            {
                     // The move tool's commit definition: m_Original points at the existing
                     // entity, Relocate tells GenerateObjectsSystem to move it instead of
                     // spawning a copy.
@@ -205,15 +253,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     });
                     EntityManager.AddComponent<Updated>(definition);
                     EntityManager.AddComponent<Deleted>(definition);
-                    Mod.Verbose("[MP] MoveSync realize: moved '" + command.PrefabName + "' from player " +
-                                 message.OriginPlayerId + " to (" + newPos.x.ToString("F1") + "," +
-                                 newPos.z.ToString("F1") + ").");
-                }
-                catch (System.Exception ex)
-                {
-                    Mod.log.Error("[MP] MoveSync realize FAILED for '" + command.PrefabName + "': " + ex);
-                }
+                Mod.Verbose("[MP] MoveSync realize: moved '" + command.PrefabName + "' from player " +
+                             message.OriginPlayerId + " to (" + newPos.x.ToString("F1") + "," +
+                             newPos.z.ToString("F1") + ").");
             }
+            catch (System.Exception ex)
+            {
+                Mod.log.Error("[MP] MoveSync realize FAILED for '" + command.PrefabName + "': " + ex);
+                SyncInbox.RequestResync("legacy building relocation failed");
+            }
+            return true;
         }
 
         private Entity FindAt(Entity prefab, float3 position)

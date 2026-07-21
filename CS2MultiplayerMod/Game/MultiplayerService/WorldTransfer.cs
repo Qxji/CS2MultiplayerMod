@@ -65,6 +65,9 @@ namespace CS2MultiplayerMod.Game
 
         private void LoadReceivedMap(byte[] data)
         {
+            // The completed blob is the causal cut: commands received before it are represented by
+            // the save, while every later command must survive the ECS world replacement.
+            _postLoadCommands.Clear();
             _log.Info("[MP] Map blob delivered to game layer (" +
                       (data != null ? data.Length / 1024 : 0) + " KB); staging and loading.");
             Diagnostics.FlightRecorder.Note("world blob received " + (data != null ? data.Length >> 10 : 0) + " KB; reloading world");
@@ -74,6 +77,7 @@ namespace CS2MultiplayerMod.Game
             SetPhase(ClientWorldPhase.LoadingMap);
             if (!JoinMapLoader.StageAndLoad(data, _log))
             {
+                _postLoadCommands.Clear();
                 // Defined, recoverable state instead of a half-connected limbo.
                 SetPhase(ClientWorldPhase.WaitingForMap);
                 _log.Warn("[MP] Could not auto-load the host world. Still connected - use /sync to " +

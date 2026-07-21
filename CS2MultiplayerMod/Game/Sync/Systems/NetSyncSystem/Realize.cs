@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using Colossal.Mathematics;
 using Game.Net;
 using Game.Simulation;
+using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Jobs;
@@ -42,15 +43,43 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             new Dictionary<NetOperationKey, long>();
         private readonly Dictionary<NetOperationKey, long> _nativeOperationDeadlines =
             new Dictionary<NetOperationKey, long>();
+        private readonly Dictionary<NetOperationKey, int> _operationBuildFailures =
+            new Dictionary<NetOperationKey, int>();
+
+        private struct PreparedNativeCourse
+        {
+            public NetPlacementCommand Command;
+            public Entity Prefab;
+            public Bezier4x3 Curve;
+            public float MeasuredLength;
+            public bool Point;
+            public bool AlreadyBuilt;
+        }
+
+        private struct RealizedCourse
+        {
+            public Entity Prefab;
+            public string PrefabName;
+            public Bezier4x3 Curve;
+            public float Length;
+            public bool Charge;
+            public Entity StartSnap;
+            public Entity EndSnap;
+            public float StartT;
+            public float EndT;
+            public int StartKind;
+            public int EndKind;
+        }
 
         private void RealizeIncoming(MultiplayerSession session, long now)
         {
+            PruneCompletedNetOperations(now);
             if (_incoming.IsEmpty && _remoteDeferred.Count == 0) return;
 
             // One Temp batch in flight at a time (a course built before the previous batch's
             // nodes/edges are query-able could not connect to them), and never on the frame the
-            // player's own gesture applies. A selected tool is allowed on its quiet preview frames;
-            // its actual Apply/Clear frame retains priority.
+            // player's own gesture applies. A selected tool is allowed while its preview is being
+            // regenerated or cleared; only the single frame that commits a local Apply has priority.
             if (!CanBuildDefinitions) return;
 
             // One source Apply may emit several native courses. Keep that operation intact: a
@@ -59,6 +88,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             List<SimulationCommandMessage> work;
             bool nativeOperation;
             if (!TryTakeCompleteOperation(session, now, out work, out nativeOperation)) return;
+
+            NetOperationKey completedKey = default(NetOperationKey);
+            bool hasCompletedKey = false;
+            if (nativeOperation && work.Count > 0)
+            {
+                NetPlacementCommand completedHeader = NetPlacementCommand.Decode(work[0].Body);
+                completedKey = new NetOperationKey
+                {
+                    Origin = work[0].OriginPlayerId,
+                    Operation = completedHeader.OperationId,
+                };
+                if (_completedNetOperations.Contains(completedKey, now))
+                {
+                    Diagnostics.FlightRecorder.Note("net operation duplicate suppressed op=" +
+                                                      completedHeader.OperationId);
+                    return;
+                }
+                hasCompletedKey = true;
+            }
 
             int maxBatch = work.Count;
 
@@ -71,7 +119,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             bool haveSnapshot = false;
             int built = 0;
             bool splitUsed = false;
-            bool forceOperationGeometryFallback = false;
+            PreparedNativeCourse[] preparedNative = nativeOperation
+                ? new PreparedNativeCourse[work.Count]
+                : null;
+            var createdDefinitions = new List<Entity>(work.Count);
+            var realizedCourses = new List<RealizedCourse>(work.Count);
+            bool abortWholeOperation = false;
+            string abortReason = null;
+            long constructionCost = 0;
+            int chargedCourses = 0;
 
             // Source messages of the courses the Temp batch builds, retained until the commit
             // actually runs: if the armed batch is wiped before committing (see _onCommitLost) they
@@ -113,6 +169,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Operation = operationHeader.OperationId,
                     };
                     bool unresolvedOperationTarget = false;
+                    int alreadyBuiltCourses = 0;
 
                     for (int i = 0; i < work.Count; i++)
                     {
@@ -146,6 +203,79 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                             }
                         }
 
+                        var curve = new Bezier4x3
+                        {
+                            a = new float3(command.Ax, command.Ay, command.Az),
+                            b = new float3(command.Bx, command.By, command.Bz),
+                            c = new float3(command.Cx, command.Cy, command.Cz),
+                            d = new float3(command.Dx, command.Dy, command.Dz),
+                        };
+                        float measuredLength = MathUtils.Length(curve);
+                        const uint pointFlags = (uint)(global::Game.Tools.CoursePosFlags.IsFirst |
+                                                       global::Game.Tools.CoursePosFlags.IsLast);
+                        bool nativePoint = measuredLength < 0.1f &&
+                                           (command.Start.Flags & pointFlags) == pointFlags &&
+                                           (command.End.Flags & pointFlags) == pointFlags;
+                        if (!math.isfinite(measuredLength) || (measuredLength < 0.1f && !nativePoint))
+                        {
+                            Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
+                                         " contains a degenerate course; dropping the whole operation.");
+                            return;
+                        }
+
+                        // Preserve the source NetCourse length exactly, but reject a forged or
+                        // corrupt scalar that materially disagrees with the transmitted curve.
+                        float lengthTolerance = math.max(0.05f, measuredLength * 0.01f);
+                        if (math.abs(command.Length - measuredLength) > lengthTolerance)
+                        {
+                            Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
+                                         " has an inconsistent course length; dropping the whole operation.");
+                            return;
+                        }
+
+                        const CreationFlags allowedNativeFlags = CreationFlags.Invert |
+                            CreationFlags.Align | CreationFlags.Hidden | CreationFlags.Optional |
+                            CreationFlags.Lowered | CreationFlags.Native |
+                            CreationFlags.Construction | CreationFlags.SubElevation;
+                        if ((((CreationFlags)command.CreationFlags) & ~allowedNativeFlags) != 0)
+                        {
+                            Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
+                                         " contains an unsafe creation mode; dropping the whole operation.");
+                            SyncInbox.RequestResync("unsafe native net creation flags");
+                            return;
+                        }
+                        NetPrefabInfo sourcePrefabInfo = NetInfoOf(prefab);
+                        if (!NativeElevationIsValid(sourcePrefabInfo,
+                                new float2(command.CourseElevationLeft, command.CourseElevationRight)) ||
+                            !NativeElevationIsValid(sourcePrefabInfo,
+                                new float2(command.Start.ElevationLeft, command.Start.ElevationRight)) ||
+                            !NativeElevationIsValid(sourcePrefabInfo,
+                                new float2(command.End.ElevationLeft, command.End.ElevationRight)))
+                        {
+                            Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
+                                         " contains elevation outside the local prefab contract; " +
+                                         "dropping the whole operation.");
+                            SyncInbox.RequestResync("native net elevation contract mismatch");
+                            return;
+                        }
+
+                        bool alreadyBuilt = !nativePoint &&
+                                            SpanAlreadyBuilt(prefab, curve, edgeEntities, edgeCurves);
+                        if (alreadyBuilt) alreadyBuiltCourses++;
+                        preparedNative[i] = new PreparedNativeCourse
+                        {
+                            Command = command,
+                            Prefab = prefab,
+                            Curve = curve,
+                            MeasuredLength = measuredLength,
+                            Point = nativePoint,
+                            AlreadyBuilt = alreadyBuilt,
+                        };
+
+                        // A course already present is this operation's idempotent portion. It needs
+                        // no source target, and the remaining missing courses reconcile atomically.
+                        if (alreadyBuilt) continue;
+
                         NetPrefabInfo placedInfo = NetInfoOf(prefab);
                         bool resolved = true;
                         Entity ignoredEntity;
@@ -164,6 +294,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         if (!resolved) unresolvedOperationTarget = true;
                     }
 
+                    if (alreadyBuiltCourses == work.Count)
+                    {
+                        _nativeOperationDeadlines.Remove(operationRetryKey);
+                        _operationBuildFailures.Remove(operationRetryKey);
+                        Diagnostics.FlightRecorder.Note("net native op already present=" +
+                                                          operationHeader.OperationId +
+                                                          " courses=" + work.Count);
+                        _completedNetOperations.Remember(operationRetryKey, now, 60000);
+                        return;
+                    }
+                    if (alreadyBuiltCourses > 0)
+                        Diagnostics.FlightRecorder.Note("net native op reconcile existing=" +
+                                                          alreadyBuiltCourses + "/" + work.Count);
+
                     if (unresolvedOperationTarget)
                     {
                         long deadline;
@@ -179,10 +323,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         }
 
                         _nativeOperationDeadlines.Remove(operationRetryKey);
-                        forceOperationGeometryFallback = true;
                         Mod.log.Warn("[MP] NetSync: native operation " + operationHeader.OperationId +
-                                     " has an unresolved target after its retry window; " +
-                                     "using geometry fallback for the whole operation.");
+                                     " has an unresolved target after its retry window; rejecting " +
+                                     "the complete operation and requesting world recovery.");
+                        Diagnostics.FlightRecorder.Note("net native operation rejected/resync op=" +
+                                                          operationHeader.OperationId);
+                        SyncInbox.RequestResync("native net target did not resolve");
+                        return;
                     }
                     else _nativeOperationDeadlines.Remove(operationRetryKey);
                 }
@@ -196,44 +343,60 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
 
                     NetPlacementCommand command;
-                    try { command = NetPlacementCommand.Decode(message.Body); }
-                    catch (System.Exception ex) { Mod.log.Warn("[MP] NetSync: dropping malformed command: " + ex.Message); continue; }
-
                     Entity prefab;
-                    if (!_prefabIndex.TryResolve(command.PrefabName, out prefab))
+                    Bezier4x3 bezier;
+                    float measuredLength;
+                    bool nativePoint;
+                    if (nativeOperation)
                     {
-                        Mod.log.Warn("[MP] NetSync realize: unknown prefab '" + command.PrefabName +
-                                     "' from player " + message.OriginPlayerId + "; skipping.");
-                        continue;
+                        PreparedNativeCourse prepared = preparedNative[i];
+                        if (prepared.AlreadyBuilt) continue;
+                        command = prepared.Command;
+                        prefab = prepared.Prefab;
+                        bezier = prepared.Curve;
+                        measuredLength = prepared.MeasuredLength;
+                        nativePoint = prepared.Point;
                     }
-                    if (!EntityManager.HasComponent<global::Game.Prefabs.NetData>(prefab) ||
-                        !EntityManager.HasComponent<global::Game.Prefabs.NetGeometryData>(prefab))
+                    else
                     {
-                        Mod.log.Warn("[MP] NetSync realize: prefab '" + command.PrefabName +
-                                     "' is not a network prefab; skipping.");
-                        continue;
+                        try { command = NetPlacementCommand.Decode(message.Body); }
+                        catch (System.Exception ex)
+                        {
+                            Mod.log.Warn("[MP] NetSync: dropping malformed command: " + ex.Message);
+                            continue;
+                        }
+
+                        if (!_prefabIndex.TryResolve(command.PrefabName, out prefab) ||
+                            !EntityManager.HasComponent<global::Game.Prefabs.NetData>(prefab) ||
+                            !EntityManager.HasComponent<global::Game.Prefabs.NetGeometryData>(prefab))
+                        {
+                            Mod.log.Warn("[MP] NetSync realize: unavailable net prefab '" +
+                                         command.PrefabName + "' from player " +
+                                         message.OriginPlayerId + "; skipping.");
+                            continue;
+                        }
+
+                        bezier = new Bezier4x3
+                        {
+                            a = new float3(command.Ax, command.Ay, command.Az),
+                            b = new float3(command.Bx, command.By, command.Bz),
+                            c = new float3(command.Cx, command.Cy, command.Cz),
+                            d = new float3(command.Dx, command.Dy, command.Dz),
+                        };
+                        measuredLength = MathUtils.Length(bezier);
+                        nativePoint = false;
+                        if (!math.isfinite(measuredLength) || measuredLength < 0.1f)
+                        {
+                            Mod.log.Warn("[MP] NetSync realize: degenerate fallback course for '" +
+                                         command.PrefabName + "'; skipping.");
+                            continue;
+                        }
+                        // Geometry-only fallback has no exact native length, so derive it locally.
+                        command.Length = measuredLength;
                     }
 
-                    var a = new float3(command.Ax, command.Ay, command.Az);
-                    var b = new float3(command.Bx, command.By, command.Bz);
-                    var c = new float3(command.Cx, command.Cy, command.Cz);
-                    var d = new float3(command.Dx, command.Dy, command.Dz);
-                    var bezier = new Bezier4x3 { a = a, b = b, c = c, d = d };
-                    float measuredLength = MathUtils.Length(bezier);
-                    const uint pointFlags = (uint)(global::Game.Tools.CoursePosFlags.IsFirst |
-                                                   global::Game.Tools.CoursePosFlags.IsLast);
-                    bool nativePoint = command.HasNativeCourse && measuredLength < 0.1f &&
-                                       (command.Start.Flags & pointFlags) == pointFlags &&
-                                       (command.End.Flags & pointFlags) == pointFlags;
-                    if (!math.isfinite(measuredLength) || (measuredLength < 0.1f && !nativePoint))
-                    {
-                        Mod.log.Warn("[MP] NetSync realize: degenerate course for '" +
-                                     command.PrefabName + "'; skipping.");
-                        continue;
-                    }
-                    // Pricing and generation use geometry measured locally, never a peer-controlled
-                    // scalar that could disagree with the transmitted curve.
-                    command.Length = measuredLength;
+                    float3 a = bezier.a;
+                    float3 d = bezier.d;
 
                     if (!haveSnapshot)
                     {
@@ -263,7 +426,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     // echo would stack a duplicate road on top of the existing one (and ping-pong).
                     // The tolerances are SplitMatch-tight (~1 m), far below a parallel lane, and a
                     // span rebuilt at another elevation fails the height match — never wrongly skipped.
-                    if (!nativePoint && SpanAlreadyBuilt(prefab, bezier, edgeEntities, edgeCurves))
+                    if (!nativeOperation && SpanAlreadyBuilt(prefab, bezier, edgeEntities, edgeCurves))
                     {
                         if (command.HasNativeCourse)
                             _nativeTargetDeadlines.Remove(NativeRetryKey(message, command));
@@ -276,7 +439,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     Entity startSnap, endSnap;
                     bool nativeTargetsResolved = true;
 
-                    if (command.HasNativeCourse && !forceOperationGeometryFallback)
+                    if (command.HasNativeCourse)
                     {
                         if (command.Start.Kind == NetEndpointTargetKind.Infer)
                             startSnap = ClassifyEndpoint(a, placedInfo, nodeEntities, nodeData,
@@ -301,28 +464,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         NativeTargetRetryKey retryKey = NativeRetryKey(message, command);
                         if (!nativeTargetsResolved)
                         {
-                            long deadline;
-                            if (!_nativeTargetDeadlines.TryGetValue(retryKey, out deadline))
-                            {
-                                deadline = now + NativeTargetRetryWindowMs;
-                                _nativeTargetDeadlines[retryKey] = deadline;
-                            }
-                            if (now < deadline)
-                            {
-                                RequeueFrom(work, i);
-                                break;
-                            }
-
+                            // The operation-level preflight resolved every external target against
+                            // this same snapshot. If one vanished now, do not leave an already-built
+                            // prefix behind; retry the complete source operation on a fresh frame.
                             _nativeTargetDeadlines.Remove(retryKey);
-                            Mod.log.Warn("[MP] NetSync: native target unresolved after retry window for op=" +
-                                         command.OperationId + " course=" + command.CourseIndex +
-                                         "; using bounded geometry fallback.");
-                            startSnap = ClassifyEndpoint(a, placedInfo, nodeEntities, nodeData,
-                                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, out startT, out startKind);
-                            endSnap = ClassifyEndpoint(d, placedInfo, nodeEntities, nodeData,
-                                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, out endT, out endKind);
+                            abortWholeOperation = true;
+                            abortReason = "a native target changed after operation preflight";
+                            break;
                         }
                         else
                         {
@@ -377,35 +525,141 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         break;
                     }
 
-                    MarkRealizeGuards(command.PrefabName, a, d, startSnap, startKind, startT,
-                        endSnap, endKind, endT, now);
                     try
                     {
                         // All replicated courses use the same Temp/apply transaction as the source.
                         // The former Permanent shortcut could not recover a missed contact or split
                         // and exposed half-realized geometry to dependent commands in this frame.
                         if (built == 0) PrepareDefinitionFrame();
+                        Entity definition;
                         if (command.HasNativeCourse)
-                            CreateNativeCourse(prefab, command, bezier,
+                            definition = CreateNativeCourse(prefab, command, bezier,
                                 startSnap, startT, startKind, endSnap, endT, endKind);
                         else
-                            CreateCourse(prefab, bezier, command.Length, startSnap, startT, endSnap, endT,
+                            definition = CreateCourse(prefab, bezier, command.Length,
+                                startSnap, startT, endSnap, endT,
                                 startElevation, endElevation);
+                        createdDefinitions.Add(definition);
                         built++;
-                        RecordRealizedSpan(bezier);
                         (retained ?? (retained = new List<SimulationCommandMessage>())).Add(message);
-                        _rzSegments++;
-                        TallyEnd(startKind);
-                        TallyEnd(endKind);
                         if (splittingCourse) splitUsed = true;
                         if (startKind == KindFree) batchNewNodes.Add(a);
                         if (endKind == KindFree) batchNewNodes.Add(d);
                         if (!nativePoint) batchEdges.Add(bezier);
+                        realizedCourses.Add(new RealizedCourse
+                        {
+                            Prefab = prefab,
+                            PrefabName = command.PrefabName,
+                            Curve = bezier,
+                            Length = command.Length,
+                            Charge = !command.HasNativeCourse ||
+                                     ((((global::Game.Tools.CoursePosFlags)command.Start.Flags |
+                                        (global::Game.Tools.CoursePosFlags)command.End.Flags) &
+                                       global::Game.Tools.CoursePosFlags.DontCreate) == 0),
+                            StartSnap = startSnap,
+                            EndSnap = endSnap,
+                            StartT = startT,
+                            EndT = endT,
+                            StartKind = startKind,
+                            EndKind = endKind,
+                        });
                     }
                     catch (System.Exception ex)
                     {
-                        Mod.log.Error("[MP] NetSync realize FAILED for '" + command.PrefabName + "': " + ex);
+                        if (nativeOperation)
+                        {
+                            abortWholeOperation = true;
+                            abortReason = "course " + command.CourseIndex + " definition failed (" +
+                                          ex.GetType().Name + ")";
+                            break;
+                        }
+                        Mod.log.Error("[MP] NetSync realize FAILED for '" + command.PrefabName +
+                                      "': " + ex);
                     }
+                }
+
+                if (abortWholeOperation)
+                {
+                    for (int i = 0; i < createdDefinitions.Count; i++)
+                    {
+                        Entity definition = createdDefinitions[i];
+                        if (EntityManager.Exists(definition)) EntityManager.DestroyEntity(definition);
+                    }
+                    built = 0;
+                    retained = null;
+                    NetPlacementCommand header = preparedNative[0].Command;
+                    var failureKey = new NetOperationKey
+                    {
+                        Origin = work[0].OriginPlayerId,
+                        Operation = header.OperationId,
+                    };
+                    int failures;
+                    _operationBuildFailures.TryGetValue(failureKey, out failures);
+                    failures++;
+                    bool retry = failures <= 3;
+                    if (retry)
+                    {
+                        _operationBuildFailures[failureKey] = failures;
+                        RequeueAtFront(work);
+                    }
+                    else
+                    {
+                        _operationBuildFailures.Remove(failureKey);
+                    }
+                    ReleaseTrackedTemps(_isolatedLocalTemps);
+                    ForceActiveToolUpdate();
+                    Mod.log.Warn("[MP] NetSync: native operation rolled back before generation - " +
+                                 abortReason + (retry
+                                     ? "; retrying the whole operation (" + failures + "/3)."
+                                     : "; dropped after 3 retries."));
+                    Diagnostics.FlightRecorder.Note("net native op rollback before generation retry=" +
+                                                      (retry ? failures : 0));
+                    return;
+                }
+
+                if (nativeOperation)
+                {
+                    NetPlacementCommand header = preparedNative[0].Command;
+                    _operationBuildFailures.Remove(new NetOperationKey
+                    {
+                        Origin = work[0].OriginPlayerId,
+                        Operation = header.OperationId,
+                    });
+                }
+
+                // Accumulate the operation only after every selected definition exists. The actual
+                // host treasury update is one write after this Temp transaction has drained, so a
+                // failed/replayed later grid or parallel course cannot leave a partial charge.
+                try
+                {
+                    for (int i = 0; i < realizedCourses.Count; i++)
+                    {
+                        RealizedCourse realized = realizedCourses[i];
+                        if (!realized.Charge) continue;
+                        constructionCost += ConstructionCharger.CalculateNetCost(
+                            EntityManager, realized.Prefab, realized.Length);
+                        chargedCourses++;
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    constructionCost = 0;
+                    chargedCourses = 0;
+                    Mod.log.Warn("[MP] NetSync: could not calculate remote net charge: " + ex.Message);
+                }
+                // Publish echo guards and diagnostics only after every definition selected for this
+                // operation exists. A failed later course therefore cannot leave a phantom realized
+                // span suppressing unrelated local capture.
+                for (int i = 0; i < realizedCourses.Count; i++)
+                {
+                    RealizedCourse realized = realizedCourses[i];
+                    MarkRealizeGuards(realized.PrefabName, realized.Curve.a, realized.Curve.d,
+                        realized.StartSnap, realized.StartKind, realized.StartT,
+                        realized.EndSnap, realized.EndKind, realized.EndT, now);
+                    RecordRealizedSpan(realized.Curve);
+                    _rzSegments++;
+                    TallyEnd(realized.StartKind);
+                    TallyEnd(realized.EndKind);
                 }
             }
             finally
@@ -420,19 +674,50 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 batchEdges.Dispose();
             }
 
+            if (built == 0 && _isolatedLocalTemps.Count > 0)
+            {
+                ReleaseTrackedTemps(_isolatedLocalTemps);
+                ForceActiveToolUpdate();
+            }
+
             // Arm the commit for the Temp batch: those definitions become Temp edges at this frame's
             // Modification, and the next quiet frame applies that isolated set through the net domain.
             if (built > 0)
             {
                 _pendingApply = true;
+                _pendingTransactionKind = RemoteToolTransactionKind.Net;
                 _armTick = System.Environment.TickCount;
-                List<SimulationCommandMessage> batchSources = retained;
+                _pendingNetConstructionCharge = constructionCost;
+                _pendingNetConstructionChargeCourses = chargedCourses;
+                // A partially reconciled native operation may have skipped courses that were
+                // already present locally. If this commit is lost, replay the complete source
+                // operation so it can be assembled atomically again; replaying only the missing
+                // fragments could never satisfy CourseCount.
+                List<SimulationCommandMessage> batchSources = nativeOperation
+                    ? new List<SimulationCommandMessage>(work)
+                    : retained;
                 _onCommitLost = delegate
                 {
                     RequeueAtFront(batchSources);
                 };
+                if (hasCompletedKey)
+                {
+                    NetOperationKey completionKey = completedKey;
+                    _onCommitComplete = delegate
+                    {
+                        long completedNow = Mod.Service != null ? Mod.Service.NowMs : now;
+                        _completedNetOperations.Remember(completionKey, completedNow, 60000);
+                        Diagnostics.FlightRecorder.Note("net operation committed/drained op=" +
+                                                          completionKey.Operation);
+                    };
+                }
                 Diagnostics.FlightRecorder.Note("net build batch armed n=" + built + (splitUsed ? " +split" : ""));
             }
+        }
+
+        private void PruneCompletedNetOperations(long now)
+        {
+            _completedNetOperations.Prune(now);
         }
 
         /// <summary>
@@ -543,16 +828,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                              key.Origin + " expired (" + received + "/" + expected + "); dropped whole operation.");
                 Diagnostics.FlightRecorder.Note("net incomplete op dropped=" + key.Operation +
                     " courses=" + received + "/" + expected);
+                SyncInbox.RequestResync("incomplete net operation expired");
                 return false;
             }
 
             _operationAssemblyDeadlines.Remove(key);
             operation = new List<SimulationCommandMessage>(expected);
             nativeOperation = true;
+            bool hasNativeCourse = false;
+            bool hasGeometryOnlyCourse = false;
             for (int i = 0; i < expected; i++)
             {
                 operation.Add(courses[i]);
                 nativeOperation &= decodedCourses[i].HasNativeCourse;
+                hasNativeCourse |= decodedCourses[i].HasNativeCourse;
+                hasGeometryOnlyCourse |= !decodedCourses[i].HasNativeCourse;
             }
 
             // Preserve later operations in their original receive order. Extra messages carrying
@@ -568,6 +858,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 deferred.Add(scanned[i]);
             }
             RequeueAtFront(deferred);
+
+            // Current senders only group exact native definitions. Geometry-only capture represents
+            // one final edge per command. Rejecting mixed or grouped fallback input prevents a peer
+            // from smuggling a partially native operation into per-course fallback realization.
+            if ((hasNativeCourse && hasGeometryOnlyCourse) || (expected > 1 && !nativeOperation))
+            {
+                Mod.log.Warn("[MP] NetSync: operation " + key.Operation + " from player " +
+                             key.Origin + " mixed incompatible course encodings; dropped whole operation.");
+                Diagnostics.FlightRecorder.Note("net incompatible multi-course op dropped=" +
+                                                  key.Operation);
+                SyncInbox.RequestResync("incompatible net operation rejected");
+                operation = null;
+                nativeOperation = false;
+                return false;
+            }
             return true;
         }
 

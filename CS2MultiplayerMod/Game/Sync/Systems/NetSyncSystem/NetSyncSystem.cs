@@ -156,16 +156,37 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // The net domain is applied directly while local previews are structurally isolated.
         private global::Game.Tools.ToolSystem _toolSystem;
         private global::Game.Tools.ApplyNetSystem _applyNetSystem;
+        private global::Game.Tools.ApplyObjectsSystem _applyObjectsSystem;
+        private global::Game.Tools.ApplyAreasSystem _applyAreasSystem;
         private global::Game.Tools.ApplyBrushesSystem _applyBrushesSystem;
-        private EntityQuery _tempNetEntities;
+        // Exact entity set consumed by the net apply pass. A road transaction is not only its
+        // visible nodes and edges: generated lanes and street-name aggregates participate too.
+        // Every isolation, validation, commit, drain, and discard must use this same boundary.
+        private EntityQuery _netTransactionTemps;
+        // The object apply pass consumes Object Temps while owned driveways/connectors and lots are
+        // consumed by the net and area passes. This all-Temp boundary keeps that native graph one
+        // transaction and also exposes unexpected shapes to validation instead of hiding them.
+        private EntityQuery _objectTransactionTemps;
+        // A standing interactive preview can span several domains (for example a building plus
+        // owned driveway nets). It must be frozen and restored as one graph.
+        private EntityQuery _standingTemps;
         private EntityQuery _localBrushTemps;
-        private readonly List<Entity> _isolatedLocalNetTemps = new List<Entity>();
+        private readonly List<Entity> _isolatedLocalTemps = new List<Entity>();
         private readonly List<Entity> _protectedRemoteNetTemps = new List<Entity>();
         private readonly List<Entity> _committingRemoteNetTemps = new List<Entity>();
         private readonly List<Entity> _isolatedLocalBrushTemps = new List<Entity>();
         private bool _clearLocalNetIsolationAfterBarrier;
         private bool _localToolOutputProtectedThisFrame;
         private bool _pendingApply;
+        private enum RemoteToolTransactionKind : byte { None, Net, ObjectGraph }
+        private RemoteToolTransactionKind _pendingTransactionKind;
+        private RemoteToolTransactionKind _committingTransactionKind;
+        private System.Action _onCommitComplete;
+        private bool _objectCommitThisFrame;
+        private long _pendingNetConstructionCharge;
+        private int _pendingNetConstructionChargeCourses;
+        private long _committingNetConstructionCharge;
+        private int _committingNetConstructionChargeCourses;
         // After a commit we must WAIT for its Temp entities to clear (the committed nodes/edges only
         // become query-able then) before building the next batch — otherwise a course that should
         // connect to the just-committed geometry cannot find it and lands on free ground.
@@ -198,7 +219,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         public bool DeferForTerrain;
         // Consecutive expired-window replays (reset by any successful commit). A batch whose
         // definitions the game always rejects would otherwise rebuild forever.
-        private int _expiryReplays;
+        private readonly CS2MultiplayerMod.Core.Sync.BoundedRetryBudget _applyReplayBudget =
+            new CS2MultiplayerMod.Core.Sync.BoundedRetryBudget(3);
 
         // The active net tool's latest native definitions, observed after ToolOutputBarrier. They
         // are the definitions that produced the standing preview Temps and therefore describe the
@@ -212,6 +234,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // resulting split/delete/replace, DeleteSync must not broadcast that lifecycle output as a
         // second command. The short expiry covers the apply and its immediate network aftermath.
         private readonly Dictionary<Entity, long> _committedNetSideEffects = new Dictionary<Entity, long>();
+        private readonly CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NetOperationKey>
+            _completedNetOperations =
+                new CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NetOperationKey>();
 
         private struct NativeTargetRetryKey : System.IEquatable<NativeTargetRetryKey>
         {
@@ -252,15 +277,30 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
             _toolSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ToolSystem>();
             _applyNetSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyNetSystem>();
+            _applyObjectsSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyObjectsSystem>();
+            _applyAreasSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyAreasSystem>();
             _applyBrushesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyBrushesSystem>();
-            // Live net Temp entities (a tool preview, or our own pre-commit definitions), used to
-            // confirm a commit (count drops to 0 after ApplyTool) and to detect a tool preview.
-            // Deleted is excluded: a wiped Temp lingers until Cleanup, and counting those corpses
-            // as live made the commit/drain checks act on a batch that no longer exists.
-            _tempNetEntities = GetEntityQuery(new EntityQueryDesc
+            // Mirror the net apply pass's complete transaction query, including any Temp already
+            // carrying Deleted. Such an entity makes validation reject the whole batch; silently
+            // omitting it here would still leave it visible to the apply pass and defeat isolation.
+            _netTransactionTemps = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[] { ComponentType.ReadOnly<Temp>() },
-                Any = new[] { ComponentType.ReadOnly<Edge>(), ComponentType.ReadOnly<Node>() },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<Node>(),
+                    ComponentType.ReadOnly<Edge>(),
+                    ComponentType.ReadOnly<Lane>(),
+                    ComponentType.ReadOnly<Aggregate>(),
+                },
+            });
+
+            _objectTransactionTemps = GetEntityQuery(
+                ComponentType.ReadOnly<Temp>());
+
+            _standingTemps = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<Temp>() },
                 None = new[] { ComponentType.ReadOnly<Deleted>() },
             });
 
@@ -421,7 +461,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
             else if (_pendingApply)
             {
-                ClearTempEntities(_tempNetEntities);
+                ClearTempEntities(ActiveTransactionQuery());
             }
             if (_committingRemoteNetTemps.Count > 0)
             {
@@ -437,11 +477,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _nativeTargetDeadlines.Clear();
             _operationAssemblyDeadlines.Clear();
             _nativeOperationDeadlines.Clear();
+            _operationBuildFailures.Clear();
+            _completedNetOperations.Clear();
             _recentRealizedSpans.Clear();
             _pendingApply = false;
+            _pendingTransactionKind = RemoteToolTransactionKind.None;
+            _committingTransactionKind = RemoteToolTransactionKind.None;
             _awaitingDrain = false;
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
+            _committingNetConstructionCharge = 0;
+            _committingNetConstructionChargeCourses = 0;
             _onCommitLost = null;
-            _expiryReplays = 0;
+            _onCommitComplete = null;
+            _applyReplayBudget.Reset();
             _suppressCaptureThisFrame = false;
             _prepDoneThisFrame = false;
             DeferForTerrain = false;

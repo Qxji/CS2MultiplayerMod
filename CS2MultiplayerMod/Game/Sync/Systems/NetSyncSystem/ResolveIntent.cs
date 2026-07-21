@@ -103,13 +103,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 if (xz > NativeNodeResolveXZ || dy > NativeTargetResolveY) continue;
 
                 bool prefabMatch = TargetPrefabMatches(entity, intent.TargetPrefabName);
+                if (!prefabMatch || !TargetContractMatches(entity, intent) ||
+                    !TargetOwnerMatches(entity, intent)) continue;
                 if (EntityManager.HasComponent<PrefabRef>(entity))
                 {
                     NetPrefabInfo targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
                     if (!LayersCanConnect(placedInfo, targetInfo)) continue;
                 }
 
-                float score = xz * xz + dy * dy * 0.25f + (prefabMatch ? 0f : 25f);
+                float score = xz * xz + dy * dy * 0.25f;
                 if (score >= best) continue;
                 best = score;
                 result = entity;
@@ -159,12 +161,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 bool prefabMatch = targetPrefab != Entity.Null &&
                     string.Equals(PrefabNameOf(targetPrefab), intent.TargetPrefabName,
                         System.StringComparison.Ordinal);
-                float score = xz * xz + dy * dy * 0.25f + (1f - alignment) * 16f +
-                              (prefabMatch || string.IsNullOrEmpty(intent.TargetPrefabName) ? 0f : 25f);
+                // An explicit source prefab is part of the portable edge identity. A nearby
+                // parallel road of another type is not an acceptable fallback: splitting it makes
+                // the receivers permanently disagree about which carriageway owns the junction.
+                if (!string.IsNullOrEmpty(intent.TargetPrefabName) && !prefabMatch) continue;
+                if (!TargetContractMatches(edge, intent) || !TargetOwnerMatches(edge, intent)) continue;
+                float score = xz * xz + dy * dy * 0.25f + (1f - alignment) * 16f;
                 if (score >= best) continue;
                 best = score;
                 bestEdge = edge;
-                bestT = t;
+                // When the receiver still has the exact source curve, preserve the captured split
+                // parameter instead of projecting the anchor and introducing solver-rounding drift.
+                Bezier4x3 localCurve = edgeCurves[i].m_Bezier;
+                if (SameCurveBits(localCurve, source)) bestT = sourceT;
+                else if (SameCurveBitsReversed(localCurve, source)) bestT = 1f - sourceT;
+                else bestT = t;
             }
 
             if (bestEdge == Entity.Null)
@@ -225,6 +236,55 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 c = new float3(intent.TargetCx, intent.TargetCy, intent.TargetCz),
                 d = new float3(intent.TargetDx, intent.TargetDy, intent.TargetDz),
             };
+        }
+
+        private bool TargetContractMatches(Entity entity, NetEndpointIntent intent)
+        {
+            if (!EntityManager.HasComponent<PrefabRef>(entity)) return false;
+            Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+            if (!EntityManager.HasComponent<NetData>(prefab)) return false;
+            NetData data = EntityManager.GetComponentData<NetData>(prefab);
+            return (uint)data.m_RequiredLayers == intent.TargetRequiredLayers &&
+                   (uint)data.m_ConnectLayers == intent.TargetConnectLayers;
+        }
+
+        private bool TargetOwnerMatches(Entity entity, NetEndpointIntent intent)
+        {
+            bool wantsOwner = !string.IsNullOrEmpty(intent.OwnerPrefabName);
+            Entity cursor = entity;
+            Entity top = Entity.Null;
+            for (int depth = 0; depth < 64 && EntityManager.HasComponent<Owner>(cursor); depth++)
+            {
+                Entity next = EntityManager.GetComponentData<Owner>(cursor).m_Owner;
+                if (next == Entity.Null || next == cursor || !EntityManager.Exists(next)) return false;
+                top = next;
+                cursor = next;
+            }
+            if (!wantsOwner) return top == Entity.Null;
+            if (top == Entity.Null || !EntityManager.HasComponent<PrefabRef>(top) ||
+                !EntityManager.HasComponent<global::Game.Objects.Transform>(top)) return false;
+            string prefabName = PrefabNameOf(EntityManager.GetComponentData<PrefabRef>(top).m_Prefab);
+            if (!string.Equals(prefabName, intent.OwnerPrefabName,
+                System.StringComparison.Ordinal)) return false;
+            global::Game.Objects.Transform transform =
+                EntityManager.GetComponentData<global::Game.Objects.Transform>(top);
+            float3 wantedPosition = new float3(intent.OwnerX, intent.OwnerY, intent.OwnerZ);
+            if (math.distancesq(transform.m_Position, wantedPosition) > 4f) return false;
+            quaternion wantedRotation = new quaternion(intent.OwnerRotX, intent.OwnerRotY,
+                intent.OwnerRotZ, intent.OwnerRotW);
+            return math.abs(math.dot(transform.m_Rotation.value, wantedRotation.value)) >= 0.999f;
+        }
+
+        private static bool SameCurveBits(Bezier4x3 left, Bezier4x3 right)
+        {
+            return math.all(left.a == right.a) && math.all(left.b == right.b) &&
+                   math.all(left.c == right.c) && math.all(left.d == right.d);
+        }
+
+        private static bool SameCurveBitsReversed(Bezier4x3 left, Bezier4x3 right)
+        {
+            return math.all(left.a == right.d) && math.all(left.b == right.c) &&
+                   math.all(left.c == right.b) && math.all(left.d == right.a);
         }
     }
 }

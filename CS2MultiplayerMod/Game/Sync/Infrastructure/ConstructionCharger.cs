@@ -40,9 +40,18 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
         public static void ChargeNet(EntityManager em, Entity prefab, float length, string name)
         {
             if (!em.HasComponent<PlaceableNetData>(prefab)) return;
+            int cells = math.max(1, (int)math.round(length / 8f));
+            Charge(em, CalculateNetCost(em, prefab, length),
+                name + " x" + cells + " cells (8m approximation)");
+        }
+
+        /// <summary>Calculate one net course's host-authoritative charge without mutating money.</summary>
+        public static long CalculateNetCost(EntityManager em, Entity prefab, float length)
+        {
+            if (!em.HasComponent<PlaceableNetData>(prefab)) return 0;
             uint perCell = em.GetComponentData<PlaceableNetData>(prefab).m_DefaultConstructionCost;
             int cells = math.max(1, (int)math.round(length / 8f));
-            Charge(em, (long)perCell * cells, name + " x" + cells + " cells (8m approximation)");
+            return (long)perCell * cells;
         }
 
         /// <summary>A price already known in money terms (e.g. a remote map tile purchase).</summary>

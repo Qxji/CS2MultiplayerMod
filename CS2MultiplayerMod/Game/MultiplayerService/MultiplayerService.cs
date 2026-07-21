@@ -42,6 +42,12 @@ namespace CS2MultiplayerMod.Game
         /// <summary>If a received world never starts loading in this time, give up and recover.</summary>
         private const long MapLoadTimeoutMs = 120000;
 
+        // Reliable commands sent after the map blob are causally newer than that snapshot. World
+        // replacement destroys and recreates all ECS observers, so the process-wide service keeps
+        // that suffix until the new world is ready.
+        private const int PostLoadCommandCap = 8192;
+        private const int PostLoadCommandBytesCap = 32 * 1024 * 1024;
+
         private const string MapChannel = "map";
 
         private readonly IModLogger _log;
@@ -49,6 +55,8 @@ namespace CS2MultiplayerMod.Game
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly ConcurrentDictionary<int, RemotePlayer> _remotePlayers =
             new ConcurrentDictionary<int, RemotePlayer>();
+        private readonly PostLoadCommandJournal _postLoadCommands =
+            new PostLoadCommandJournal(PostLoadCommandCap, PostLoadCommandBytesCap);
 
         private ClientWorldPhase _phase = ClientWorldPhase.None;
         private long _phaseChangedMs;
@@ -85,7 +93,8 @@ namespace CS2MultiplayerMod.Game
                 AreaCreateCommand.Id, AreaUpdateCommand.Id, AreaDeleteCommand.Id,
                 RouteCreateCommand.Id, RouteUpdateCommand.Id, RouteDeleteCommand.Id,
                 TilePurchaseCommand.Id, EntityPolicyCommand.Id, DevTreePurchaseCommand.Id,
-                NetReplaceCommand.Id);
+                NetReplaceCommand.Id, ObjectToolOperationCommand.Id,
+                VisualCustomizationCommand.Id, ColorPaletteCommand.Id);
         }
 
         public MultiplayerSession Session => _session;
@@ -158,6 +167,43 @@ namespace CS2MultiplayerMod.Game
                 " total=" + _appliedCommandTotal);
         }
 
+        private bool JournalCommandDuringWorldLoad(SimulationCommandMessage command)
+        {
+            if (_session.Role != SessionRole.Client || _phase != ClientWorldPhase.LoadingMap)
+                return false;
+
+            bool wasOverflowed = _postLoadCommands.Overflowed;
+            bool accepted = _postLoadCommands.TryAppend(command);
+            if (!accepted && !wasOverflowed)
+            {
+                _log.Error("[MP] Post-load command journal overflowed; a fresh world sync will be " +
+                           "requested after loading instead of applying a partial command suffix.");
+                Diagnostics.FlightRecorder.Note("post-load command journal overflow");
+            }
+            return true;
+        }
+
+        private void CompletePostLoadCommandCatchup()
+        {
+            int count = _postLoadCommands.Count;
+            int bytes = _postLoadCommands.Bytes;
+            List<SimulationCommandMessage> commands;
+            if (!_postLoadCommands.TryTakeAll(out commands))
+            {
+                SetPhase(ClientWorldPhase.WaitingForMap);
+                _session.RequestWorldSync();
+                return;
+            }
+
+            if (commands.Count == 0) return;
+            _log.Info("[MP] Replaying " + count + " command(s) received during world load (" +
+                      bytes + " bytes).");
+            Diagnostics.FlightRecorder.Note("post-load command replay count=" + count +
+                                              " bytes=" + bytes);
+            for (int i = 0; i < commands.Count; i++)
+                _session.DispatchBufferedCommand(commands[i]);
+        }
+
         private void ResetCommandDiagnostics()
         {
             _appliedCommandTotal = 0;
@@ -182,6 +228,7 @@ namespace CS2MultiplayerMod.Game
                 case TerrainBrushCommand.Id: return "terrain-brush";
                 case UpgradePlacementCommand.Id: return "building-upgrade";
                 case ObjectMoveCommand.Id: return "object-move";
+                case ObjectToolOperationCommand.Id: return "object-native-operation";
                 case NetUpgradeCommand.Id: return "net-upgrade";
                 case AreaCreateCommand.Id: return "area-create";
                 case AreaDeleteCommand.Id: return "area-delete";
@@ -193,6 +240,8 @@ namespace CS2MultiplayerMod.Game
                 case RouteUpdateCommand.Id: return "route-update";
                 case DevTreePurchaseCommand.Id: return "dev-tree-purchase";
                 case NetReplaceCommand.Id: return "net-replace";
+                case VisualCustomizationCommand.Id: return "visual-customization";
+                case ColorPaletteCommand.Id: return "color-palette";
                 default: return "unknown";
             }
         }
@@ -372,8 +421,11 @@ namespace CS2MultiplayerMod.Game
                 _log.Info("[MP] " + (sender ?? "system") + ": " + text);
                 _service.AppendChatEntry(sender, text);
             }
-            public override void OnCommandReceived(SimulationCommandMessage command) =>
+            public override void OnCommandReceived(SimulationCommandMessage command)
+            {
+                if (_service.JournalCommandDuringWorldLoad(command)) return;
                 _service.RecordAppliedCommand(command);
+            }
             public override void OnPlayerStateReceived(PlayerStateMessage state) => _service.RecordRemotePlayer(state);
             public override void OnBlobReceived(string channel, byte[] data)
             {
