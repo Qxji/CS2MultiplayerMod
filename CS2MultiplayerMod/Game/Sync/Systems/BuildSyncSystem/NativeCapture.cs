@@ -16,6 +16,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
         private long _nextLocalObjectOperationId = 1;
         private bool _nativeLifecycleCapturedThisFrame;
+        private ObjectToolOperationCommand _pendingSpecializedObjectOperation;
+        private ObjectToolDefinitionIntent _pendingSpecializedAreaDefinition;
+        private Entity _pendingSpecializedArea;
+        private Entity _pendingSpecializedOwner;
+        private bool _completeSpecializedAreaThisFrame;
 
         /// <summary>
         /// True through ModificationEnd when this frame's object-tool Apply was already published
@@ -32,12 +37,71 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         public void ObserveLocalObjectDefinitions(NativeArray<Entity> definitions)
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
+            Entity recreate = _areaToolSystem != null ? _areaToolSystem.recreate : Entity.Null;
+
+            // Specialized-industry placement is one native action split across two tools. The
+            // object tool first commits the main building and hands its owned lot to the area tool;
+            // only after the polygon closes does the area tool return to the object tool. Preserve
+            // the standing object definition through that handoff, then publish it with the final
+            // extractor/storage polygon as one atomic operation.
+            bool areaHandoff = recreate != Entity.Null &&
+                               (active is AreaToolSystem || active is ObjectToolSystem);
+            if (areaHandoff)
+            {
+                if (_pendingSpecializedObjectOperation == null &&
+                    _cachedLocalObjectOperation != null &&
+                    TryBeginSpecializedAreaCapture(recreate))
+                {
+                    Diagnostics.FlightRecorder.Note("specialized object/area handoff tracked");
+                }
+
+                if (_pendingSpecializedObjectOperation != null)
+                {
+                    if (_pendingSpecializedArea != recreate ||
+                        !SpecializedAreaOwnerStillMatches(recreate,
+                            _pendingSpecializedObjectOperation))
+                    {
+                        ClearSpecializedAreaCapture();
+                    }
+                    else
+                    {
+                        TryFindTopOwner(recreate, out _pendingSpecializedOwner);
+                        ObjectToolDefinitionIntent areaDefinition;
+                        if (TryCaptureSpecializedAreaDefinition(definitions, recreate,
+                                _pendingSpecializedObjectOperation, out areaDefinition))
+                            _pendingSpecializedAreaDefinition = areaDefinition;
+
+                        // On the completion frame AreaToolSystem switches activeTool back to the
+                        // object tool, while ToolSystem.applyMode still belongs to the area tool
+                        // that produced this output batch.
+                        if (active is ObjectToolSystem &&
+                            _toolSystem.applyMode == ApplyMode.Apply &&
+                            _pendingSpecializedAreaDefinition != null)
+                            _completeSpecializedAreaThisFrame = true;
+                        return;
+                    }
+                }
+
+                if (active is AreaToolSystem)
+                {
+                    _cachedLocalObjectOperation = null;
+                    return;
+                }
+            }
+
+            if (_pendingSpecializedObjectOperation != null)
+                ClearSpecializedAreaCapture();
             if (!(active is ObjectToolSystem))
             {
                 _cachedLocalObjectOperation = null;
                 return;
             }
 
+            CaptureObjectToolOperation(definitions);
+        }
+
+        private void CaptureObjectToolOperation(NativeArray<Entity> definitions)
+        {
             var captured = new List<ObjectToolDefinitionIntent>();
             int root = -1;
             for (int i = 0; i < definitions.Length; i++)
@@ -85,24 +149,267 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Diagnostics.FlightRecorder.Note("object native definitions observed=" + captured.Count);
         }
 
+        private bool TryBeginSpecializedAreaCapture(Entity recreate)
+        {
+            if (!SpecializedAreaOwnerStillMatches(recreate, _cachedLocalObjectOperation))
+                return false;
+            _pendingSpecializedObjectOperation = _cachedLocalObjectOperation;
+            _pendingSpecializedArea = recreate;
+            TryFindTopOwner(recreate, out _pendingSpecializedOwner);
+            _pendingSpecializedAreaDefinition = null;
+            _cachedLocalObjectOperation = null;
+            return true;
+        }
+
+        private bool SpecializedAreaOwnerStillMatches(Entity area,
+            ObjectToolOperationCommand operation)
+        {
+            if (area == Entity.Null || !EntityManager.Exists(area)) return false;
+
+            Entity topOwner;
+            return TryFindTopOwner(area, out topOwner) &&
+                   SpecializedObjectMatchesRoot(topOwner, operation);
+        }
+
+        private bool SpecializedObjectMatchesRoot(Entity topOwner,
+            ObjectToolOperationCommand operation)
+        {
+            if (operation == null || operation.Definitions == null ||
+                operation.RootIndex < 0 || operation.RootIndex >= operation.Definitions.Length ||
+                topOwner == Entity.Null || !EntityManager.Exists(topOwner) ||
+                !EntityManager.HasComponent<PrefabRef>(topOwner) ||
+                !EntityManager.HasComponent<global::Game.Objects.Transform>(topOwner)) return false;
+
+            ObjectToolDefinitionIntent root = operation.Definitions[operation.RootIndex];
+            if (root == null || root.Kind != ObjectToolDefinitionKind.Object ||
+                root.PrefabIsNull || string.IsNullOrEmpty(root.PrefabName) ||
+                root.Original.Kind != PortableEntityKind.None) return false;
+            Entity ownerPrefab = EntityManager.GetComponentData<PrefabRef>(topOwner).m_Prefab;
+            if (_prefabSystem.GetPrefabName(ownerPrefab) != root.PrefabName) return false;
+            global::Game.Objects.Transform ownerTransform =
+                EntityManager.GetComponentData<global::Game.Objects.Transform>(topOwner);
+            float3 wantedPosition = new float3(root.Object.PosX, root.Object.PosY, root.Object.PosZ);
+            if (math.distancesq(ownerTransform.m_Position, wantedPosition) > 4f) return false;
+
+            quaternion wantedRotation = new quaternion(root.Object.RotX, root.Object.RotY,
+                root.Object.RotZ, root.Object.RotW);
+            return math.abs(math.dot(ownerTransform.m_Rotation.value,
+                       wantedRotation.value)) >= 0.98f;
+        }
+
+        private bool TryCaptureSpecializedAreaDefinition(NativeArray<Entity> definitions,
+            Entity recreate, ObjectToolOperationCommand operation,
+            out ObjectToolDefinitionIntent result)
+        {
+            result = null;
+            ObjectToolDefinitionIntent root = operation.Definitions[operation.RootIndex];
+            for (int i = 0; i < definitions.Length; i++)
+            {
+                Entity entity = definitions[i];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<CreationDefinition>(entity) ||
+                    !EntityManager.HasBuffer<global::Game.Areas.Node>(entity)) continue;
+
+                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
+                if (creation.m_Original != recreate || creation.m_Prefab == Entity.Null ||
+                    !IsSpecializedAreaPrefab(creation.m_Prefab)) continue;
+
+                ObjectToolDefinitionIntent captured;
+                if (!TryCaptureObjectToolDefinition(entity, out captured) ||
+                    captured.Kind != ObjectToolDefinitionKind.Area ||
+                    captured.AreaNodes == null || captured.AreaNodes.Length < 3) continue;
+
+                // More than one definition targeting the recreated specialized lot would be
+                // ambiguous; retain the last known-good preview instead of sending a partial graph.
+                if (result != null) return false;
+
+                // The sender edits its already-created owned area. The receiver is creating the
+                // whole graph for the first time, so remove sender-local entity references and
+                // recreation flags, then bind the area to the new root by stable owner identity.
+                captured.Original = default(PortableEntityRef);
+                captured.Owner = default(PortableEntityRef);
+                captured.Attached = default(PortableEntityRef);
+                captured.CreationFlags = 0;
+                captured.HasOwnerDefinition = true;
+                captured.OwnerDefinitionPrefabName = root.PrefabName;
+                captured.OwnerDefinitionX = root.Object.PosX;
+                captured.OwnerDefinitionY = root.Object.PosY;
+                captured.OwnerDefinitionZ = root.Object.PosZ;
+                captured.OwnerDefinitionRotX = root.Object.RotX;
+                captured.OwnerDefinitionRotY = root.Object.RotY;
+                captured.OwnerDefinitionRotZ = root.Object.RotZ;
+                captured.OwnerDefinitionRotW = root.Object.RotW;
+                result = captured;
+            }
+            return result != null;
+        }
+
+        private bool IsSpecializedAreaPrefab(Entity prefab)
+        {
+            return prefab != Entity.Null && EntityManager.Exists(prefab) &&
+                   (EntityManager.HasComponent<ExtractorAreaData>(prefab) ||
+                    EntityManager.HasComponent<StorageAreaData>(prefab));
+        }
+
+        private bool IsSpecializedAreaDefinitionForRoot(ObjectToolDefinitionIntent definition,
+            ObjectToolDefinitionIntent root)
+        {
+            if (definition == null || definition.Kind != ObjectToolDefinitionKind.Area ||
+                !definition.HasOwnerDefinition ||
+                definition.OwnerDefinitionPrefabName != root.PrefabName ||
+                string.IsNullOrEmpty(definition.PrefabName)) return false;
+            Entity prefab;
+            return _prefabIndex.TryResolve(definition.PrefabName, out prefab) &&
+                   IsSpecializedAreaPrefab(prefab);
+        }
+
+        private void PublishSpecializedAreaOperation()
+        {
+            ObjectToolOperationCommand source = _pendingSpecializedObjectOperation;
+            ObjectToolDefinitionIntent root = source.Definitions[source.RootIndex];
+            var definitions = new List<ObjectToolDefinitionIntent>(source.Definitions.Length + 1);
+            short rootIndex = -1;
+            for (int i = 0; i < source.Definitions.Length; i++)
+            {
+                ObjectToolDefinitionIntent definition = source.Definitions[i];
+                if (IsSpecializedAreaDefinitionForRoot(definition, root)) continue;
+                if (i == source.RootIndex) rootIndex = (short)definitions.Count;
+                definitions.Add(definition);
+            }
+            definitions.Add(_pendingSpecializedAreaDefinition);
+
+            if (rootIndex < 0 || definitions.Count > ObjectToolOperationCommand.MaxDefinitions)
+            {
+                Mod.log.Warn("[MP] BuildSync: specialized object/area operation was incomplete; not sent.");
+                ClearSpecializedAreaCapture();
+                return;
+            }
+
+            var operation = new ObjectToolOperationCommand
+            {
+                RootIndex = rootIndex,
+                Definitions = definitions.ToArray(),
+            };
+            try
+            {
+                if (TryPublishLocalObjectOperation(operation))
+                    Diagnostics.FlightRecorder.Note("specialized object/area operation captured op=" +
+                        operation.OperationId + " defs=" + operation.Definitions.Length +
+                        " areaNodes=" + _pendingSpecializedAreaDefinition.AreaNodes.Length);
+            }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] BuildSync: specialized object/area operation was not sent: " +
+                             ex.Message);
+                Diagnostics.FlightRecorder.Note("specialized object/area capture rejected=" +
+                                                  ex.GetType().Name);
+            }
+            finally
+            {
+                ClearSpecializedAreaCapture();
+                _cachedLocalObjectOperation = null;
+            }
+        }
+
+        private void ClearSpecializedAreaCapture()
+        {
+            _pendingSpecializedObjectOperation = null;
+            _pendingSpecializedAreaDefinition = null;
+            _pendingSpecializedArea = Entity.Null;
+            _pendingSpecializedOwner = Entity.Null;
+            _completeSpecializedAreaThisFrame = false;
+        }
+
+        /// <summary>
+        /// Publish only after the area apply has reached live entities. DefinitionGateSystem can
+        /// discard local definitions while a remote transaction owns the apply slot; checking the
+        /// live polygon here prevents broadcasting an edit that was not committed on this machine.
+        /// </summary>
+        private void CaptureCompletedSpecializedArea()
+        {
+            if (!_completeSpecializedAreaThisFrame) return;
+            _completeSpecializedAreaThisFrame = false;
+            if (!CompletedSpecializedAreaMatchesCapture())
+            {
+                Diagnostics.FlightRecorder.Note("specialized object/area apply not observed");
+                ClearSpecializedAreaCapture();
+                return;
+            }
+            PublishSpecializedAreaOperation();
+        }
+
+        private bool CompletedSpecializedAreaMatchesCapture()
+        {
+            ObjectToolDefinitionIntent expected = _pendingSpecializedAreaDefinition;
+            if (expected == null || !SpecializedObjectMatchesRoot(_pendingSpecializedOwner,
+                    _pendingSpecializedObjectOperation)) return false;
+
+            NativeArray<Entity> areas = _portableAreas.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < areas.Length; i++)
+                {
+                    Entity area = areas[i];
+                    Entity topOwner;
+                    if (!TryFindTopOwner(area, out topOwner) ||
+                        topOwner != _pendingSpecializedOwner) continue;
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(area).m_Prefab;
+                    if (_prefabSystem.GetPrefabName(prefab) != expected.PrefabName) continue;
+                    DynamicBuffer<global::Game.Areas.Node> actual =
+                        EntityManager.GetBuffer<global::Game.Areas.Node>(area, isReadOnly: true);
+                    if (PolygonMatches(actual, expected.AreaNodes)) return true;
+                }
+                return false;
+            }
+            finally
+            {
+                areas.Dispose();
+            }
+        }
+
+        private static bool PolygonMatches(DynamicBuffer<global::Game.Areas.Node> actual,
+            ObjectAreaNodeIntent[] expected)
+        {
+            if (expected == null || actual.Length != expected.Length || actual.Length < 3)
+                return false;
+            for (int start = 0; start < actual.Length; start++)
+            {
+                if (!AreaNodeMatches(actual[start], expected[0])) continue;
+                bool forward = true;
+                bool reverse = true;
+                for (int i = 1; i < expected.Length && (forward || reverse); i++)
+                {
+                    forward &= AreaNodeMatches(actual[(start + i) % actual.Length], expected[i]);
+                    int reverseIndex = (start - i + actual.Length) % actual.Length;
+                    reverse &= AreaNodeMatches(actual[reverseIndex], expected[i]);
+                }
+                if (forward || reverse) return true;
+            }
+            return false;
+        }
+
+        private static bool AreaNodeMatches(global::Game.Areas.Node actual,
+            ObjectAreaNodeIntent expected)
+        {
+            float3 wanted = new float3(expected.X, expected.Y, expected.Z);
+            if (math.distancesq(actual.m_Position, wanted) > 0.0625f) return false;
+            if (actual.m_Elevation == float.MinValue || expected.Elevation == float.MinValue)
+                return actual.m_Elevation == expected.Elevation;
+            return math.abs(actual.m_Elevation - expected.Elevation) <= 0.25f;
+        }
+
         /// <summary>Publish the cached batch when the object tool enters Apply.</summary>
         public void CaptureLocalObjectApply()
         {
             _nativeLifecycleCapturedThisFrame = false;
             if (!_localObjectApplyThisFrame || _cachedLocalObjectOperation == null) return;
 
-            MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady) return;
-
             try
             {
-                _cachedLocalObjectOperation.OperationId = _nextLocalObjectOperationId++;
-                byte[] body = _cachedLocalObjectOperation.Encode();
-                service.Session.SendCommand(0, ObjectToolOperationCommand.Id, body);
-                _nativeLifecycleCapturedThisFrame = true;
-                Diagnostics.FlightRecorder.Note("object operation captured op=" +
-                    _cachedLocalObjectOperation.OperationId + " defs=" +
-                    _cachedLocalObjectOperation.Definitions.Length);
+                if (TryPublishLocalObjectOperation(_cachedLocalObjectOperation))
+                    Diagnostics.FlightRecorder.Note("object operation captured op=" +
+                        _cachedLocalObjectOperation.OperationId + " defs=" +
+                        _cachedLocalObjectOperation.Definitions.Length);
             }
             catch (System.Exception ex)
             {
@@ -114,6 +421,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             {
                 _cachedLocalObjectOperation = null;
             }
+        }
+
+        private bool TryPublishLocalObjectOperation(ObjectToolOperationCommand operation)
+        {
+            MultiplayerService service = Mod.Service;
+            if (service == null || !service.GameplaySyncReady) return false;
+            operation.OperationId = _nextLocalObjectOperationId++;
+            byte[] body = operation.Encode();
+            service.Session.SendCommand(0, ObjectToolOperationCommand.Id, body);
+            _nativeLifecycleCapturedThisFrame = true;
+            return true;
         }
 
         private bool TryCaptureObjectToolDefinition(Entity entity,

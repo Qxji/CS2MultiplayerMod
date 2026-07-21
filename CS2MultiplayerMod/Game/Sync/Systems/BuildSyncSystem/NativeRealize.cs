@@ -232,6 +232,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool TryFindUnsafeSimulationReference(ObjectToolOperationCommand command,
             out string prefabName)
         {
+            bool allowSpecializedRoot = IsSpecializedIndustryPlacement(command);
             for (int i = 0; i < command.Definitions.Length; i++)
             {
                 ObjectToolDefinitionIntent definition = command.Definitions[i];
@@ -244,7 +245,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         (definition.Kind == ObjectToolDefinitionKind.Object &&
                          definition.Original.Kind == PortableEntityKind.None &&
                          EntityManager.HasComponent<SpawnableBuildingData>(prefab) &&
-                         !EntityManager.HasComponent<SignatureBuildingData>(prefab)))
+                         !EntityManager.HasComponent<SignatureBuildingData>(prefab) &&
+                         !(i == command.RootIndex && allowSpecializedRoot)))
                     {
                         prefabName = definition.PrefabName;
                         return true;
@@ -266,6 +268,84 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             prefabName = null;
+            return false;
+        }
+
+        /// <summary>
+        /// A specialized-industry main building can use the same spawnable prefab machinery as
+        /// zone growth, but its object-tool transaction is distinguishable: a newly-created root
+        /// owns an extractor/storage area declared by that root prefab. Require that complete
+        /// contract before exempting only the root from the generic growable rejection.
+        /// </summary>
+        private bool IsSpecializedIndustryPlacement(ObjectToolOperationCommand command)
+        {
+            if (command == null || command.Definitions == null || command.RootIndex < 0 ||
+                command.RootIndex >= command.Definitions.Length) return false;
+            ObjectToolDefinitionIntent root = command.Definitions[command.RootIndex];
+            if (root == null || root.Kind != ObjectToolDefinitionKind.Object || root.PrefabIsNull ||
+                root.Original.Kind != PortableEntityKind.None ||
+                root.Owner.Kind != PortableEntityKind.None ||
+                root.Attached.Kind != PortableEntityKind.None) return false;
+
+            CreationFlags rootFlags = (CreationFlags)root.CreationFlags;
+            if ((rootFlags & (CreationFlags.Delete | CreationFlags.Relocate |
+                              CreationFlags.Recreate | CreationFlags.Upgrade |
+                              CreationFlags.Permanent)) != 0) return false;
+
+            Entity rootPrefab;
+            if (!_prefabIndex.TryResolve(root.PrefabName, out rootPrefab) ||
+                !EntityManager.HasComponent<SpawnableBuildingData>(rootPrefab) ||
+                EntityManager.HasComponent<SignatureBuildingData>(rootPrefab)) return false;
+
+            for (int i = 0; i < command.Definitions.Length; i++)
+            {
+                ObjectToolDefinitionIntent area = command.Definitions[i];
+                if (area == null || area.Kind != ObjectToolDefinitionKind.Area ||
+                    area.PrefabIsNull || !area.HasOwnerDefinition ||
+                    area.OwnerDefinitionPrefabName != root.PrefabName ||
+                    area.Original.Kind != PortableEntityKind.None ||
+                    area.Owner.Kind != PortableEntityKind.None ||
+                    area.Attached.Kind != PortableEntityKind.None ||
+                    area.CreationFlags != 0 || area.AreaNodes == null ||
+                    area.AreaNodes.Length < 3) continue;
+
+                float3 rootPosition = new float3(root.Object.PosX, root.Object.PosY,
+                    root.Object.PosZ);
+                float3 ownerPosition = new float3(area.OwnerDefinitionX,
+                    area.OwnerDefinitionY, area.OwnerDefinitionZ);
+                if (math.distancesq(rootPosition, ownerPosition) > 0.01f) continue;
+                float4 rootRotation = new float4(root.Object.RotX, root.Object.RotY,
+                    root.Object.RotZ, root.Object.RotW);
+                float4 ownerRotation = new float4(area.OwnerDefinitionRotX,
+                    area.OwnerDefinitionRotY, area.OwnerDefinitionRotZ,
+                    area.OwnerDefinitionRotW);
+                if (math.abs(math.dot(rootRotation, ownerRotation)) < 0.999f) continue;
+
+                Entity areaPrefab;
+                if (!_prefabIndex.TryResolve(area.PrefabName, out areaPrefab) ||
+                    !IsSpecializedAreaPrefab(areaPrefab) ||
+                    !PrefabDeclaresOwnedArea(rootPrefab, areaPrefab)) continue;
+                return true;
+            }
+            return false;
+        }
+
+        private bool PrefabDeclaresOwnedArea(Entity objectPrefab, Entity areaPrefab)
+        {
+            if (!EntityManager.HasBuffer<SubArea>(objectPrefab)) return false;
+            DynamicBuffer<SubArea> subAreas =
+                EntityManager.GetBuffer<SubArea>(objectPrefab, isReadOnly: true);
+            for (int i = 0; i < subAreas.Length; i++)
+            {
+                Entity declared = subAreas[i].m_Prefab;
+                if (declared == areaPrefab) return true;
+                if (declared == Entity.Null || !EntityManager.Exists(declared)) continue;
+                if (!EntityManager.HasBuffer<PlaceholderObjectElement>(declared)) continue;
+                DynamicBuffer<PlaceholderObjectElement> candidates =
+                    EntityManager.GetBuffer<PlaceholderObjectElement>(declared, isReadOnly: true);
+                for (int j = 0; j < candidates.Length; j++)
+                    if (candidates[j].m_Object == areaPrefab) return true;
+            }
             return false;
         }
 

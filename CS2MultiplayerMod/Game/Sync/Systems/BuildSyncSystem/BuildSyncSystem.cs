@@ -65,6 +65,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private PrefabIndex _prefabIndex;
         private CityStateSyncSystem _cityStateSync;
         private ToolSystem _toolSystem;
+        private AreaToolSystem _areaToolSystem;
         private bool _localObjectApplyThisFrame;
         private EntityQuery _createdObjects;
         private EntityQuery _liveNodes;
@@ -88,6 +89,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
             _cityStateSync = World.GetOrCreateSystemManaged<CityStateSyncSystem>();
             _toolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
+            _areaToolSystem = World.GetOrCreateSystemManaged<AreaToolSystem>();
             _prefabIndex = new PrefabIndex(_prefabSystem, GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
 
             _cityConfig = World.GetOrCreateSystemManaged<CityConfigurationSystem>();
@@ -191,6 +193,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _attachRetry.Clear();
             DrainNativeObjectOperations();
             _cachedLocalObjectOperation = null;
+            ClearSpecializedAreaCapture();
             _nativeLifecycleCapturedThisFrame = false;
             _localObjectApplyThisFrame = false;
             DeferForTerrain = false;
@@ -219,6 +222,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             MultiplayerSession session = service.Session;
             if (ready)
             {
+                CaptureCompletedSpecializedArea();
                 PrioritizeCreatedTrees(session);
                 _guard.Prune(now);
                 CaptureNewObjects(session, now);
