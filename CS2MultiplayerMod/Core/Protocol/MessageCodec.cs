@@ -41,6 +41,7 @@ namespace CS2MultiplayerMod.Core.Protocol
                 ProtocolConstants.BlobChunkBytes + 1024);
             codec.Register(MessageType.StateEdit, () => new StateEditMessage(), 128 * 1024);
             codec.Register(MessageType.ResyncRequest, () => new ResyncRequestMessage(), 64);
+            codec.Register(MessageType.WorldSyncControl, () => new WorldSyncControlMessage(), 64);
             return codec;
         }
 

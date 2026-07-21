@@ -20,6 +20,7 @@ namespace CS2MultiplayerMod.Game
         Connecting,
         WaitingForMap,
         LoadingMap,
+        WaitingForResume,
         InSession,
     }
 
@@ -42,12 +43,6 @@ namespace CS2MultiplayerMod.Game
         /// <summary>If a received world never starts loading in this time, give up and recover.</summary>
         private const long MapLoadTimeoutMs = 120000;
 
-        // Reliable commands sent after the map blob are causally newer than that snapshot. World
-        // replacement destroys and recreates all ECS observers, so the process-wide service keeps
-        // that suffix until the new world is ready.
-        private const int PostLoadCommandCap = 8192;
-        private const int PostLoadCommandBytesCap = 32 * 1024 * 1024;
-
         private const string MapChannel = "map";
 
         private readonly IModLogger _log;
@@ -55,9 +50,6 @@ namespace CS2MultiplayerMod.Game
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly ConcurrentDictionary<int, RemotePlayer> _remotePlayers =
             new ConcurrentDictionary<int, RemotePlayer>();
-        private readonly PostLoadCommandJournal _postLoadCommands =
-            new PostLoadCommandJournal(PostLoadCommandCap, PostLoadCommandBytesCap);
-
         private ClientWorldPhase _phase = ClientWorldPhase.None;
         private long _phaseChangedMs;
         private bool _sawLoading;
@@ -119,6 +111,7 @@ namespace CS2MultiplayerMod.Game
         public bool GameplaySyncReady =>
             ModEnabled &&
             _session.Status == SessionStatus.Connected &&
+            !_worldSyncBarrierActive &&
             (_session.Role == SessionRole.Host || _phase == ClientWorldPhase.InSession);
 
         internal string CommandDiagnosticSnapshot(long nowMs)
@@ -165,43 +158,6 @@ namespace CS2MultiplayerMod.Game
                 " bytes=" + _lastAppliedCommandBytes +
                 " sinceLast=" + commandsSinceLog +
                 " total=" + _appliedCommandTotal);
-        }
-
-        private bool JournalCommandDuringWorldLoad(SimulationCommandMessage command)
-        {
-            if (_session.Role != SessionRole.Client || _phase != ClientWorldPhase.LoadingMap)
-                return false;
-
-            bool wasOverflowed = _postLoadCommands.Overflowed;
-            bool accepted = _postLoadCommands.TryAppend(command);
-            if (!accepted && !wasOverflowed)
-            {
-                _log.Error("[MP] Post-load command journal overflowed; a fresh world sync will be " +
-                           "requested after loading instead of applying a partial command suffix.");
-                Diagnostics.FlightRecorder.Note("post-load command journal overflow");
-            }
-            return true;
-        }
-
-        private void CompletePostLoadCommandCatchup()
-        {
-            int count = _postLoadCommands.Count;
-            int bytes = _postLoadCommands.Bytes;
-            List<SimulationCommandMessage> commands;
-            if (!_postLoadCommands.TryTakeAll(out commands))
-            {
-                SetPhase(ClientWorldPhase.WaitingForMap);
-                _session.RequestWorldSync();
-                return;
-            }
-
-            if (commands.Count == 0) return;
-            _log.Info("[MP] Replaying " + count + " command(s) received during world load (" +
-                      bytes + " bytes).");
-            Diagnostics.FlightRecorder.Note("post-load command replay count=" + count +
-                                              " bytes=" + bytes);
-            for (int i = 0; i < commands.Count; i++)
-                _session.DispatchBufferedCommand(commands[i]);
         }
 
         private void ResetCommandDiagnostics()
@@ -361,6 +317,7 @@ namespace CS2MultiplayerMod.Game
                 else if (status == SessionStatus.Offline || status == SessionStatus.Faulted)
                 {
                     if (status == SessionStatus.Faulted) _service._lastFault = detail;
+                    _service.ResetWorldSyncState(restoreSpeed: true);
                     _service.SetPhase(ClientWorldPhase.None);
                     _service._remotePlayers.Clear();
                 }
@@ -423,13 +380,17 @@ namespace CS2MultiplayerMod.Game
             }
             public override void OnCommandReceived(SimulationCommandMessage command)
             {
-                if (_service.JournalCommandDuringWorldLoad(command)) return;
                 _service.RecordAppliedCommand(command);
             }
             public override void OnPlayerStateReceived(PlayerStateMessage state) => _service.RecordRemotePlayer(state);
-            public override void OnBlobReceived(string channel, byte[] data)
+            public override void OnBlobReceived(string channel, long transferId, byte[] data)
             {
-                if (channel == MapChannel) _service.LoadReceivedMap(data);
+                if (channel == MapChannel) _service.LoadReceivedMap(transferId, data);
+            }
+            public override void OnWorldSyncControl(WorldSyncStage stage, long epoch,
+                float resumeSpeed, Core.Networking.ConnectionId connection)
+            {
+                _service.HandleWorldSyncControl(stage, epoch, resumeSpeed);
             }
             public override void OnError(string message)
             {

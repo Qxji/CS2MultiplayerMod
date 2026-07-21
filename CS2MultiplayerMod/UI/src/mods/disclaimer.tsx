@@ -42,7 +42,7 @@ const styles: Record<string, CSSProperties> = {
     },
     panel: {
         width: "480rem",
-        maxWidth: "calc(100vw - 48rem)",
+        maxWidth: "90%",
         backgroundColor: "rgba(24, 33, 51, 0.97)",
         borderRadius: "4rem",
         padding: "24rem",

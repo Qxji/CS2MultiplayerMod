@@ -101,12 +101,21 @@ namespace CS2MultiplayerMod.Core.Session
                 catch (Exception ex) { LogObserverError("OnPlayerStateReceived", ex); }
         }
 
-        private void NotifyBlob(string channel, byte[] data)
+        private void NotifyBlob(string channel, long transferId, byte[] data)
         {
-            _log.Info("Blob '" + channel + "' received (" + data.Length + " bytes).");
+            _log.Info("Blob '" + channel + "' transfer " + transferId + " received (" +
+                      data.Length + " bytes).");
             for (int i = 0; i < _observers.Count; i++)
-                try { _observers[i].OnBlobReceived(channel, data); }
+                try { _observers[i].OnBlobReceived(channel, transferId, data); }
                 catch (Exception ex) { LogObserverError("OnBlobReceived", ex); }
+        }
+
+        private void NotifyWorldSync(WorldSyncStage stage, long epoch, float resumeSpeed,
+            ConnectionId connection)
+        {
+            for (int i = 0; i < _observers.Count; i++)
+                try { _observers[i].OnWorldSyncControl(stage, epoch, resumeSpeed, connection); }
+                catch (Exception ex) { LogObserverError("OnWorldSyncControl", ex); }
         }
 
         private void LogObserverError(string callback, Exception ex)

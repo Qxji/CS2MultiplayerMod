@@ -149,7 +149,8 @@ const styles: Record<string, CSSProperties> = {
     },
     toastAnchor: {
         position: "absolute",
-        right: "calc(100% + 12rem)",
+        right: "100%",
+        marginRight: "12rem",
         top: "50%",
         transform: "translateY(-50%)",
         width: "320rem",

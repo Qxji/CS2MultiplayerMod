@@ -27,6 +27,7 @@ const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
 const statusTitle$ = bindValue<string>(GROUP, "statusTitle", "");
 const statusDetail$ = bindValue<string>(GROUP, "statusDetail", "");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
+const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const isHost$ = bindValue<boolean>(GROUP, "isHost", false);
 
 // rem behaves like resolution-independent pixels (the game scales root font size).
@@ -82,7 +83,7 @@ const styles: Record<string, CSSProperties> = {
     },
     barOuter: {
         width: "640rem",
-        maxWidth: "calc(100vw - 120rem)",
+        maxWidth: "85%",
     },
     barHeader: {
         display: "flex",
@@ -184,8 +185,10 @@ export const JoinLoadingScreen = () => {
     const statusKind = useValue(statusKind$);
     const statusTitle = useValue(statusTitle$);
     const statusDetail = useValue(statusDetail$);
-    const percent = useValue(mapTransferPercent$);
+    const mapTransferPercent = useValue(mapTransferPercent$);
+    const worldSendPercent = useValue(worldSendPercent$);
     const isHost = useValue(isHost$);
+    const percent = isHost ? worldSendPercent : mapTransferPercent;
 
     // Shown from the first "connecting" until connected/offline. An error keeps it
     // up (so the failure is visible) until the player dismisses it.
@@ -194,7 +197,10 @@ export const JoinLoadingScreen = () => {
     // backdrop element is still there to read; static for the whole attempt.
     const [backdropImage, setBackdropImage] = useState<string | null>(null);
     useEffect(() => {
-        if (isHost) {
+        if (statusKind === "syncing") {
+            setActive(true);
+            setBackdropImage((current) => current ?? currentMenuBackdropImage());
+        } else if (isHost) {
             setActive(false);
             setBackdropImage(null);
         } else if (statusKind === "connecting") {
@@ -210,6 +216,7 @@ export const JoinLoadingScreen = () => {
     if (!active) return null;
 
     const failed = statusKind === "error";
+    const synchronizing = statusKind === "syncing";
     const dismiss = () => {
         setActive(false);
         // Clear the faulted session so the next attempt starts clean.
@@ -262,9 +269,11 @@ export const JoinLoadingScreen = () => {
                                     {t(LOC.loadingHint, "Keep this window open while the host's city is transferred.")}
                                 </div>
                             </div>
-                            <Button variant="flat" style={styles.cancel} onSelect={dismiss}>
-                                {t(LOC.cancel, "Cancel")}
-                            </Button>
+                            {!synchronizing || !isHost ? (
+                                <Button variant="flat" style={styles.cancel} onSelect={dismiss}>
+                                    {t(LOC.cancel, "Cancel")}
+                                </Button>
+                            ) : null}
                         </>
                     )}
                 </div>

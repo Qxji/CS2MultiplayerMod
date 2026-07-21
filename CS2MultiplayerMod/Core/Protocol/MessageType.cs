@@ -50,5 +50,11 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// for incompatible client detection.
         /// </summary>
         HandshakeChallenge = 11,
+
+        /// <summary>
+        /// Coordinates an atomic world replacement. The host opens an epoch, clients
+        /// acknowledge quiescence and load completion, and the host explicitly resumes it.
+        /// </summary>
+        WorldSyncControl = 12,
     }
 }

@@ -373,15 +373,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     EntityManager.HasComponent<Node>(target) && IsNodeBeingDeleted(target));
         }
 
-        private static bool NativeElevationIsValid(NetPrefabInfo prefabInfo, float2 elevation)
-        {
-            if (!math.all(math.isfinite(elevation))) return false;
-            if (!prefabInfo.Placeable) return true;
-            const float tolerance = 0.01f;
-            return math.all(elevation >= new float2(prefabInfo.ElevMin - tolerance)) &&
-                   math.all(elevation <= new float2(prefabInfo.ElevMax + tolerance));
-        }
-
         /// <summary>
         /// Nearest standalone edge whose centreline passes within the width-scaled snap radius (XZ)
         /// of <paramref name="point"/> at a matching height (within <see cref="VerticalSnapTol"/> - a

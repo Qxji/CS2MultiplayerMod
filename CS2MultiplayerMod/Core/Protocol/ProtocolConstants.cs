@@ -4,7 +4,9 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v18 adds entity visual-customization and savegame color-palette commands.
+        /// Current v19 makes world replacement an epoch-scoped pause/load/resume transaction
+        /// and tags blob chunks with their transfer epoch. v18 adds entity visual-customization
+        /// and savegame color-palette commands.
         /// v17 carries atomic native object-tool definition batches, portable owned-net connector
         /// identities, and host-authoritative tree stage/growth correction. v16 carries
         /// object random seed/tree age and service-upgrade random seed. v15
@@ -16,7 +18,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 18;
+        public const int ProtocolVersion = 19;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

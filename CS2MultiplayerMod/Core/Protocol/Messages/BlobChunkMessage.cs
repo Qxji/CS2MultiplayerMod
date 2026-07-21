@@ -10,6 +10,11 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
     public sealed class BlobChunkMessage : INetMessage
     {
         public string Channel;
+        /// <summary>
+        /// Identity of this transfer. World snapshots use their recovery epoch; zero is
+        /// reserved for ordinary, uncoordinated blobs.
+        /// </summary>
+        public long TransferId;
         public int TotalBytes;
         public bool Last;
         public byte[] Data;
@@ -17,8 +22,14 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
         public BlobChunkMessage() { }
 
         public BlobChunkMessage(string channel, int totalBytes, bool last, byte[] data)
+            : this(channel, 0, totalBytes, last, data)
+        {
+        }
+
+        public BlobChunkMessage(string channel, long transferId, int totalBytes, bool last, byte[] data)
         {
             Channel = channel;
+            TransferId = transferId;
             TotalBytes = totalBytes;
             Last = last;
             Data = data ?? System.Array.Empty<byte>();
@@ -29,6 +40,7 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
         public void Write(NetworkWriter writer)
         {
             writer.WriteString(Channel);
+            writer.WriteLong(TransferId);
             writer.WriteInt(TotalBytes);
             writer.WriteBool(Last);
             writer.WriteInt(Data != null ? Data.Length : 0);
@@ -39,6 +51,7 @@ namespace CS2MultiplayerMod.Core.Protocol.Messages
         public void Read(NetworkReader reader)
         {
             Channel = reader.ReadString();
+            TransferId = reader.ReadLong();
             TotalBytes = reader.ReadInt();
             Last = reader.ReadBool();
             int length = reader.ReadInt();

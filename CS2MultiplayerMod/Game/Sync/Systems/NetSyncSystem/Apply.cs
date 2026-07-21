@@ -56,6 +56,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         public void RealizePending()
         {
+            MultiplayerService service = Mod.Service;
+            if (service == null) return;
+
+            // Begin closes GameplaySyncReady before the save is taken. Never let an already armed
+            // graph slip through merely because it was created one ToolUpdate earlier.
+            if (!service.GameplaySyncReady)
+            {
+                DrainNetQueues();
+                PruneRecentRealizedSpans();
+                return;
+            }
+
+            // A rejected graph has only been tagged Deleted at this point. Unity's cleanup systems
+            // remove it later; rebuilding while it still exists is the native crash seen in the
+            // supplied host log. Pump cleanup and return for the whole frame, even when replay just
+            // became eligible, so generation happens on a subsequent frame.
+            if (_invalidatedBatchDraining)
+            {
+                PumpInvalidatedBatchDrain(allowReplay: true);
+                PruneRecentRealizedSpans();
+                return;
+            }
+
             // Definitions created on the prior ToolUpdate have now become remote Temp net entities.
             // A quiet/preview-clear frame applies only that enabled net set. On a local Apply frame,
             // BeginRealizeFrame protects the remote set instead and this transaction waits intact.
@@ -96,6 +119,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 }
                 else if (System.Environment.TickCount - _drainArmTick > DrainWindowMs)
                 {
+                    TrackInvalidatedTemps(_committingRemoteNetTemps);
                     ClearTrackedTemps(_committingRemoteNetTemps, clearPreview: true);
                     _committingRemoteNetTemps.Clear();
                     _committingNetConstructionCharge = 0;
@@ -103,19 +127,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     _awaitingDrain = false;
                     _committingTransactionKind = RemoteToolTransactionKind.None;
                     _onCommitComplete = null;
-                    Mod.log.Warn("[MP] NetApply: isolated remote commit did not drain; stale Temps cleared.");
-                    Diagnostics.FlightRecorder.Note("net isolated commit did not drain; stale temps cleared");
+                    _replayAfterInvalidatedDrain = null;
+                    _invalidatedBatchDraining = true;
+                    _invalidatedDrainArmTick = System.Environment.TickCount;
+                    _invalidatedCleanFrames = 0;
+                    _invalidatedDrainTimedOut = false;
+                    Mod.log.Warn("[MP] NetApply: isolated remote commit did not drain; " +
+                                 "further native work is blocked until its Temps are gone.");
+                    Diagnostics.FlightRecorder.Note(
+                        "net isolated commit did not drain; waiting for temp destruction");
                     SyncInbox.RequestResync("remote transaction failed to drain");
                 }
             }
 
             PruneRecentRealizedSpans();
 
-            MultiplayerService service = Mod.Service;
-            if (service == null) return;
+            if (_invalidatedBatchDraining) return;
 
             MultiplayerSession session = service.Session;
-            if (!service.GameplaySyncReady) return;
             RealizeIncoming(session, service.NowMs);
         }
 
@@ -124,7 +153,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// replace) enters any one net-domain pass - a split course and a delete of the same edge in
         /// the same commit can make ApplyNetSystem dereference a stale edge and native-crash.
         /// </summary>
-        public bool IsCommitBusy => _pendingApply || _awaitingDrain;
+        public bool IsCommitBusy => _pendingApply || _awaitingDrain || _invalidatedBatchDraining;
+
+        /// <summary>
+        /// Host recovery may take its save only after no armed/committing/rejected remote native
+        /// graph remains. Deleted-but-not-destroyed Temps are intentionally still considered live.
+        /// </summary>
+        public bool IsRecoveryQuiescent =>
+            !_pendingApply && !_awaitingDrain && !_invalidatedBatchDraining &&
+            !TrackedInvalidatedTempsRemain();
 
         /// <summary>
         /// True until queued placement courses and their commit/drain have become queryable network
@@ -140,7 +177,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             get
             {
-                if (_pendingApply || _awaitingDrain) return false;
+                if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return false;
                 global::Game.Tools.ToolBaseSystem tool = _toolSystem != null ? _toolSystem.activeTool : null;
                 // Clear is preview maintenance/cancellation, not a permanent city edit. Net tools
                 // use it repeatedly while the cursor moves, so blocking here would starve remote
@@ -351,7 +388,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
             catch (System.Exception ex)
             {
-                _committingRemoteNetTemps.Clear();
                 Diagnostics.FlightRecorder.Note("net isolated apply failed: " + ex.GetType().Name);
                 InvalidateArmedBatch("isolated apply failed (" + ex.GetType().Name + ")", count);
                 return;
@@ -398,14 +434,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             for (int i = 0; i < _committingRemoteNetTemps.Count; i++)
             {
                 Entity entity = _committingRemoteNetTemps[i];
-                if (EntityManager.Exists(entity) && EntityManager.HasComponent<Temp>(entity) &&
-                    !EntityManager.HasComponent<Deleted>(entity)) return true;
+                // Deleted is only a request to the deferred cleanup pipeline. Treating that tag as
+                // "gone" allowed the next native transaction to reuse a graph still being torn down.
+                if (EntityManager.Exists(entity) && EntityManager.HasComponent<Temp>(entity))
+                    return true;
             }
             return false;
         }
 
         private void InvalidateArmedBatch(string reason, int count)
         {
+            TrackInvalidatedTemps(ActiveTransactionQuery());
+            TrackInvalidatedTemps(_committingRemoteNetTemps);
             _pendingApply = false;
             _awaitingDrain = false;
             _pendingNetConstructionCharge = 0;
@@ -413,6 +453,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (count > 0) DiscardStaleTransactionTemps(reason);
             _pendingTransactionKind = RemoteToolTransactionKind.None;
             _committingTransactionKind = RemoteToolTransactionKind.None;
+            _committingRemoteNetTemps.Clear();
             ReleaseTrackedTemps(_isolatedLocalTemps);
 
             System.Action replay = _onCommitLost;
@@ -420,21 +461,110 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _onCommitComplete = null;
             if (replay != null && _applyReplayBudget.TryConsume())
             {
-                Mod.log.Warn("[MP] NetApply: " + reason + "; re-queueing batch (attempt " +
+                _replayAfterInvalidatedDrain = replay;
+                Mod.log.Warn("[MP] NetApply: " + reason + "; draining rejected Temps before " +
+                             "re-queueing batch (attempt " +
                              _applyReplayBudget.AttemptsUsed + "/" +
                              _applyReplayBudget.MaximumAttempts + ").");
-                Diagnostics.FlightRecorder.Note("net batch invalidated; replay " +
+                Diagnostics.FlightRecorder.Note("net batch invalidated; drain then replay " +
                     _applyReplayBudget.AttemptsUsed + "/" + _applyReplayBudget.MaximumAttempts);
-                replay();
             }
             else
             {
+                _replayAfterInvalidatedDrain = null;
                 Mod.log.Warn("[MP] NetApply: " + reason + "; batch dropped" +
                              (replay != null ? " after " + _applyReplayBudget.AttemptsUsed +
                                                " replays." : "."));
                 Diagnostics.FlightRecorder.Note("net batch invalidated; dropped");
                 SyncInbox.RequestResync("remote transaction exhausted bounded replays");
             }
+
+            _invalidatedBatchDraining = true;
+            _invalidatedDrainArmTick = System.Environment.TickCount;
+            _invalidatedCleanFrames = 0;
+            _invalidatedDrainTimedOut = false;
+        }
+
+        private void TrackInvalidatedTemps(EntityQuery query)
+        {
+            if (query.IsEmptyIgnoreFilter) return;
+            NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                    TrackInvalidatedTemp(entities[i]);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
+        }
+
+        private void TrackInvalidatedTemps(List<Entity> entities)
+        {
+            for (int i = 0; i < entities.Count; i++) TrackInvalidatedTemp(entities[i]);
+        }
+
+        private void TrackInvalidatedTemp(Entity entity)
+        {
+            if (entity == Entity.Null || _invalidatedRemoteTemps.Contains(entity)) return;
+            if (EntityManager.Exists(entity) && EntityManager.HasComponent<Temp>(entity))
+                _invalidatedRemoteTemps.Add(entity);
+        }
+
+        private bool TrackedInvalidatedTempsRemain()
+        {
+            for (int i = 0; i < _invalidatedRemoteTemps.Count; i++)
+            {
+                Entity entity = _invalidatedRemoteTemps[i];
+                if (EntityManager.Exists(entity) && EntityManager.HasComponent<Temp>(entity))
+                    return true;
+            }
+            return false;
+        }
+
+        private void PruneInvalidatedTemps()
+        {
+            for (int i = _invalidatedRemoteTemps.Count - 1; i >= 0; i--)
+            {
+                Entity entity = _invalidatedRemoteTemps[i];
+                if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<Temp>(entity))
+                    _invalidatedRemoteTemps.RemoveAt(i);
+            }
+        }
+
+        private void PumpInvalidatedBatchDrain(bool allowReplay)
+        {
+            PruneInvalidatedTemps();
+            if (TrackedInvalidatedTempsRemain())
+            {
+                _invalidatedCleanFrames = 0;
+                if (!_invalidatedDrainTimedOut &&
+                    System.Environment.TickCount - _invalidatedDrainArmTick > DrainWindowMs)
+                {
+                    _invalidatedDrainTimedOut = true;
+                    _replayAfterInvalidatedDrain = null;
+                    Mod.log.Error("[MP] NetApply: rejected native transaction did not leave Temp " +
+                                  "state; blocking further native work and requesting world recovery.");
+                    Diagnostics.FlightRecorder.Note(
+                        "invalidated net temps failed to drain; native work remains blocked");
+                    SyncInbox.RequestResync("rejected native transaction failed to drain");
+                }
+                return;
+            }
+
+            // Require two observations with no surviving Temp. This keeps the cleanup structural
+            // changes and the new definition graph in different native update frames.
+            if (++_invalidatedCleanFrames < 2) return;
+
+            System.Action replay = allowReplay ? _replayAfterInvalidatedDrain : null;
+            _replayAfterInvalidatedDrain = null;
+            _invalidatedRemoteTemps.Clear();
+            _invalidatedBatchDraining = false;
+            _invalidatedCleanFrames = 0;
+            _invalidatedDrainTimedOut = false;
+            Diagnostics.FlightRecorder.Note("invalidated net transaction fully drained");
+            if (replay != null) replay();
         }
 
         /// <summary>Finish structural isolation after ToolOutputBarrier has consumed this frame.</summary>
@@ -471,7 +601,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             get
             {
-                if (_pendingApply || _awaitingDrain) return false;
+                if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return false;
                 // Match ToolOutputSystem's own dispatch source. Clear only cleans Temp previews and
                 // is safe after the isolated brush pass; Apply would run ApplyBrushesSystem again.
                 return _toolSystem == null ||
@@ -817,10 +947,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 reason = "a referenced original vanished between arm and commit";
                 return false;
             }
-            if (isNode && (!EntityManager.HasComponent<Node>(original) || IsNodeBeingDeleted(original)))
+            // Do not infer teardown from the original node's connected edges here. A valid
+            // split/replacement marks its old edges Deleted inside this same Temp transaction,
+            // which is indistinguishable from teardown until the transaction commits. The
+            // entity-level Deleted check above remains the authoritative stale-original guard.
+            if (isNode)
             {
-                reason = "a referenced original node is being torn down";
-                return false;
+                bool replacesEdge = (temp.m_Flags & TempFlags.Replace) != 0 &&
+                                    EntityManager.HasComponent<Edge>(original);
+                if (!EntityManager.HasComponent<Node>(original) && !replacesEdge)
+                {
+                    reason = "a generated node has an invalid original type";
+                    return false;
+                }
+                // GenerateNodesSystem deliberately gives a split node the original Edge and
+                // TempFlags.Replace. ApplyNetSystem then uses that pair to split the edge.
             }
             if (isEdge && !EntityManager.HasComponent<Edge>(original))
             {
@@ -982,7 +1123,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         public void ArmNetCommit(System.Action onCommitLost, string source)
         {
-            if (_pendingApply || _awaitingDrain) return;
+            if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return;
             _pendingApply = true;
             _pendingTransactionKind = RemoteToolTransactionKind.Net;
             _armTick = System.Environment.TickCount;
@@ -1000,7 +1141,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         public bool ArmObjectCommit(System.Action onCommitLost, System.Action onCommitComplete,
             string source)
         {
-            if (_pendingApply || _awaitingDrain) return false;
+            if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return false;
             _pendingApply = true;
             _pendingTransactionKind = RemoteToolTransactionKind.ObjectGraph;
             _armTick = System.Environment.TickCount;

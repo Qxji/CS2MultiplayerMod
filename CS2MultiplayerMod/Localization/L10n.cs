@@ -87,6 +87,7 @@ namespace CS2MultiplayerMod.Localization
             public const string WorldLoaded = "CS2MP.Status.WorldLoaded";
             public const string PhaseWaitingForMap = "CS2MP.Status.WaitingForMap";
             public const string PhaseLoadingMap = "CS2MP.Status.LoadingMap";
+            public const string PhaseSynchronizing = "CS2MP.Status.Synchronizing";
             public const string TitleModDisabled = "CS2MP.Status.ModDisabled";
             public const string TitleConnectionFailed = "CS2MP.Status.ConnectionFailed";
             public const string TitleHosting = "CS2MP.Status.Hosting";

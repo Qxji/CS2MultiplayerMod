@@ -244,20 +244,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                             SyncInbox.RequestResync("unsafe native net creation flags");
                             return;
                         }
-                        NetPrefabInfo sourcePrefabInfo = NetInfoOf(prefab);
-                        if (!NativeElevationIsValid(sourcePrefabInfo,
-                                new float2(command.CourseElevationLeft, command.CourseElevationRight)) ||
-                            !NativeElevationIsValid(sourcePrefabInfo,
-                                new float2(command.Start.ElevationLeft, command.Start.ElevationRight)) ||
-                            !NativeElevationIsValid(sourcePrefabInfo,
-                                new float2(command.End.ElevationLeft, command.End.ElevationRight)))
-                        {
-                            Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
-                                         " contains elevation outside the local prefab contract; " +
-                                         "dropping the whole operation.");
-                            SyncInbox.RequestResync("native net elevation contract mismatch");
-                            return;
-                        }
+                        // NetCourse elevations are exact native generator state, not values limited
+                        // by PlaceableNetData's UI range. Snaps and underground transitions can
+                        // legitimately exceed that range. The wire decoder already rejects every
+                        // non-finite or globally implausible value, so preserve these values intact.
 
                         bool alreadyBuilt = !nativePoint &&
                                             SpanAlreadyBuilt(prefab, curve, edgeEntities, edgeCurves);

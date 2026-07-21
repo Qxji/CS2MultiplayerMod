@@ -125,6 +125,7 @@ namespace CS2MultiplayerMod.Core.Session
 
             _peers.Clear();
             _blobs.Clear();
+            _blobTransferIds.Clear();
             ClearBlobProgress();
             _outgoingBlobActive = false;
             _outgoingBlobTotal = 0;
@@ -133,6 +134,8 @@ namespace CS2MultiplayerMod.Core.Session
             LocalPlayerId = 0;
             _nextPlayerId = HostPlayerId + 1;
             EncryptionActive = false;
+            _worldSyncSuspended = false;
+            _worldSyncEpoch = 0;
             SetStatus(SessionStatus.Offline, "Stopped");
         }
 

@@ -174,6 +174,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private readonly List<Entity> _isolatedLocalTemps = new List<Entity>();
         private readonly List<Entity> _protectedRemoteNetTemps = new List<Entity>();
         private readonly List<Entity> _committingRemoteNetTemps = new List<Entity>();
+        // Rejected native transactions are only tagged Deleted by the game's clear path; actual
+        // destruction is deferred. Keep their exact entity identities until none remains Temp so a
+        // retry can never overlap the stale native ownership/connectivity graph.
+        private readonly List<Entity> _invalidatedRemoteTemps = new List<Entity>();
         private readonly List<Entity> _isolatedLocalBrushTemps = new List<Entity>();
         private bool _clearLocalNetIsolationAfterBarrier;
         private bool _localToolOutputProtectedThisFrame;
@@ -195,6 +199,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private int _drainArmTick;
         // Frames spent waiting for the isolated entities to leave their Temp state.
         private int _drainFrames;
+        private bool _invalidatedBatchDraining;
+        private System.Action _replayAfterInvalidatedDrain;
+        private int _invalidatedDrainArmTick;
+        private int _invalidatedCleanFrames;
+        private bool _invalidatedDrainTimedOut;
         // True only on the frame the isolated net-domain pass commits a remote batch. Capture skips
         // that pass's Created edges; local Apply frames are never suppressed.
         private bool _suppressCaptureThisFrame;
@@ -456,15 +465,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // side is enabled depends on whether this frame had protected the remote batch.
             if (_protectedRemoteNetTemps.Count > 0)
             {
+                TrackInvalidatedTemps(_protectedRemoteNetTemps);
                 ClearTrackedTemps(_protectedRemoteNetTemps, clearPreview: true);
                 _protectedRemoteNetTemps.Clear();
             }
             else if (_pendingApply)
             {
+                TrackInvalidatedTemps(ActiveTransactionQuery());
                 ClearTempEntities(ActiveTransactionQuery());
             }
             if (_committingRemoteNetTemps.Count > 0)
             {
+                TrackInvalidatedTemps(_committingRemoteNetTemps);
                 ClearTrackedTemps(_committingRemoteNetTemps, clearPreview: true);
                 _committingRemoteNetTemps.Clear();
             }
@@ -490,6 +502,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _committingNetConstructionChargeCourses = 0;
             _onCommitLost = null;
             _onCommitComplete = null;
+            _replayAfterInvalidatedDrain = null;
+            PruneInvalidatedTemps();
+            _invalidatedBatchDraining = TrackedInvalidatedTempsRemain();
+            _invalidatedCleanFrames = 0;
+            _invalidatedDrainTimedOut = false;
+            if (_invalidatedBatchDraining && _invalidatedDrainArmTick == 0)
+                _invalidatedDrainArmTick = System.Environment.TickCount;
+            else if (!_invalidatedBatchDraining)
+            {
+                _invalidatedRemoteTemps.Clear();
+                _invalidatedDrainArmTick = 0;
+            }
             _applyReplayBudget.Reset();
             _suppressCaptureThisFrame = false;
             _prepDoneThisFrame = false;

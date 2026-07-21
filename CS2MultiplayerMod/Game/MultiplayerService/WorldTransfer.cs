@@ -8,66 +8,74 @@ namespace CS2MultiplayerMod.Game
 {
     public sealed partial class MultiplayerService
     {
-        /// <summary>Stream the newest existing save - explicit fallback when a fresh save failed.</summary>
-        public void StreamWorld(ConnectionId target) => StreamWorld(target, DateTime.MinValue);
-
         /// <summary>
-        /// Host: stream a savegame to one peer (<paramref name="target"/>) or all
-        /// (<see cref="ConnectionId.None"/>). When <paramref name="writtenAfterUtc"/> is given, only a
-        /// save from the just-completed save task qualifies. Called by <see cref="WorldResyncSystem"/>.
+        /// Read the authoritative save produced for one recovery epoch exactly once. Returning
+        /// false is terminal for that epoch: callers must Abort instead of substituting a stale
+        /// save whose contents do not match the established causal cut.
         /// </summary>
-        public void StreamWorld(ConnectionId target, DateTime writtenAfterUtc)
+        internal bool TryReadWorldSnapshot(DateTime writtenAfterUtc, out byte[] data,
+            out string saveName)
         {
-            if (_session.Role != SessionRole.Host) return;
-
-            string targetText = DescribeWorldTarget(target);
-            _log.Info("[MP] World stream requested for " + targetText +
-                      (writtenAfterUtc > DateTime.MinValue
-                          ? " using save written after " + writtenAfterUtc.ToString("O") + "."
-                          : " using newest available save."));
+            data = null;
+            saveName = null;
+            if (_session.Role != SessionRole.Host) return false;
 
             string save = FindNewestSave(writtenAfterUtc);
             if (save == null)
             {
-                if (writtenAfterUtc > DateTime.MinValue)
-                    _log.Warn("[MP] The completed save task produced no new .cok on disk; " +
-                              "not streaming stale state to " + targetText + ". (/sync will retry.)");
-                else
-                    _log.Warn("[MP] No savegame to stream yet for " + targetText + ".");
-                return;
+                _log.Error("[MP] The recovery save task produced no fresh .cok; the epoch will " +
+                           "be aborted rather than streaming stale world state.");
+                return false;
             }
 
             try
             {
                 var info = new FileInfo(save);
-                _log.Info("[MP] Preparing world stream to " + targetText +
-                          ": save='" + info.Name + "'" +
-                          " size=" + (info.Length / 1024) + " KB" +
-                          " modifiedUtc=" + info.LastWriteTimeUtc.ToString("O") + ".");
-
-                byte[] bytes = File.ReadAllBytes(save);
-                if (bytes.Length == 0 || bytes.Length > MaxSaveBlobBytes)
+                data = File.ReadAllBytes(save);
+                if (data.Length == 0 || data.Length > MaxSaveBlobBytes)
                 {
-                    _log.Warn("[MP] Save '" + Path.GetFileName(save) + "' has implausible size " +
-                              bytes.Length + "; not streaming to " + targetText + ".");
-                    return;
+                    _log.Error("[MP] Recovery save '" + info.Name + "' has implausible size " +
+                               data.Length + "; aborting the epoch.");
+                    data = null;
+                    return false;
                 }
-                if (target.IsNone) _session.SendBlob(MapChannel, bytes);
-                else _session.SendBlobTo(target, MapChannel, bytes);
-                _log.Info("[MP] Streamed world '" + Path.GetFileName(save) + "' (" + (bytes.Length / 1024) + " KB) to " +
-                          targetText + ".");
+                saveName = info.Name;
+                _log.Info("[MP] Prepared recovery snapshot '" + saveName + "' (" +
+                          (data.Length / 1024) + " KB, modified " +
+                          info.LastWriteTimeUtc.ToString("O") + ").");
+                return true;
             }
             catch (Exception ex)
             {
-                _log.Error("[MP] Failed to read/send save to " + targetText + ": " + ex.Message);
+                _log.Error("[MP] Failed to read recovery snapshot: " + ex.Message);
+                data = null;
+                return false;
             }
         }
 
-        private void LoadReceivedMap(byte[] data)
+        /// <summary>Queue one already-read snapshot for one participant, tagged with its epoch.</summary>
+        internal void StreamWorldSnapshot(ConnectionId target, long epoch, byte[] data,
+            string saveName)
         {
+            if (_session.Role != SessionRole.Host || target.IsNone || data == null || epoch <= 0)
+                return;
+            _session.SendBlobTo(target, MapChannel, epoch, data);
+            _log.Info("[MP] Queued recovery snapshot '" + (saveName ?? "<save>") + "' (" +
+                      (data.Length / 1024) + " KB) for " + DescribeWorldTarget(target) +
+                      " in epoch " + epoch + ".");
+        }
+
+        private void LoadReceivedMap(long transferId, byte[] data)
+        {
+            if (!_worldSyncBarrierActive || transferId <= 0 || transferId != _activeWorldSyncEpoch)
+            {
+                _log.Warn("[MP] Ignoring map transfer " + transferId +
+                          ": active world-sync epoch is " +
+                          (_worldSyncBarrierActive ? _activeWorldSyncEpoch.ToString() : "none") + ".");
+                return;
+            }
             // The completed blob is the causal cut: commands received before it are represented by
             // the save, while every later command must survive the ECS world replacement.
-            _postLoadCommands.Clear();
             _log.Info("[MP] Map blob delivered to game layer (" +
                       (data != null ? data.Length / 1024 : 0) + " KB); staging and loading.");
             Diagnostics.FlightRecorder.Note("world blob received " + (data != null ? data.Length >> 10 : 0) + " KB; reloading world");
@@ -77,9 +85,9 @@ namespace CS2MultiplayerMod.Game
             SetPhase(ClientWorldPhase.LoadingMap);
             if (!JoinMapLoader.StageAndLoad(data, _log))
             {
-                _postLoadCommands.Clear();
                 // Defined, recoverable state instead of a half-connected limbo.
                 SetPhase(ClientWorldPhase.WaitingForMap);
+                _session.SendWorldSyncStage(_activeWorldSyncEpoch, WorldSyncStage.Failed);
                 _log.Warn("[MP] Could not auto-load the host world. Still connected - use /sync to " +
                           "request it again, or load '" + JoinMapLoader.TransientName + "' from Load Game.");
             }

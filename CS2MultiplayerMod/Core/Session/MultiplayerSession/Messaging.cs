@@ -119,6 +119,11 @@ namespace CS2MultiplayerMod.Core.Session
         public void RequestWorldSync()
         {
             if (Status != SessionStatus.Connected) return;
+            if (_worldSyncSuspended)
+            {
+                _log.Info("World sync request coalesced into active epoch " + _worldSyncEpoch + ".");
+                return;
+            }
 
             if (Role == SessionRole.Client)
             {
@@ -164,7 +169,7 @@ namespace CS2MultiplayerMod.Core.Session
         /// </summary>
         public void SendCommand(long tick, ushort commandId, byte[] body)
         {
-            if (Status != SessionStatus.Connected) return;
+            if (Status != SessionStatus.Connected || _worldSyncSuspended) return;
 
             var message = new SimulationCommandMessage(LocalPlayerId, tick, commandId, body);
             if (Role == SessionRole.Host)
@@ -178,17 +183,13 @@ namespace CS2MultiplayerMod.Core.Session
             }
         }
 
-        /// <summary>
-        /// Re-dispatch a command that this client already authenticated and journaled while its
-        /// world was being replaced. This is local-only: it never relays or writes to the transport.
-        /// </summary>
-        internal void DispatchBufferedCommand(SimulationCommandMessage command)
-        {
-            if (command != null) NotifyCommand(command);
-        }
-
         private void HandleCommand(ConnectionId from, Peer peer, SimulationCommandMessage command)
         {
+            // Commands crossing the snapshot cut are deliberately rejected. Every participant
+            // installs the host snapshot before Resume, so applying only a suffix on one side would
+            // recreate the very drift this transaction is meant to repair.
+            if (_worldSyncSuspended) return;
+
             // Only command ids the game layer registered are legitimate; anything else
             // is a peer probing the surface.
             if (_allowedCommandIds.Count > 0 && !_allowedCommandIds.Contains(command.CommandId))
@@ -213,7 +214,7 @@ namespace CS2MultiplayerMod.Core.Session
         /// </summary>
         public void SendState(byte channelId, byte[] data)
         {
-            if (Role != SessionRole.Host || Status != SessionStatus.Connected) return;
+            if (Role != SessionRole.Host || Status != SessionStatus.Connected || _worldSyncSuspended) return;
             BroadcastToAll(new StateSnapshotMessage(channelId, data), ConnectionId.None);
         }
 
@@ -226,6 +227,7 @@ namespace CS2MultiplayerMod.Core.Session
                 Punt(from, peer, "client sent a host-only state snapshot", "StateSnapshot");
                 return;
             }
+            if (_worldSyncSuspended) return;
             NotifyState(snapshot);
         }
 
@@ -236,7 +238,7 @@ namespace CS2MultiplayerMod.Core.Session
         /// </summary>
         public void SendStateEdit(byte channelId, byte[] data)
         {
-            if (Role != SessionRole.Client || Status != SessionStatus.Connected) return;
+            if (Role != SessionRole.Client || Status != SessionStatus.Connected || _worldSyncSuspended) return;
             SendTo(ConnectionId.Server, new StateEditMessage(LocalPlayerId, channelId, data));
         }
 
@@ -244,6 +246,7 @@ namespace CS2MultiplayerMod.Core.Session
         {
             // Only the host arbitrates edits; a client receiving one is a stray.
             if (Role != SessionRole.Host) return;
+            if (_worldSyncSuspended) return;
 
             if (peer != null) edit.OriginPlayerId = peer.PlayerId; // no impersonation
             NotifyStateEdit(edit);
@@ -252,7 +255,7 @@ namespace CS2MultiplayerMod.Core.Session
         /// <summary>Publish the local player's camera focus and eye position to the others.</summary>
         public void SendPlayerState(float x, float y, float z, float eyeX, float eyeY, float eyeZ, float yaw)
         {
-            if (Status != SessionStatus.Connected) return;
+            if (Status != SessionStatus.Connected || _worldSyncSuspended) return;
 
             var message = new PlayerStateMessage(LocalPlayerId, x, y, z, eyeX, eyeY, eyeZ, yaw);
             if (Role == SessionRole.Host)
@@ -263,6 +266,7 @@ namespace CS2MultiplayerMod.Core.Session
 
         private void HandlePlayerState(ConnectionId from, Peer peer, PlayerStateMessage state)
         {
+            if (_worldSyncSuspended) return;
             // Same anti-impersonation stamp as commands: positions are keyed by player id.
             if (Role == SessionRole.Host && peer != null)
                 state.PlayerId = peer.PlayerId;

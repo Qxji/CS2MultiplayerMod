@@ -49,7 +49,7 @@ namespace CS2MultiplayerMod.Game
                 return;
             }
 
-            service.Update();
+            service.Update(World);
             PumpHealth(service);
         }
 

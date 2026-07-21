@@ -33,6 +33,16 @@ namespace CS2MultiplayerMod.Core.Session
         void OnBlobReceived(string channel, byte[] data);
 
         /// <summary>
+        /// A complete epoch-tagged blob arrived. The base observer forwards this to the
+        /// legacy two-argument callback so observers that do not care about epochs keep working.
+        /// </summary>
+        void OnBlobReceived(string channel, long transferId, byte[] data);
+
+        /// <summary>An atomic world-sync control stage arrived.</summary>
+        void OnWorldSyncControl(WorldSyncStage stage, long epoch, float resumeSpeed,
+            ConnectionId connection);
+
+        /// <summary>
         /// A player ran /sync (host only). Stream the current world to
         /// <paramref name="connection"/>, or to everyone when it is
         /// <see cref="ConnectionId.None"/> (the host itself asked).
@@ -54,6 +64,10 @@ namespace CS2MultiplayerMod.Core.Session
         public virtual void OnStateEditReceived(StateEditMessage edit) { }
         public virtual void OnPlayerStateReceived(PlayerStateMessage state) { }
         public virtual void OnBlobReceived(string channel, byte[] data) { }
+        public virtual void OnBlobReceived(string channel, long transferId, byte[] data) =>
+            OnBlobReceived(channel, data);
+        public virtual void OnWorldSyncControl(WorldSyncStage stage, long epoch, float resumeSpeed,
+            ConnectionId connection) { }
         public virtual void OnResyncRequested(int playerId, ConnectionId connection) { }
         public virtual void OnError(string message) { }
     }

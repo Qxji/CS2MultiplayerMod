@@ -1,8 +1,10 @@
 using System;
 using Game.SceneFlow;
 using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Localization;
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
+using Unity.Entities;
 
 namespace CS2MultiplayerMod.Game
 {
@@ -22,13 +24,15 @@ namespace CS2MultiplayerMod.Game
                 case ClientWorldPhase.Connecting: return L10n.T(L10n.Key.StateConnecting);
                 case ClientWorldPhase.WaitingForMap: return L10n.T(L10n.Key.PhaseWaitingForMap);
                 case ClientWorldPhase.LoadingMap: return L10n.T(L10n.Key.PhaseLoadingMap);
+                case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseSynchronizing);
                 default: return phase.ToString();
             }
         }
 
         /// <summary>Called once per simulation tick by the ECS system.</summary>
-        public void Update()
+        public void Update(World world)
         {
+            _currentWorld = world;
             _session.Update(_clock.ElapsedMilliseconds);
             string recoveryReason;
             if (_session.Status == SessionStatus.Connected &&
@@ -39,6 +43,7 @@ namespace CS2MultiplayerMod.Game
                 _session.RequestWorldSync();
             }
             PumpWorldPhase();
+            MaintainWorldSyncBarrier();
         }
 
         /// <summary>
@@ -59,18 +64,19 @@ namespace CS2MultiplayerMod.Game
 
             if (_sawLoading)
             {
-                SetPhase(ClientWorldPhase.InSession);
-                _log.Info("[MP] Host world loaded - gameplay sync active.");
-                CompletePostLoadCommandCatchup();
+                SetPhase(ClientWorldPhase.WaitingForResume);
+                _log.Info("[MP] Host world loaded - waiting for the epoch resume barrier.");
+                _session.SendWorldSyncStage(_activeWorldSyncEpoch, WorldSyncStage.Loaded);
                 return;
             }
 
             if (NowMs - _phaseChangedMs > MapLoadTimeoutMs)
             {
-                _postLoadCommands.Clear();
                 // The load never started (failed staging, asset index miss, …). Recover
                 // to a defined state instead of idling half-connected forever.
                 SetPhase(ClientWorldPhase.WaitingForMap);
+                if (_worldSyncBarrierActive && _activeWorldSyncEpoch > 0)
+                    _session.SendWorldSyncStage(_activeWorldSyncEpoch, WorldSyncStage.Failed);
                 _log.Warn("[MP] Host world never started loading. Still connected - use /sync to " +
                           "request it again, or load '" + JoinMapLoader.TransientName + "' manually.");
             }
@@ -81,8 +87,6 @@ namespace CS2MultiplayerMod.Game
             if (_phase == phase) return;
             _phase = phase;
             _phaseChangedMs = NowMs;
-            if (phase == ClientWorldPhase.None || phase == ClientWorldPhase.Connecting)
-                _postLoadCommands.Clear();
             if (phase != ClientWorldPhase.LoadingMap) _sawLoading = false;
             _log.Info("[MP] World phase: " + phase);
             Diagnostics.FlightRecorder.Note("phase " + phase);
@@ -163,6 +167,7 @@ namespace CS2MultiplayerMod.Game
 
         public void Disconnect()
         {
+            ResetWorldSyncState(restoreSpeed: true);
             _session.Stop();
             SetPhase(ClientWorldPhase.None);
             JoinMapLoader.DeleteTransient(_log); // a joining client keeps no copy of the host world
@@ -170,6 +175,7 @@ namespace CS2MultiplayerMod.Game
 
         public void Shutdown()
         {
+            ResetWorldSyncState(restoreSpeed: true);
             _session.Stop();
             SetPhase(ClientWorldPhase.None);
             RestoreAutosave(); // even if the phase was already None

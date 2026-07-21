@@ -219,6 +219,9 @@ namespace CS2MultiplayerMod.Core.Session
                 case MessageType.ResyncRequest:
                     HandleResyncRequest(connection, peer, nowUnixMs);
                     break;
+                case MessageType.WorldSyncControl:
+                    HandleWorldSyncControl(connection, peer, (WorldSyncControlMessage)message);
+                    break;
             }
         }
 

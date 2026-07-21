@@ -35,6 +35,7 @@ namespace CS2MultiplayerMod.Core.Session
         private readonly List<TransportEvent> _eventBuffer = new List<TransportEvent>();
         private readonly Dictionary<int, Peer> _peers = new Dictionary<int, Peer>();
         private readonly Dictionary<string, BlobReassembler> _blobs = new Dictionary<string, BlobReassembler>();
+        private readonly Dictionary<string, long> _blobTransferIds = new Dictionary<string, long>();
         private readonly Dictionary<string, int> _allowedBlobChannels = new Dictionary<string, int>();
         private readonly HashSet<ushort> _allowedCommandIds = new HashSet<ushort>();
         private readonly FailedAuthTracker _failedAuth = new FailedAuthTracker();
@@ -48,6 +49,8 @@ namespace CS2MultiplayerMod.Core.Session
         private long _lastAuthSweepMs;
         private long _lastResyncAcceptedUnixMs;
         private bool _challengeAnswered;
+        private bool _worldSyncSuspended;
+        private long _worldSyncEpoch;
 
         public MultiplayerSession(IModLogger log, MessageCodec codec = null)
         {
@@ -79,6 +82,14 @@ namespace CS2MultiplayerMod.Core.Session
         public string IncomingBlobChannel { get; private set; }
         public int IncomingBlobReceived { get; private set; }
         public int IncomingBlobTotal { get; private set; }
+        public long IncomingBlobTransferId { get; private set; }
+
+        /// <summary>
+        /// True between a world-sync Begin and its matching Resume/Abort. Gameplay traffic is
+        /// rejected at the session boundary during this interval, in addition to game-layer gates.
+        /// </summary>
+        public bool WorldSyncSuspended => _worldSyncSuspended;
+        public long WorldSyncEpoch => _worldSyncEpoch;
 
         // Host-side "Sending world %": a streamed blob is queued instantly (the send is
         // non-blocking) and then drains off the transport's send thread; these track that

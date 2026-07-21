@@ -77,6 +77,7 @@ namespace CS2MultiplayerMod.Game
             get
             {
                 if (_session.Role == SessionRole.None) return L10n.T(L10n.Key.WorldNone);
+                if (_worldSyncBarrierActive) return L10n.T(L10n.Key.PhaseSynchronizing);
                 if (_session.Role == SessionRole.Host) return L10n.T(L10n.Key.WorldHosting);
                 if (_session.IncomingBlobChannel == MapChannel && _session.IncomingBlobTotal > 0)
                     return L10n.F(L10n.Key.WorldMapProgress,
@@ -106,7 +107,8 @@ namespace CS2MultiplayerMod.Game
         {
             get
             {
-                if (!_session.OutgoingBlobActive || _session.OutgoingBlobTotal <= 0) return -1;
+                if (_session.OutgoingBlobTotal <= 0 ||
+                    (!_session.OutgoingBlobActive && !_worldSyncBarrierActive)) return -1;
                 long percent = 100L * _session.OutgoingBlobSent / _session.OutgoingBlobTotal;
                 if (percent < 0) return 0;
                 if (percent > 100) return 100;
@@ -126,6 +128,7 @@ namespace CS2MultiplayerMod.Game
                 if (_session.Role == SessionRole.None)
                     return string.IsNullOrEmpty(_lastFault) ? "offline" : "error";
                 if (_session.Status == SessionStatus.Faulted) return "error";
+                if (_worldSyncBarrierActive) return "syncing";
                 if (_session.Status == SessionStatus.Connecting ||
                     (_session.Role == SessionRole.Client && _phase != ClientWorldPhase.InSession))
                     return "connecting";
@@ -143,6 +146,7 @@ namespace CS2MultiplayerMod.Game
                     return L10n.T(string.IsNullOrEmpty(_lastFault) ? L10n.Key.StatusOffline : L10n.Key.TitleConnectionFailed);
                 if (_session.Status == SessionStatus.Faulted) return L10n.T(L10n.Key.TitleConnectionFailed);
                 if (_session.Status == SessionStatus.Connecting) return L10n.T(L10n.Key.StateConnecting);
+                if (_worldSyncBarrierActive) return L10n.T(L10n.Key.PhaseSynchronizing);
                 if (_session.Role == SessionRole.Client)
                 {
                     switch (_phase)
@@ -150,6 +154,7 @@ namespace CS2MultiplayerMod.Game
                         case ClientWorldPhase.Connecting: return L10n.T(L10n.Key.StateConnecting);
                         case ClientWorldPhase.WaitingForMap: return L10n.T(L10n.Key.PhaseWaitingForMap);
                         case ClientWorldPhase.LoadingMap: return L10n.T(L10n.Key.PhaseLoadingMap);
+                        case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseSynchronizing);
                     }
                 }
                 return L10n.T(_session.Role == SessionRole.Host ? L10n.Key.TitleHosting : L10n.Key.StateConnected);
