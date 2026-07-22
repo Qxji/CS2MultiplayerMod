@@ -305,6 +305,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureReplacements(MultiplayerSession session, long now)
         {
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame))
+            {
+                // The native object graph already carries these mutations. Advance the baseline so
+                // a later unrelated Updated tag cannot rediscover them as a delayed replacement.
+                AdoptUpdatedEdges();
+                return;
+            }
+
             if (_updatedEdges.IsEmptyIgnoreFilter) return;
 
             // Two passes: detect against the UNCHANGED baselines first, then advance them all. The
@@ -383,6 +393,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // back. Endpoint drift from neighbouring work lands here too.
             for (int i = 0; i < changes.Count; i++)
                 _edgeBaseline[changes[i].e] = new EdgeBaseline { Prefab = changes[i].current, Curve = changes[i].b };
+        }
+
+        private void AdoptUpdatedEdges()
+        {
+            if (_updatedEdges.IsEmptyIgnoreFilter) return;
+            NativeArray<Entity> entities = _updatedEdges.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                    _edgeBaseline[entities[i]] = BaselineOf(entities[i]);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
         }
 
         // Shortest extension worth replicating (metres). Node snapping and neighbouring work nudge

@@ -13,7 +13,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     public partial class BuildSyncSystem
     {
+        private sealed class RecentLocalObjectOperation
+        {
+            public ObjectToolOperationCommand Operation;
+            public long ObservedAtMs;
+        }
+
+        private const int MaxRecentLocalObjectOperations = 32;
+        private const long RecentLocalObjectOperationLifetimeMs = 5000;
+
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
+        private readonly List<RecentLocalObjectOperation> _recentLocalObjectOperations =
+            new List<RecentLocalObjectOperation>(MaxRecentLocalObjectOperations);
+        // Sampled before ToolOutputSystem runs. A one-shot stamp can switch active tools while its
+        // rootless definition graph is being emitted, so the graph itself cannot tell us which
+        // AssetStampPrefab owns the construction cost/contract.
+        private string _selectedAssetStampPrefabName;
         private long _nextLocalObjectOperationId = 1;
         private bool _nativeLifecycleCapturedThisFrame;
         private ObjectToolOperationCommand _pendingSpecializedObjectOperation;
@@ -30,11 +45,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         public bool NativeLifecycleCapturedThisFrame => _nativeLifecycleCapturedThisFrame;
 
         /// <summary>
+        /// Process object-tool output after the output barrier. A late Apply must publish the
+        /// previously cached standing preview before this frame's replacement preview is cached.
+        /// Keeping both actions here makes that ordering an invariant of the capture pipeline.
+        /// </summary>
+        public void ObserveLocalObjectToolOutput(NativeArray<Entity> definitions,
+            bool allowLateApplyCapture)
+        {
+            if (allowLateApplyCapture)
+                CaptureLocalObjectApplyAfterToolOutput();
+            ObserveLocalObjectDefinitions(definitions);
+        }
+
+        /// <summary>
         /// Cache the active object tool's complete definition batch after the output barrier. This
         /// is the last point at which exact placement, ownership, relocation, area, and connector
         /// intent is available together, before generation reduces it to final entities.
         /// </summary>
-        public void ObserveLocalObjectDefinitions(NativeArray<Entity> definitions)
+        private void ObserveLocalObjectDefinitions(NativeArray<Entity> definitions)
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             Entity recreate = _areaToolSystem != null ? _areaToolSystem.recreate : Entity.Null;
@@ -93,6 +121,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 ClearSpecializedAreaCapture();
             if (!(active is ObjectToolSystem))
             {
+                // ToolSystem keeps the tool that actually ran this ToolUpdate as its last tool even
+                // when a one-shot placement switches activeTool before the output barrier. Its Apply
+                // pulse therefore remains authoritative here. Require an ObjectDefinition or a
+                // Stamping NetCourse in this exact output batch so an immediately-applied net/area
+                // tool can never publish a stale object preview left over from the previous
+                // selection. Asset stamps intentionally emit no root ObjectDefinition.
+                if (_toolSystem != null && _toolSystem.applyMode == ApplyMode.Apply &&
+                    ContainsObjectOrAssetStampDefinition(definitions))
+                {
+                    CaptureObjectToolOperation(definitions);
+                    return;
+                }
                 _cachedLocalObjectOperation = null;
                 return;
             }
@@ -100,10 +140,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             CaptureObjectToolOperation(definitions);
         }
 
+        private bool ContainsObjectOrAssetStampDefinition(NativeArray<Entity> definitions)
+        {
+            for (int i = 0; i < definitions.Length; i++)
+            {
+                Entity entity = definitions[i];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
+                if (EntityManager.HasComponent<ObjectDefinition>(entity)) return true;
+                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
+                if (EntityManager.HasComponent<NetCourse>(entity) &&
+                    (creation.m_Flags & CreationFlags.Stamping) != 0) return true;
+            }
+            return false;
+        }
+
         private void CaptureObjectToolOperation(NativeArray<Entity> definitions)
         {
             var captured = new List<ObjectToolDefinitionIntent>();
             int root = -1;
+            bool hasStampingNet = false;
             for (int i = 0; i < definitions.Length; i++)
             {
                 Entity entity = definitions[i];
@@ -119,14 +175,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     return;
                 }
 
-                // An attached upgrade often starts with an update definition for its existing
-                // owner. Prefer the newly-created object as the operation root so duplicate
-                // suppression and construction charging identify the extension itself.
+                // Owned subobjects carry OwnerDefinition, while the top-level object does not.
+                // Prefer that structural distinction first, then a newly-created object over an
+                // update definition for an existing owner (the usual attached-upgrade ordering).
                 if (definition.Kind == ObjectToolDefinitionKind.Object &&
-                    (root < 0 ||
-                     (captured[root].Original.Kind != PortableEntityKind.None &&
-                      definition.Original.Kind == PortableEntityKind.None)))
+                    (root < 0 || IsBetterObjectOperationRoot(definition, captured[root])))
                     root = captured.Count;
+                if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
+                    (((CreationFlags)definition.CreationFlags & CreationFlags.Stamping) != 0))
+                    hasStampingNet = true;
                 captured.Add(definition);
                 if (captured.Count > ObjectToolOperationCommand.MaxDefinitions)
                 {
@@ -135,24 +192,295 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
             }
 
-            if (captured.Count == 0 || root < 0)
+            if (captured.Count == 0 || (!hasStampingNet && root < 0))
             {
                 _cachedLocalObjectOperation = null;
                 return;
             }
 
+            string stampPrefabName = null;
+            if (hasStampingNet)
+            {
+                stampPrefabName = GetSelectedAssetStampPrefabName(
+                    _toolSystem != null ? _toolSystem.activeTool : null) ??
+                    _selectedAssetStampPrefabName;
+                if (string.IsNullOrEmpty(stampPrefabName))
+                {
+                    _cachedLocalObjectOperation = null;
+                    Diagnostics.FlightRecorder.Note("asset stamp definitions lacked selected prefab");
+                    return;
+                }
+                // Any ObjectDefinitions in this output are independently placed stamp subobjects,
+                // not a persistent owner for the subnet graph.
+                root = ObjectToolOperationCommand.AssetStampRootIndex;
+            }
+
             _cachedLocalObjectOperation = new ObjectToolOperationCommand
             {
                 RootIndex = (short)root,
+                AssetStampPrefabName = stampPrefabName,
                 Definitions = captured.ToArray(),
             };
-            Diagnostics.FlightRecorder.Note("object native definitions observed=" + captured.Count);
+            RememberRecentLocalObjectOperation(_cachedLocalObjectOperation);
+            Diagnostics.FlightRecorder.Note(hasStampingNet
+                ? "asset stamp native definitions observed=" + captured.Count +
+                  " prefab=" + stampPrefabName
+                : "object native definitions observed=" + captured.Count +
+                  " root=" + captured[root].PrefabName +
+                  " seed=" + unchecked((ushort)captured[root].RandomSeed));
+        }
+
+        private static bool IsBetterObjectOperationRoot(ObjectToolDefinitionIntent candidate,
+            ObjectToolDefinitionIntent current)
+        {
+            return ObjectOperationRootScore(candidate) > ObjectOperationRootScore(current);
+        }
+
+        private static int ObjectOperationRootScore(ObjectToolDefinitionIntent definition)
+        {
+            int score = 0;
+            if (!definition.HasOwnerDefinition) score |= 4;
+            if (definition.Original.Kind == PortableEntityKind.None) score |= 2;
+            if (definition.Owner.Kind == PortableEntityKind.None) score |= 1;
+            return score;
+        }
+
+        private void RememberSelectedAssetStampPrefab(global::Game.Tools.ToolBaseSystem active)
+        {
+            _selectedAssetStampPrefabName = GetSelectedAssetStampPrefabName(active);
+        }
+
+        private string GetSelectedAssetStampPrefabName(global::Game.Tools.ToolBaseSystem active)
+        {
+            PrefabBase selected = active != null ? active.GetPrefab() : null;
+            if (!(selected is AssetStampPrefab)) return null;
+            Entity prefab;
+            if (!_prefabSystem.TryGetEntity(selected, out prefab) || prefab == Entity.Null ||
+                !EntityManager.Exists(prefab) || !EntityManager.HasComponent<AssetStampData>(prefab))
+                return null;
+            return _prefabSystem.GetPrefabName(prefab);
+        }
+
+        private void RememberRecentLocalObjectOperation(ObjectToolOperationCommand operation)
+        {
+            ObjectToolDefinitionIntent root;
+            if (!TryGetNewTopLevelRoot(operation, out root)) return;
+
+            long now = Mod.Service != null ? Mod.Service.NowMs : 0;
+            PruneRecentLocalObjectOperations(now);
+            for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+            {
+                RecentLocalObjectOperation recent = _recentLocalObjectOperations[i];
+                ObjectToolDefinitionIntent recentRoot;
+                if (!TryGetNewTopLevelRoot(recent.Operation, out recentRoot) ||
+                    !SameRootSignature(root, recentRoot)) continue;
+
+                recent.Operation = operation;
+                recent.ObservedAtMs = now;
+                _recentLocalObjectOperations.RemoveAt(i);
+                _recentLocalObjectOperations.Add(recent);
+                return;
+            }
+
+            _recentLocalObjectOperations.Add(new RecentLocalObjectOperation
+            {
+                Operation = operation,
+                ObservedAtMs = now,
+            });
+            if (_recentLocalObjectOperations.Count > MaxRecentLocalObjectOperations)
+                _recentLocalObjectOperations.RemoveAt(0);
+        }
+
+        private static bool TryGetNewTopLevelRoot(ObjectToolOperationCommand operation,
+            out ObjectToolDefinitionIntent root)
+        {
+            root = null;
+            if (operation == null || operation.IsAssetStamp || operation.Definitions == null ||
+                operation.RootIndex < 0 || operation.RootIndex >= operation.Definitions.Length)
+                return false;
+
+            root = operation.Definitions[operation.RootIndex];
+            if (root == null || root.Kind != ObjectToolDefinitionKind.Object ||
+                root.PrefabIsNull || string.IsNullOrEmpty(root.PrefabName) ||
+                root.Original.Kind != PortableEntityKind.None ||
+                root.Owner.Kind != PortableEntityKind.None || root.HasOwnerDefinition)
+                return false;
+
+            CreationFlags flags = (CreationFlags)root.CreationFlags;
+            return (flags & (CreationFlags.Delete | CreationFlags.Relocate |
+                             CreationFlags.Recreate | CreationFlags.Upgrade |
+                             CreationFlags.Permanent)) == 0;
+        }
+
+        private static bool SameRootSignature(ObjectToolDefinitionIntent left,
+            ObjectToolDefinitionIntent right)
+        {
+            if (!string.Equals(left.PrefabName, right.PrefabName,
+                    System.StringComparison.Ordinal) ||
+                left.RandomSeed != right.RandomSeed ||
+                left.CreationFlags != right.CreationFlags) return false;
+
+            float3 leftPosition = new float3(left.Object.PosX, left.Object.PosY,
+                left.Object.PosZ);
+            float3 rightPosition = new float3(right.Object.PosX, right.Object.PosY,
+                right.Object.PosZ);
+            if (math.distancesq(leftPosition, rightPosition) > 0.0001f) return false;
+
+            float4 leftRotation = new float4(left.Object.RotX, left.Object.RotY,
+                left.Object.RotZ, left.Object.RotW);
+            float4 rightRotation = new float4(right.Object.RotX, right.Object.RotY,
+                right.Object.RotZ, right.Object.RotW);
+            return math.abs(math.dot(leftRotation, rightRotation)) >= 0.99999f;
+        }
+
+        private void PruneRecentLocalObjectOperations(long now)
+        {
+            if (now <= 0) return;
+            for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+            {
+                long observedAt = _recentLocalObjectOperations[i].ObservedAtMs;
+                if (observedAt > 0 && now >= observedAt &&
+                    now - observedAt > RecentLocalObjectOperationLifetimeMs)
+                    _recentLocalObjectOperations.RemoveAt(i);
+            }
+        }
+
+        private void ForgetRecentLocalObjectOperation(ObjectToolOperationCommand operation)
+        {
+            if (operation == null) return;
+            for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+                if (object.ReferenceEquals(_recentLocalObjectOperations[i].Operation, operation))
+                    _recentLocalObjectOperations.RemoveAt(i);
+        }
+
+        private void ClearRecentLocalObjectOperations()
+        {
+            _recentLocalObjectOperations.Clear();
+        }
+
+        /// <summary>
+        /// Bind a full preview graph to the root entity that demonstrably committed. Generated
+        /// objects preserve the definition's prefab, transform, and pseudo-random seed, providing
+        /// a stable identity after the transient tool Apply pulse has disappeared.
+        /// </summary>
+        private bool TryPublishMatchingRecentLocalObjectOperation(List<Entity> created, long now)
+        {
+            PruneRecentLocalObjectOperations(now);
+            if (_recentLocalObjectOperations.Count == 0) return false;
+
+            for (int entityIndex = 0; entityIndex < created.Count; entityIndex++)
+            {
+                Entity entity = created[entityIndex];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<Applied>(entity) ||
+                    !EntityManager.HasComponent<PrefabRef>(entity) ||
+                    !EntityManager.HasComponent<global::Game.Objects.Transform>(entity) ||
+                    !EntityManager.HasComponent<PseudoRandomSeed>(entity)) continue;
+
+                Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                string prefabName = _prefabSystem.GetPrefabName(prefab);
+                global::Game.Objects.Transform transform =
+                    EntityManager.GetComponentData<global::Game.Objects.Transform>(entity);
+                ushort randomSeed = unchecked((ushort)
+                    EntityManager.GetComponentData<PseudoRandomSeed>(entity).m_Seed);
+
+                for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+                {
+                    ObjectToolOperationCommand operation =
+                        _recentLocalObjectOperations[i].Operation;
+                    ObjectToolDefinitionIntent root;
+                    if (!TryGetNewTopLevelRoot(operation, out root) ||
+                        !CommittedRootMatches(root, prefabName, transform, randomSeed)) continue;
+
+                    int definitionCount = operation.Definitions.Length;
+                    try
+                    {
+                        if (!TryPublishLocalObjectOperation(operation)) return false;
+                        if (object.ReferenceEquals(_cachedLocalObjectOperation, operation))
+                            _cachedLocalObjectOperation = null;
+                        Diagnostics.FlightRecorder.Note("object graph matched committed root op=" +
+                            operation.OperationId + " defs=" + definitionCount +
+                            " prefab=" + prefabName + " seed=" + randomSeed);
+                        return true;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ForgetRecentLocalObjectOperation(operation);
+                        if (object.ReferenceEquals(_cachedLocalObjectOperation, operation))
+                            _cachedLocalObjectOperation = null;
+                        Mod.log.Warn("[MP] BuildSync: committed object graph was not sent: " +
+                                     ex.Message);
+                        Diagnostics.FlightRecorder.Note("committed object graph rejected=" +
+                                                          ex.GetType().Name);
+                        return false;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private static bool CommittedRootMatches(ObjectToolDefinitionIntent root,
+            string prefabName, global::Game.Objects.Transform transform, ushort randomSeed)
+        {
+            if (!string.Equals(root.PrefabName, prefabName, System.StringComparison.Ordinal) ||
+                unchecked((ushort)root.RandomSeed) != randomSeed) return false;
+
+            float3 expectedPosition = new float3(root.Object.PosX, root.Object.PosY,
+                root.Object.PosZ);
+            // Generation copies the definition transform verbatim and ApplyObjectsSystem does not
+            // rewrite it for a new entity. Keep this tight so proximity is never the identity.
+            if (math.distancesq(expectedPosition, transform.m_Position) > 0.0001f)
+                return false;
+
+            float4 expectedRotation = new float4(root.Object.RotX, root.Object.RotY,
+                root.Object.RotZ, root.Object.RotW);
+            return math.abs(math.dot(expectedRotation, transform.m_Rotation.value)) >= 0.99999f;
+        }
+
+        private void NoteCommittedObjectGraphMiss(List<Entity> created)
+        {
+            if (created.Count == 0) return;
+            Entity entity = created[0];
+            for (int i = 0; i < created.Count; i++)
+            {
+                Entity candidate = created[i];
+                if (EntityManager.Exists(candidate) &&
+                    EntityManager.HasComponent<Applied>(candidate) &&
+                    EntityManager.HasComponent<PseudoRandomSeed>(candidate))
+                {
+                    entity = candidate;
+                    break;
+                }
+            }
+            string prefabName = "unknown";
+            string seed = "none";
+            if (EntityManager.Exists(entity) && EntityManager.HasComponent<PrefabRef>(entity))
+            {
+                Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                prefabName = _prefabSystem.GetPrefabName(prefab) ?? "unknown";
+            }
+            if (EntityManager.Exists(entity) && EntityManager.HasComponent<PseudoRandomSeed>(entity))
+                seed = EntityManager.GetComponentData<PseudoRandomSeed>(entity).m_Seed.ToString();
+
+            string newest = "none";
+            if (_recentLocalObjectOperations.Count > 0)
+            {
+                ObjectToolDefinitionIntent root;
+                if (TryGetNewTopLevelRoot(
+                        _recentLocalObjectOperations[_recentLocalObjectOperations.Count - 1].Operation,
+                        out root))
+                    newest = root.PrefabName + "/" + unchecked((ushort)root.RandomSeed);
+            }
+            Diagnostics.FlightRecorder.Note("object graph match missed prefab=" + prefabName +
+                " seed=" + seed + " recent=" + _recentLocalObjectOperations.Count +
+                " newest=" + newest);
         }
 
         private bool TryBeginSpecializedAreaCapture(Entity recreate)
         {
             if (!SpecializedAreaOwnerStillMatches(recreate, _cachedLocalObjectOperation))
                 return false;
+            ForgetRecentLocalObjectOperation(_cachedLocalObjectOperation);
             _pendingSpecializedObjectOperation = _cachedLocalObjectOperation;
             _pendingSpecializedArea = recreate;
             TryFindTopOwner(recreate, out _pendingSpecializedOwner);
@@ -398,11 +726,101 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return math.abs(actual.m_Elevation - expected.Elevation) <= 0.25f;
         }
 
-        /// <summary>Publish the cached batch when the object tool enters Apply.</summary>
+        /// <summary>
+        /// Capture a rootless asset stamp in the narrow phase between ObjectToolSystem selecting
+        /// Apply and ToolOutputSystem consuming its standing preview. The cached command is that
+        /// complete preview graph; the definitions generated later in the frame are the next ghost.
+        /// </summary>
+        public void CaptureAssetStampApplyBeforeToolOutput()
+        {
+            ObjectToolOperationCommand operation = _cachedLocalObjectOperation;
+            if (_nativeLifecycleCapturedThisFrame || operation == null || !operation.IsAssetStamp ||
+                operation.Definitions == null || _toolSystem == null ||
+                _toolSystem.applyMode != ApplyMode.Apply) return;
+
+            // A remote net transaction owns this frame's ApplyTool pass. Its isolation deliberately
+            // prevents the local preview from committing, so it must not be published as local work.
+            if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedNetCommit) return;
+
+            string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
+                                   _selectedAssetStampPrefabName;
+            if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
+                    System.StringComparison.Ordinal)) return;
+
+            _localObjectApplyThisFrame = true;
+            Diagnostics.FlightRecorder.Note("asset stamp apply captured before tool output defs=" +
+                                              operation.Definitions.Length + " prefab=" +
+                                              operation.AssetStampPrefabName);
+            PublishCachedLocalObjectOperation();
+        }
+
+        /// <summary>
+        /// Process the cached batch when the object tool enters Apply. New top-level placements
+        /// remain cached until their generated root proves which preview graph committed.
+        /// </summary>
         public void CaptureLocalObjectApply()
         {
+            // ApplyMode is a stored tool state, not an edge-triggered event. A capture performed
+            // after the previous early sample still owns that Apply pulse; consume the marker and
+            // let the tool update before accepting another one. Any genuinely new Apply later in
+            // this ToolUpdate is caught at the output barrier.
+            bool applyAlreadyCaptured = _nativeLifecycleCapturedThisFrame;
             _nativeLifecycleCapturedThisFrame = false;
+            if (applyAlreadyCaptured) return;
             if (!_localObjectApplyThisFrame || _cachedLocalObjectOperation == null) return;
+
+            // A rootless stamp has no Created object that can prove its commit later. Its dedicated
+            // pre-ToolOutput hook observes the current Apply decision while the standing graph is
+            // still intact; a stored Apply sampled at the front of the phase is not sufficient.
+            if (_cachedLocalObjectOperation.IsAssetStamp) return;
+
+            PublishCachedLocalObjectOperation();
+        }
+
+        /// <summary>
+        /// Catch one-frame object-tool applies at the first point after the tool has made its update
+        /// decision. At this point <see cref="ToolOutputSystem"/> has applied the standing preview,
+        /// while <see cref="ToolOutputBarrier"/> has exposed the replacement definitions generated
+        /// after the click. The cached operation still describes the graph that actually committed;
+        /// callers must invoke this before replacing that cache with the new output batch.
+        /// </summary>
+        private void CaptureLocalObjectApplyAfterToolOutput()
+        {
+            if (_nativeLifecycleCapturedThisFrame || _cachedLocalObjectOperation == null) return;
+
+            // ToolSystem chooses its last tool before entering ToolUpdate. Sampling activeTool at
+            // the front of that phase therefore identifies the tool that ran even when a one-shot
+            // object/stamp switches activeTool while applying. Do not let another tool's Apply
+            // publish an object preview cached before a tool switch.
+            if (!_localObjectToolRanThisFrame || _toolSystem == null ||
+                _toolSystem.applyMode != ApplyMode.Apply) return;
+
+            // Specialized-industry placement intentionally commits its building first and then
+            // hands the owned lot to AreaToolSystem. ObserveLocalObjectDefinitions must retain this
+            // standing graph until the polygon closes, when both halves are published atomically.
+            Entity recreate = _areaToolSystem != null ? _areaToolSystem.recreate : Entity.Null;
+            global::Game.Tools.ToolBaseSystem active = _toolSystem.activeTool;
+            if (recreate != Entity.Null &&
+                (active is AreaToolSystem || active is ObjectToolSystem)) return;
+
+            // Preserve the late observation through ModificationEnd. If native encoding is rejected,
+            // the legacy final-entity path still sees this as a genuine local object-tool apply.
+            _localObjectApplyThisFrame = true;
+            Diagnostics.FlightRecorder.Note("object apply observed after output; processing standing defs=" +
+                                              _cachedLocalObjectOperation.Definitions.Length);
+            PublishCachedLocalObjectOperation();
+        }
+
+        private void PublishCachedLocalObjectOperation()
+        {
+            if (_cachedLocalObjectOperation == null) return;
+
+            // A new top-level object has a stronger commit signal than ApplyMode: its generated
+            // root preserves the preview definition's prefab, transform, and random seed. Keep the
+            // graph in the bounded recent set and publish it only after that root exists. This also
+            // prevents the replacement ghost generated after a click from becoming a placement.
+            ObjectToolDefinitionIntent newRoot;
+            if (TryGetNewTopLevelRoot(_cachedLocalObjectOperation, out newRoot)) return;
 
             try
             {
@@ -430,6 +848,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             operation.OperationId = _nextLocalObjectOperationId++;
             byte[] body = operation.Encode();
             service.Session.SendCommand(0, ObjectToolOperationCommand.Id, body);
+            ForgetRecentLocalObjectOperation(operation);
             _nativeLifecycleCapturedThisFrame = true;
             return true;
         }

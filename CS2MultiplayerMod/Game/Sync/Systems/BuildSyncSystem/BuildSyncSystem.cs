@@ -66,6 +66,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private CityStateSyncSystem _cityStateSync;
         private ToolSystem _toolSystem;
         private AreaToolSystem _areaToolSystem;
+        private bool _localObjectToolRanThisFrame;
         private bool _localObjectApplyThisFrame;
         private EntityQuery _createdObjects;
         private EntityQuery _liveNodes;
@@ -193,8 +194,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _attachRetry.Clear();
             DrainNativeObjectOperations();
             _cachedLocalObjectOperation = null;
+            ClearRecentLocalObjectOperations();
+            _selectedAssetStampPrefabName = null;
             ClearSpecializedAreaCapture();
             _nativeLifecycleCapturedThisFrame = false;
+            _localObjectToolRanThisFrame = false;
             _localObjectApplyThisFrame = false;
             DeferForTerrain = false;
             _refused.Clear();
@@ -256,7 +260,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         public void ObserveLocalToolOutput()
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
-            _localObjectApplyThisFrame = active is ObjectToolSystem &&
+            RememberSelectedAssetStampPrefab(active);
+            _localObjectToolRanThisFrame = active is ObjectToolSystem;
+            _localObjectApplyThisFrame = _localObjectToolRanThisFrame &&
                                          active.applyMode == ApplyMode.Apply;
         }
 
@@ -350,19 +356,44 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (_createdObjects.IsEmptyIgnoreFilter || _nativeLifecycleCapturedThisFrame ||
                 (_nativeNetCoordinator != null && _nativeNetCoordinator.DidCommitObjectGraphThisFrame)) return;
-
-            // Narrow capture to genuine player placements: tool-applied objects appear
-            // on frames where the object tool is active. Simulation-spawned objects
-            // (zone growth, sub-spawns) arrive regardless of the active tool, so
-            // requiring it filters them out. (In-game verification tracked in docs.)
-            if (!_localObjectApplyThisFrame) return;
+            // Specialized-industry placement is not committed until its area-tool polygon closes.
+            // Its initial building root must never publish the incomplete object half here.
+            if (_pendingSpecializedObjectOperation != null ||
+                (_areaToolSystem != null && _areaToolSystem.recreate != Entity.Null)) return;
 
             NativeArray<Entity> entities = _createdObjects.ToEntityArray(Allocator.Temp);
             try
             {
+                var localCreated = new List<Entity>(entities.Length);
                 for (int i = 0; i < entities.Length; i++)
                 {
                     Entity entity = entities[i];
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                    string name = _prefabSystem.GetPrefabName(prefab);
+                    if (string.IsNullOrEmpty(name) || IsSimulationOnlyPlacementPrefab(prefab))
+                        continue;
+                    Transform transform = EntityManager.GetComponentData<Transform>(entity);
+                    if (_guard.Consume(ReplicationGuard.Key(name, transform.m_Position), now))
+                        continue;
+                    localCreated.Add(entity);
+                }
+
+                if (localCreated.Count == 0) return;
+
+                // A committed root is a stronger signal than the transient tool Apply pulse. Its
+                // prefab, transform, and random seed select the exact recent preview graph.
+                if (TryPublishMatchingRecentLocalObjectOperation(localCreated, now)) return;
+
+                // Record every failed graph correlation, including the original failure mode where
+                // the one-frame Apply pulse was not sampled. Apply still gates the reduced fallback.
+                NoteCommittedObjectGraphMiss(localCreated);
+
+                // Only the reduced compatibility fallback still depends on the tool Apply sample.
+                if (!_localObjectApplyThisFrame) return;
+
+                for (int i = 0; i < localCreated.Count; i++)
+                {
+                    Entity entity = localCreated[i];
                     Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
                     string name = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(name)) continue;
@@ -379,9 +410,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     float age = EntityManager.HasComponent<Tree>(entity)
                         ? TreeAge(EntityManager.GetComponentData<Tree>(entity))
                         : 0f;
-
-                    // Skip objects we just realized from a remote command — don't echo them.
-                    if (_guard.Consume(ReplicationGuard.Key(name, transform.m_Position), now)) continue;
 
                     // A net object (roundabout island, turn-restriction sign) is inert without its
                     // parent: the ring and the restriction are derived from the parent's sub-objects,

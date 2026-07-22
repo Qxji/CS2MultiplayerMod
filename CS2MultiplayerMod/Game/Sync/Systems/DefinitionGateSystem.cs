@@ -61,8 +61,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // armed: the next Apply frame publishes this preview rather than inferring from
                 // its final Created edges.
                 _netSync.ObserveLocalNetDefinitions(definitions);
-                World.GetOrCreateSystemManaged<BuildSyncSystem>()
-                    .ObserveLocalObjectDefinitions(definitions);
+                BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+                // ObjectToolSystem can pulse Apply entirely between SyncRealizeSystem's early
+                // ToolUpdate sample and this barrier. ToolOutputSystem has just applied the standing
+                // preview; publish that cached graph before observing this frame's definitions,
+                // which describe the replacement preview generated after the click.
+                buildSync.ObserveLocalObjectToolOutput(definitions,
+                    !_netSync.HasArmedNetCommit);
 
                 if (!_netSync.HasArmedNetCommit) return;
                 for (int i = 0; i < definitions.Length; i++)

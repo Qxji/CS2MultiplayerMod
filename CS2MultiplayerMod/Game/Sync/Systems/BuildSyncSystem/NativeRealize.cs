@@ -210,7 +210,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             bool armed = _nativeNetCoordinator.ArmObjectCommit(
                 () => ReplayNativeObject(retained),
                 () => CompleteNativeObject(key, command, resolved, now),
-                "native op=" + command.OperationId + " defs=" + command.Definitions.Length);
+                "native op=" + command.OperationId + " defs=" + command.Definitions.Length,
+                command.IsAssetStamp);
             if (!armed)
             {
                 DestroyDefinitions(created);
@@ -391,34 +392,56 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             long now = Mod.Service != null ? Mod.Service.NowMs : capturedNow;
             _recentNativeObjectOperations.Remember(key, now, NativeObjectReplayRememberMs);
-            ObjectToolDefinitionIntent root = command.Definitions[command.RootIndex];
-            Entity rootPrefab = resolved[command.RootIndex].Prefab;
             try
             {
-                CreationFlags flags = (CreationFlags)root.CreationFlags;
-                if ((flags & CreationFlags.Relocate) == 0 && rootPrefab != Entity.Null)
+                if (command.IsAssetStamp)
                 {
-                    if (root.Owner.Kind != PortableEntityKind.None ||
-                        (flags & CreationFlags.Upgrade) != 0)
-                        ConstructionCharger.ChargeUpgrade(EntityManager, rootPrefab,
-                            root.PrefabName ?? "object upgrade");
-                    else
-                        ConstructionCharger.ChargeObject(EntityManager, rootPrefab,
-                            root.PrefabName ?? "object");
+                    Entity stampPrefab;
+                    if (_prefabIndex.TryResolve(command.AssetStampPrefabName, out stampPrefab))
+                        ConstructionCharger.ChargeObject(EntityManager, stampPrefab,
+                            command.AssetStampPrefabName);
+                }
+                else
+                {
+                    ObjectToolDefinitionIntent root = command.Definitions[command.RootIndex];
+                    Entity rootPrefab = resolved[command.RootIndex].Prefab;
+                    CreationFlags flags = (CreationFlags)root.CreationFlags;
+                    if ((flags & CreationFlags.Relocate) == 0 && rootPrefab != Entity.Null)
+                    {
+                        if (root.Owner.Kind != PortableEntityKind.None ||
+                            (flags & CreationFlags.Upgrade) != 0)
+                            ConstructionCharger.ChargeUpgrade(EntityManager, rootPrefab,
+                                root.PrefabName ?? "object upgrade");
+                        else
+                            ConstructionCharger.ChargeObject(EntityManager, rootPrefab,
+                                root.PrefabName ?? "object");
+                    }
                 }
             }
             catch (System.Exception ex)
             {
                 Mod.log.Warn("[MP] BuildSync: committed object charge failed: " + ex.Message);
             }
-            Diagnostics.FlightRecorder.Note("object transaction committed/drained op=" +
-                                              command.OperationId);
+            Diagnostics.FlightRecorder.Note((command.IsAssetStamp
+                ? "asset stamp transaction committed/drained op="
+                : "object transaction committed/drained op=") + command.OperationId);
         }
 
         private bool TryResolveObjectOperation(ObjectToolOperationCommand command,
             out ResolvedObjectDefinition[] resolved, out string reason)
         {
             resolved = new ResolvedObjectDefinition[command.Definitions.Length];
+            if (command.IsAssetStamp)
+            {
+                Entity stampPrefab;
+                if (!_prefabIndex.TryResolve(command.AssetStampPrefabName, out stampPrefab) ||
+                    stampPrefab == Entity.Null || !EntityManager.Exists(stampPrefab) ||
+                    !EntityManager.HasComponent<AssetStampData>(stampPrefab))
+                {
+                    reason = "asset-stamp prefab is unavailable or incompatible";
+                    return false;
+                }
+            }
             for (int i = 0; i < command.Definitions.Length; i++)
             {
                 ObjectToolDefinitionIntent definition = command.Definitions[i];
@@ -626,6 +649,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool EquivalentObjectOperationAlreadyExists(ObjectToolOperationCommand command,
             ResolvedObjectDefinition[] resolved)
         {
+            // A stamp has no root object identity. Replay suppression is handled by OperationId;
+            // geometry proximity would incorrectly suppress two intentional adjacent stamps.
+            if (command.IsAssetStamp) return false;
             ObjectToolDefinitionIntent root = command.Definitions[command.RootIndex];
             if (root.Kind != ObjectToolDefinitionKind.Object ||
                 root.Original.Kind != PortableEntityKind.None) return false;

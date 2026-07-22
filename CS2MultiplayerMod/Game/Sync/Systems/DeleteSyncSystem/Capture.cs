@@ -16,6 +16,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     {
         private void CaptureDeletedObjects(MultiplayerSession session, long now)
         {
+            // A native object-tool transaction already contains every explicit delete in the
+            // object/sub-net/area graph, and the receiver's generator reproduces its implicit
+            // clear/split side effects. Do not turn that transaction output into a second command.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame)) return;
             if (_deletedObjects.IsEmptyIgnoreFilter) return;
 
             NativeArray<Entity> entities = _deletedObjects.ToEntityArray(Allocator.Temp);
@@ -46,6 +52,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureDeletedEdges(MultiplayerSession session, long now)
         {
+            // Asset-stamp intersections and other object prefabs apply their whole owned network in
+            // one native graph. A follow-up edge delete can otherwise tear down the freshly connected
+            // receiver graph after its atomic commit.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame)) return;
             if (_deletedEdges.IsEmptyIgnoreFilter) return;
 
             // Snapshot this frame's Created edges so we can distinguish a mid-span SPLIT from a real

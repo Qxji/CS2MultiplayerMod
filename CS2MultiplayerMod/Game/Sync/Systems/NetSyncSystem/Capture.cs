@@ -91,6 +91,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // reductions) is output, not another placement command.
             if (_nativeApplyCapturedFrame == _realizeFrame) return;
 
+            // Object-prefab networks (asset-stamp intersections, building driveways/connectors,
+            // etc.) are already carried inside one atomic ObjectToolOperationCommand. Replaying the
+            // resulting Created edges here discarded their shared graph and rebuilt them as many
+            // independent clicks: slow for large stamps and unreliable at tightly-spaced nodes.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if (buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) return;
+
             // On the frame a self-driven ApplyTool pass commits a remote batch, every Created edge
             // here is that batch's output - skip exactly this frame (never a wall-clock window,
             // which also swallowed roads the player built while remote batches streamed in).

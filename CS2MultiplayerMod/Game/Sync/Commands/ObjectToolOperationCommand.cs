@@ -121,34 +121,38 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
     public sealed class ObjectToolOperationCommand : ISimulationCommand
     {
         public const ushort Id = 20;
+        /// <summary>
+        /// Asset stamps deliberately have no persistent root object definition. Their prefab emits
+        /// its complete transformed subnet/subobject/area graph directly in one tool transaction.
+        /// </summary>
+        public const short AssetStampRootIndex = -1;
         public const int MaxDefinitions = 1024;
         public const int MaxAreaNodesPerDefinition = 1024;
         public const int MaxEncodedBytes = 120 * 1024;
 
         private const uint KnownCreationFlags = 0xfffffu;
         private const uint KnownCoursePosFlags = 0x7fffu;
+        private const uint StampingCreationFlag = 0x80000u;
+        private const uint UnsafeAssetStampCreationFlags = 0x60835u;
 
         public long OperationId;
         public short RootIndex;
+        public string AssetStampPrefabName;
         public ObjectToolDefinitionIntent[] Definitions;
 
         public ushort CommandId => Id;
+        public bool IsAssetStamp => RootIndex == AssetStampRootIndex;
 
         public void Write(NetworkWriter writer)
         {
             if (OperationId <= 0)
                 throw new ProtocolException("Invalid object-tool operation id " + OperationId + ".");
-            if (Definitions == null || Definitions.Length == 0 || Definitions.Length > MaxDefinitions)
-                throw new ProtocolException("Invalid object-tool definition count.");
-            if (RootIndex < 0 || RootIndex >= Definitions.Length)
-                throw new ProtocolException("Invalid object-tool root index " + RootIndex + ".");
-            if (Definitions[RootIndex] == null ||
-                Definitions[RootIndex].Kind != ObjectToolDefinitionKind.Object)
-                throw new ProtocolException("Object-tool root must be an object definition.");
+            ValidateEnvelope();
 
             writer.WriteLong(OperationId);
             writer.WriteShort(RootIndex);
             writer.WriteShort((short)Definitions.Length);
+            if (IsAssetStamp) writer.WriteString(AssetStampPrefabName);
             for (int i = 0; i < Definitions.Length; i++) WriteDefinition(writer, Definitions[i]);
         }
 
@@ -159,15 +163,64 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                 throw new ProtocolException("Invalid object-tool operation id " + OperationId + ".");
             RootIndex = reader.ReadShort();
             int count = WireGuard.ReadCount(reader, 2, MaxDefinitions);
-            if (count == 0 || RootIndex < 0 || RootIndex >= count)
+            if (count == 0 || RootIndex < AssetStampRootIndex || RootIndex >= count)
                 throw new ProtocolException("Invalid object-tool root/count " + RootIndex + "/" + count + ".");
+            if (IsAssetStamp) AssetStampPrefabName = WireGuard.ReadName(reader);
 
             Definitions = new ObjectToolDefinitionIntent[count];
             for (int i = 0; i < count; i++) Definitions[i] = ReadDefinition(reader);
-            if (Definitions[RootIndex].Kind != ObjectToolDefinitionKind.Object)
-                throw new ProtocolException("Object-tool root must be an object definition.");
+            ValidateEnvelope();
             if (reader.Remaining != 0)
                 throw new ProtocolException("Trailing bytes in object-tool operation: " + reader.Remaining + ".");
+        }
+
+        private void ValidateEnvelope()
+        {
+            if (Definitions == null || Definitions.Length == 0 || Definitions.Length > MaxDefinitions)
+                throw new ProtocolException("Invalid object-tool definition count.");
+
+            if (!IsAssetStamp)
+            {
+                if (RootIndex < 0 || RootIndex >= Definitions.Length)
+                    throw new ProtocolException("Invalid object-tool root index " + RootIndex + ".");
+                if (Definitions[RootIndex] == null ||
+                    Definitions[RootIndex].Kind != ObjectToolDefinitionKind.Object)
+                    throw new ProtocolException("Object-tool root must be an object definition.");
+                if (!string.IsNullOrEmpty(AssetStampPrefabName))
+                    throw new ProtocolException("A rooted object operation may not name an asset stamp.");
+                return;
+            }
+
+            if (string.IsNullOrEmpty(AssetStampPrefabName))
+                throw new ProtocolException("A rootless asset-stamp operation has no stamp prefab.");
+
+            bool hasStampingNet = false;
+            for (int i = 0; i < Definitions.Length; i++)
+            {
+                ObjectToolDefinitionIntent definition = Definitions[i];
+                if (definition == null || definition.PrefabIsNull ||
+                    string.IsNullOrEmpty(definition.PrefabName))
+                    throw new ProtocolException("Asset-stamp definitions must create named prefabs.");
+                if (definition.Original.Kind != PortableEntityKind.None ||
+                    definition.Owner.Kind != PortableEntityKind.None ||
+                    definition.Attached.Kind != PortableEntityKind.None ||
+                    definition.HasOwnerDefinition)
+                    throw new ProtocolException("A rootless asset stamp may not reference an external owner or original.");
+                if ((definition.CreationFlags & ~KnownCreationFlags) != 0 ||
+                    (definition.CreationFlags & UnsafeAssetStampCreationFlags) != 0)
+                    throw new ProtocolException("Unsafe asset-stamp creation flags 0x" +
+                                                definition.CreationFlags.ToString("x") + ".");
+
+                if (definition.Kind != ObjectToolDefinitionKind.NetCourse) continue;
+                if ((definition.CreationFlags & StampingCreationFlag) == 0 ||
+                    definition.NetCourse.Start.Entity.Kind != PortableEntityKind.None ||
+                    definition.NetCourse.End.Entity.Kind != PortableEntityKind.None)
+                    throw new ProtocolException("Asset-stamp net courses must be new stamping courses.");
+                hasStampingNet = true;
+            }
+
+            if (!hasStampingNet)
+                throw new ProtocolException("A rootless asset stamp has no stamping net course.");
         }
 
         public byte[] Encode()

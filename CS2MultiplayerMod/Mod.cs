@@ -143,6 +143,11 @@ namespace CS2MultiplayerMod
             updateSystem.UpdateBefore<Game.Sync.Systems.TerrainReadbackBarrierSystem>(
                 SystemUpdatePhase.ToolUpdate);
             updateSystem.UpdateAt<Game.Sync.Systems.SyncRealizeSystem>(SystemUpdatePhase.ToolUpdate);
+            // Asset stamps have no persistent root object. Capture their one-frame Apply after the
+            // object tool made its decision but before ToolOutputSystem consumes the complete
+            // standing definition graph.
+            updateSystem.UpdateBefore<Game.Sync.Systems.ObjectToolApplyCaptureSystem,
+                global::Game.Tools.ToolOutputSystem>(SystemUpdatePhase.ToolUpdate);
             // After ToolOutputBarrier: tools record their definitions through that end-of-phase
             // buffer, so this is the first (and only) slot where they exist as entities but have
             // not been consumed - the gate keeps them out of an armed net commit (see there).

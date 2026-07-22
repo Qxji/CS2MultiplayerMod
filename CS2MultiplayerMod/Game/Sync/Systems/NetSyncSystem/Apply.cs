@@ -87,7 +87,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 EntityQuery transactionQuery = ActiveTransactionQuery();
                 int isolatedCount = transactionQuery.CalculateEntityCount();
                 string invalidReason;
-                bool valid = _pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph
+                bool valid = IsObjectGraphTransaction(_pendingTransactionKind)
                     ? ValidateArmedObjectTransaction(out invalidReason)
                     : ValidateArmedNetTransaction(out invalidReason);
                 if (isolatedCount > 0 && !valid)
@@ -349,7 +349,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private EntityQuery ActiveTransactionQuery() =>
-            _pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph
+            IsObjectGraphTransaction(_pendingTransactionKind)
                 ? _objectTransactionTemps : _netTransactionTemps;
 
         private void CommitRemoteTemps(EntityQuery transactionQuery, int count)
@@ -372,7 +372,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
             try
             {
-                if (_pendingTransactionKind == RemoteToolTransactionKind.ObjectGraph)
+                if (IsObjectGraphTransaction(_pendingTransactionKind))
                 {
                     // Preserve the native ApplyTool domain order. Owner resolution in the object
                     // pass must run before its owned connector nets and lot areas are committed.
@@ -646,6 +646,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 }
 
                 int objectRoots = 0;
+                int netStructures = 0;
                 for (int i = 0; i < temps.Length; i++)
                 {
                     Entity entity = temps[i];
@@ -656,6 +657,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     bool isLane = EntityManager.HasComponent<Lane>(entity);
                     bool isAggregate = EntityManager.HasComponent<Aggregate>(entity);
                     bool isArea = EntityManager.HasComponent<global::Game.Areas.Area>(entity);
+                    if (isNode || isEdge) netStructures++;
                     if (!isObject && !isNode && !isEdge && !isLane && !isAggregate && !isArea)
                     {
                         reason = "the generated object transaction contains an unsupported Temp shape";
@@ -696,7 +698,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
                 }
 
-                if (objectRoots == 0)
+                if (_pendingTransactionKind == RemoteToolTransactionKind.AssetStampGraph)
+                {
+                    if (netStructures == 0)
+                    {
+                        reason = "the generated asset-stamp transaction has no network graph";
+                        return false;
+                    }
+                }
+                else if (objectRoots == 0)
                 {
                     reason = "the generated object transaction has no top-level object";
                     return false;
@@ -1139,17 +1149,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// validated and consumed together. The source callback is retained until drain completes.
         /// </summary>
         public bool ArmObjectCommit(System.Action onCommitLost, System.Action onCommitComplete,
-            string source)
+            string source, bool rootlessAssetStamp = false)
         {
             if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return false;
             _pendingApply = true;
-            _pendingTransactionKind = RemoteToolTransactionKind.ObjectGraph;
+            _pendingTransactionKind = rootlessAssetStamp
+                ? RemoteToolTransactionKind.AssetStampGraph
+                : RemoteToolTransactionKind.ObjectGraph;
             _armTick = System.Environment.TickCount;
             _pendingNetConstructionCharge = 0;
             _pendingNetConstructionChargeCourses = 0;
             _onCommitLost = onCommitLost;
             _onCommitComplete = onCommitComplete;
-            Diagnostics.FlightRecorder.Note("object " + source + " operation armed");
+            Diagnostics.FlightRecorder.Note((rootlessAssetStamp ? "asset stamp " : "object ") +
+                                               source + " operation armed");
             return true;
         }
 

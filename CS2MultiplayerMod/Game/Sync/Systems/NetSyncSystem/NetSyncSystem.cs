@@ -182,9 +182,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private bool _clearLocalNetIsolationAfterBarrier;
         private bool _localToolOutputProtectedThisFrame;
         private bool _pendingApply;
-        private enum RemoteToolTransactionKind : byte { None, Net, ObjectGraph }
+        private enum RemoteToolTransactionKind : byte { None, Net, ObjectGraph, AssetStampGraph }
         private RemoteToolTransactionKind _pendingTransactionKind;
         private RemoteToolTransactionKind _committingTransactionKind;
+        private static bool IsObjectGraphTransaction(RemoteToolTransactionKind kind) =>
+            kind == RemoteToolTransactionKind.ObjectGraph ||
+            kind == RemoteToolTransactionKind.AssetStampGraph;
         private System.Action _onCommitComplete;
         private bool _objectCommitThisFrame;
         private long _pendingNetConstructionCharge;
