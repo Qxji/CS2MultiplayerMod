@@ -192,7 +192,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
             }
 
-            if (captured.Count == 0 || (!hasStampingNet && root < 0))
+            if (captured.Count == 0)
+            {
+                // ObjectToolSystem emits no definitions while an unchanged preview is standing and
+                // reports ApplyMode.None. ToolOutputSystem leaves the existing Temp graph intact in
+                // that case, so an empty barrier batch means "unchanged", not "no preview". Erasing
+                // the cache here made stamp capture depend on clicking in the same frame as cursor
+                // movement. Clear only when the tool is actively clearing/applying its output.
+                if (_toolSystem == null || _toolSystem.applyMode != ApplyMode.None)
+                    _cachedLocalObjectOperation = null;
+                return;
+            }
+
+            if (!hasStampingNet && root < 0)
             {
                 _cachedLocalObjectOperation = null;
                 return;
@@ -230,19 +242,42 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                   " seed=" + unchecked((ushort)captured[root].RandomSeed));
         }
 
-        private static bool IsBetterObjectOperationRoot(ObjectToolDefinitionIntent candidate,
+        private bool IsBetterObjectOperationRoot(ObjectToolDefinitionIntent candidate,
             ObjectToolDefinitionIntent current)
         {
             return ObjectOperationRootScore(candidate) > ObjectOperationRootScore(current);
         }
 
-        private static int ObjectOperationRootScore(ObjectToolDefinitionIntent definition)
+        private int ObjectOperationRootScore(ObjectToolDefinitionIntent definition)
         {
             int score = 0;
+            // An upgrade preview also contains an update definition for the existing building.
+            // That definition has no prefab and used to outrank the newly-created extension,
+            // leaving the complete preview graph without a committed entity it could bind to.
+            if (IsNewServiceUpgradeRoot(definition)) score |= 16;
             if (!definition.HasOwnerDefinition) score |= 4;
             if (definition.Original.Kind == PortableEntityKind.None) score |= 2;
             if (definition.Owner.Kind == PortableEntityKind.None) score |= 1;
             return score;
+        }
+
+        private bool IsNewServiceUpgradeRoot(ObjectToolDefinitionIntent definition)
+        {
+            if (definition == null || definition.Kind != ObjectToolDefinitionKind.Object ||
+                definition.PrefabIsNull || string.IsNullOrEmpty(definition.PrefabName) ||
+                definition.Original.Kind != PortableEntityKind.None ||
+                definition.Owner.Kind != PortableEntityKind.None ||
+                !definition.HasOwnerDefinition) return false;
+
+            CreationFlags flags = (CreationFlags)definition.CreationFlags;
+            if ((flags & CreationFlags.Upgrade) == 0 ||
+                (flags & (CreationFlags.Delete | CreationFlags.Relocate |
+                          CreationFlags.Recreate | CreationFlags.Permanent)) != 0) return false;
+
+            Entity prefab;
+            return _prefabIndex.TryResolve(definition.PrefabName, out prefab) &&
+                   (EntityManager.HasComponent<ServiceUpgradeData>(prefab) ||
+                    EntityManager.HasComponent<BuildingExtensionData>(prefab));
         }
 
         private void RememberSelectedAssetStampPrefab(global::Game.Tools.ToolBaseSystem active)
@@ -264,7 +299,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private void RememberRecentLocalObjectOperation(ObjectToolOperationCommand operation)
         {
             ObjectToolDefinitionIntent root;
-            if (!TryGetNewTopLevelRoot(operation, out root)) return;
+            if (!TryGetNewCommittedObjectRoot(operation, out root)) return;
 
             long now = Mod.Service != null ? Mod.Service.NowMs : 0;
             PruneRecentLocalObjectOperations(now);
@@ -272,7 +307,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             {
                 RecentLocalObjectOperation recent = _recentLocalObjectOperations[i];
                 ObjectToolDefinitionIntent recentRoot;
-                if (!TryGetNewTopLevelRoot(recent.Operation, out recentRoot) ||
+                if (!TryGetNewCommittedObjectRoot(recent.Operation, out recentRoot) ||
                     !SameRootSignature(root, recentRoot)) continue;
 
                 recent.Operation = operation;
@@ -291,7 +326,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _recentLocalObjectOperations.RemoveAt(0);
         }
 
-        private static bool TryGetNewTopLevelRoot(ObjectToolOperationCommand operation,
+        private bool TryGetNewCommittedObjectRoot(ObjectToolOperationCommand operation,
             out ObjectToolDefinitionIntent root)
         {
             root = null;
@@ -302,14 +337,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             root = operation.Definitions[operation.RootIndex];
             if (root == null || root.Kind != ObjectToolDefinitionKind.Object ||
                 root.PrefabIsNull || string.IsNullOrEmpty(root.PrefabName) ||
-                root.Original.Kind != PortableEntityKind.None ||
-                root.Owner.Kind != PortableEntityKind.None || root.HasOwnerDefinition)
+                root.Original.Kind != PortableEntityKind.None)
                 return false;
 
             CreationFlags flags = (CreationFlags)root.CreationFlags;
-            return (flags & (CreationFlags.Delete | CreationFlags.Relocate |
-                             CreationFlags.Recreate | CreationFlags.Upgrade |
-                             CreationFlags.Permanent)) == 0;
+            if ((flags & (CreationFlags.Delete | CreationFlags.Relocate |
+                          CreationFlags.Recreate | CreationFlags.Permanent)) != 0) return false;
+
+            if (IsNewServiceUpgradeRoot(root)) return true;
+            return root.Owner.Kind == PortableEntityKind.None && !root.HasOwnerDefinition &&
+                   (flags & CreationFlags.Upgrade) == 0;
         }
 
         private static bool SameRootSignature(ObjectToolDefinitionIntent left,
@@ -359,6 +396,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         /// <summary>
+        /// Correlate any newly-applied object, including an owned service extension, with the exact
+        /// object-tool graph that produced it. This runs before the reduced top-level and upgrade
+        /// capture paths, so one successful match owns the whole native transaction.
+        /// </summary>
+        private bool TryPublishCommittedObjectGraph(long now)
+        {
+            if (_recentLocalObjectOperations.Count == 0 ||
+                _nativeLifecycleCapturedThisFrame ||
+                (_nativeNetCoordinator != null &&
+                 _nativeNetCoordinator.DidCommitObjectGraphThisFrame) ||
+                _createdAppliedObjects.IsEmptyIgnoreFilter) return false;
+
+            NativeArray<Entity> entities = _createdAppliedObjects.ToEntityArray(Allocator.Temp);
+            try
+            {
+                var created = new List<Entity>(entities.Length);
+                for (int i = 0; i < entities.Length; i++) created.Add(entities[i]);
+                return TryPublishMatchingRecentLocalObjectOperation(created, now);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
+        }
+
+        /// <summary>
         /// Bind a full preview graph to the root entity that demonstrably committed. Generated
         /// objects preserve the definition's prefab, transform, and pseudo-random seed, providing
         /// a stable identity after the transient tool Apply pulse has disappeared.
@@ -389,7 +452,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     ObjectToolOperationCommand operation =
                         _recentLocalObjectOperations[i].Operation;
                     ObjectToolDefinitionIntent root;
-                    if (!TryGetNewTopLevelRoot(operation, out root) ||
+                    if (!TryGetNewCommittedObjectRoot(operation, out root) ||
                         !CommittedRootMatches(root, prefabName, transform, randomSeed)) continue;
 
                     int definitionCount = operation.Definitions.Length;
@@ -466,7 +529,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (_recentLocalObjectOperations.Count > 0)
             {
                 ObjectToolDefinitionIntent root;
-                if (TryGetNewTopLevelRoot(
+                if (TryGetNewCommittedObjectRoot(
                         _recentLocalObjectOperations[_recentLocalObjectOperations.Count - 1].Operation,
                         out root))
                     newest = root.PrefabName + "/" + unchecked((ushort)root.RandomSeed);
@@ -820,7 +883,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // graph in the bounded recent set and publish it only after that root exists. This also
             // prevents the replacement ghost generated after a click from becoming a placement.
             ObjectToolDefinitionIntent newRoot;
-            if (TryGetNewTopLevelRoot(_cachedLocalObjectOperation, out newRoot)) return;
+            if (TryGetNewCommittedObjectRoot(_cachedLocalObjectOperation, out newRoot)) return;
 
             try
             {

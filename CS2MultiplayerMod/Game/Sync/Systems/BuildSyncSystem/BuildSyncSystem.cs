@@ -69,6 +69,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool _localObjectToolRanThisFrame;
         private bool _localObjectApplyThisFrame;
         private EntityQuery _createdObjects;
+        private EntityQuery _createdAppliedObjects;
         private EntityQuery _liveNodes;
         private EntityQuery _liveEdges;
         private EntityQuery _liveStaticObjects;
@@ -116,6 +117,27 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     ComponentType.ReadOnly<global::Game.Objects.Moving>(),
                     ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
                     ComponentType.ReadOnly<global::Game.Creatures.Creature>(),
+                },
+            });
+
+            // Full object-tool transactions can commit through an owned extension rather than a
+            // top-level object. Keep a narrow Applied query for correlating either kind with the
+            // exact preview graph cached before the click.
+            _createdAppliedObjects = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[]
+                {
+                    ComponentType.ReadOnly<Created>(),
+                    ComponentType.ReadOnly<Applied>(),
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Transform>(),
+                    ComponentType.ReadOnly<PseudoRandomSeed>(),
+                    ComponentType.ReadOnly<global::Game.Objects.Object>(),
+                },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Temp>(),
+                    ComponentType.ReadOnly<Deleted>(),
                 },
             });
 
@@ -229,6 +251,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 CaptureCompletedSpecializedArea();
                 PrioritizeCreatedTrees(session);
                 _guard.Prune(now);
+                TryPublishCommittedObjectGraph(now);
                 CaptureNewObjects(session, now);
             }
             else DrainQueue();

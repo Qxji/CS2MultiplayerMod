@@ -20,7 +20,7 @@ Host-authoritative and friend-focused: set a password, share your IP-address, an
 	<!--Link to the forum post where the mod can be discussed-->
 	<ForumLink Value="" />
 	<!--Version of the mod-->
-	<ModVersion Value="0.1.3" />
+	<ModVersion Value="0.1.4" />
 	<!--Recommended version of the base game to use the mod-->
 	<GameVersion Value="1.6.*" />
 	<!--Dependency for the mod, can be set multiple times-->
@@ -29,11 +29,28 @@ Host-authoritative and friend-focused: set a password, share your IP-address, an
 	<RequiredDLC Value="" />
 	<!--Change log for new version. Single line or multi line. Supports minimal markdown subset-->
 	<ChangeLog>
-		- Fixed: Building placement issues
-		- Fixed: Street not syncing
-		- Optimized: Network traffic
-		- Optimized: Street Placement
-		- Added: New Crash logging system
+		# Version 0.1.4 is now available!
+
+		This update focuses on synchronization improvements, crash fixes, and a smoother multiplayer experience.
+
+		## Bug Fixes
+
+		* Fixed large intersections being placed incorrectly.
+		* Fixed missing details when placing streets.
+		* Fixed buildings incorrectly displaying “Not connected” due to pathway issues.
+		* Added a synchronization screen for the host when joining or resyncing, helping both players maintain the same world state.
+		* Fixed special industries not syncing correctly and potentially causing crashes.
+		* Reviewed the submitted crash logs, identified their causes, and implemented fixes.
+
+		## Quality-of-Life Improvements
+
+		* Updated the hosting interface.
+		* The mod now attempts to detect synchronization issues and automatically resync the game.
+		* Added clearer and easier-to-understand error messages when connecting.
+		
+		Thank you for your reports on Discord.
+
+		Happy playing!
 		
 	</ChangeLog>
 	<!--External link, can be set multiple times. supported types are "discord", "github", "youtube", "twitch", "x", "paypal", "patreon", "buymeacoffee", "kofi", "crowdin", "gitlab", "gofundme"-->

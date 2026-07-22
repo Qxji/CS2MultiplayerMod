@@ -164,8 +164,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // Every isolation, validation, commit, drain, and discard must use this same boundary.
         private EntityQuery _netTransactionTemps;
         // The object apply pass consumes Object Temps while owned driveways/connectors and lots are
-        // consumed by the net and area passes. This all-Temp boundary keeps that native graph one
-        // transaction and also exposes unexpected shapes to validation instead of hiding them.
+        // consumed by the net and area passes. Keep this query equal to the union of those three
+        // apply domains. Other tools can legitimately create unrelated Temp shapes in the same
+        // frame; including them would make them look like a partial remote object transaction.
         private EntityQuery _objectTransactionTemps;
         // A standing interactive preview can span several domains (for example a building plus
         // owned driveway nets). It must be frozen and restored as one graph.
@@ -307,8 +308,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 },
             });
 
-            _objectTransactionTemps = GetEntityQuery(
-                ComponentType.ReadOnly<Temp>());
+            _objectTransactionTemps = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<Temp>() },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<global::Game.Objects.Object>(),
+                    ComponentType.ReadOnly<Node>(),
+                    ComponentType.ReadOnly<Edge>(),
+                    ComponentType.ReadOnly<Lane>(),
+                    ComponentType.ReadOnly<Aggregate>(),
+                    ComponentType.ReadOnly<global::Game.Areas.Area>(),
+                },
+            });
 
             _standingTemps = GetEntityQuery(new EntityQueryDesc
             {

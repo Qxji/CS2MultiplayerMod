@@ -656,9 +656,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (root.Kind != ObjectToolDefinitionKind.Object ||
                 root.Original.Kind != PortableEntityKind.None) return false;
             ObjectDefinitionIntent data = root.Object;
-            PortableEntityRef wantedOwner = root.Owner;
+            PortableEntityRef wantedIdentity = default(PortableEntityRef);
+            if (root.Owner.Kind != PortableEntityKind.None)
+            {
+                wantedIdentity.OwnerPrefabName = root.Owner.PrefabName;
+                wantedIdentity.OwnerX = root.Owner.PosX;
+                wantedIdentity.OwnerY = root.Owner.PosY;
+                wantedIdentity.OwnerZ = root.Owner.PosZ;
+            }
+            else if (root.HasOwnerDefinition)
+            {
+                wantedIdentity.OwnerPrefabName = root.OwnerDefinitionPrefabName;
+                wantedIdentity.OwnerX = root.OwnerDefinitionX;
+                wantedIdentity.OwnerY = root.OwnerDefinitionY;
+                wantedIdentity.OwnerZ = root.OwnerDefinitionZ;
+            }
             return FindPortableObject(resolved[command.RootIndex].Prefab,
-                new float3(data.PosX, data.PosY, data.PosZ), wantedOwner) != Entity.Null;
+                new float3(data.PosX, data.PosY, data.PosZ), wantedIdentity) != Entity.Null;
         }
 
         private bool TryResolvePortableRef(PortableEntityRef source, out Entity result)

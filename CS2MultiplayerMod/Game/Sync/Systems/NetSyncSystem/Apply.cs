@@ -939,8 +939,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (EntityManager.HasComponent<Temp>(owner) &&
                 (!members.Contains(owner) || EntityManager.HasComponent<Disabled>(owner)))
             {
-                reason = "a generated net entity is separated from its Temp owner";
-                return false;
+                // Generated child entities may still point at an isolated preview copy of an
+                // existing owner. The apply passes patch that reference to Temp.m_Original before
+                // consuming the child. Accept exactly that resolvable form; a new/replacement Temp
+                // owner outside this transaction would leave the child attached to discarded work.
+                Temp ownerTemp = EntityManager.GetComponentData<Temp>(owner);
+                Entity original = ownerTemp.m_Original;
+                bool resolvesToLiveOriginal = original != Entity.Null &&
+                    (ownerTemp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) == 0 &&
+                    EntityManager.Exists(original) &&
+                    !EntityManager.HasComponent<Deleted>(original) &&
+                    !EntityManager.HasComponent<Temp>(original);
+                if (!resolvesToLiveOriginal)
+                {
+                    reason = "a generated net entity is separated from an unresolved Temp owner";
+                    return false;
+                }
             }
             return true;
         }

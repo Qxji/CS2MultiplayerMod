@@ -644,10 +644,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             course.m_FixedIndex = -1;
             course.m_StartPosition.m_Flags |= CoursePosFlags.IsFirst;
             course.m_EndPosition.m_Flags |= CoursePosFlags.IsLast;
-            // Owned subnet endpoints must remain distinct from coincident road/utility previews;
-            // ownership resolution, not proximity merging, links the native graph.
-            course.m_StartPosition.m_Flags |= CoursePosFlags.DisableMerge;
-            course.m_EndPosition.m_Flags |= CoursePosFlags.DisableMerge;
             if (course.m_StartPosition.m_Position.Equals(course.m_EndPosition.m_Position))
             {
                 course.m_StartPosition.m_Flags |= CoursePosFlags.IsLast;

@@ -35,8 +35,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private readonly System.Collections.Generic.List<(UpgradePlacementCommand cmd, int origin, long deadline)> _ownerRetry =
             new System.Collections.Generic.List<(UpgradePlacementCommand, int, long)>();
-        private readonly System.Collections.Generic.List<(Entity prefab, float3 position, int seed, long deadline)>
-            _ownedElementRetry = new System.Collections.Generic.List<(Entity, float3, int, long)>();
+        private readonly System.Collections.Generic.List<(Entity prefab, Entity owner, float3 position, int seed, long deadline)>
+            _ownedElementRetry = new System.Collections.Generic.List<(Entity, Entity, float3, int, long)>();
 
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
@@ -164,6 +164,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return;
             }
             long now = service.NowMs;
+            RealizePendingOwnedElements(now);
             RealizeIncoming(session, now);
         }
 
@@ -352,14 +353,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             if (EntityManager.HasBuffer<SubNet>(prefab) || EntityManager.HasBuffer<SubArea>(prefab))
             {
-                var upgradeOwner = new OwnerDefinition
-                {
-                    m_Prefab = prefab,
-                    m_Position = position,
-                    m_Rotation = rotation,
-                };
-                var random = new Unity.Mathematics.Random((uint)math.max(1, randomSeed));
-                _buildSync.RealizeOwnedSubElements(prefab, upgradeOwner, ref random);
+                // The permanent extension is generated later in this modification pass. Its owned
+                // network must wait until that entity is live, otherwise positional owner lookup
+                // can consume the definition without establishing an Owner relationship.
+                if (_ownedElementRetry.Count >= MaxPendingOwners) _ownedElementRetry.RemoveAt(0);
+                long now = Mod.Service != null ? Mod.Service.NowMs : 0;
+                _ownedElementRetry.Add((prefab, owner, position, randomSeed,
+                    now + OwnerRetryWindowMs));
             }
         }
 
@@ -368,7 +368,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             for (int i = _ownedElementRetry.Count - 1; i >= 0; i--)
             {
                 var pending = _ownedElementRetry[i];
-                Entity upgrade = FindUpgrade(pending.prefab, pending.position, Entity.Null);
+                Entity upgrade = FindUpgrade(pending.prefab, pending.position, pending.owner);
                 if (upgrade != Entity.Null)
                 {
                     try
@@ -376,6 +376,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         var random = new Unity.Mathematics.Random((uint)math.max(1, pending.seed));
                         _buildSync.RealizeOwnedSubElements(pending.prefab, upgrade,
                             EntityManager.GetComponentData<Transform>(upgrade), ref random);
+                        MarkUpdated(upgrade);
+                        MarkUpdated(pending.owner);
                     }
                     catch (System.Exception ex)
                     {
@@ -390,6 +392,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                                  "owned access elements were dropped.");
                 }
             }
+        }
+
+        private void MarkUpdated(Entity entity)
+        {
+            if (entity == Entity.Null || !EntityManager.Exists(entity) ||
+                EntityManager.HasComponent<Deleted>(entity) ||
+                EntityManager.HasComponent<Updated>(entity)) return;
+            EntityManager.AddComponent<Updated>(entity);
         }
 
         private Entity FindUpgrade(Entity prefab, float3 position, Entity expectedOwner)
