@@ -38,8 +38,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             public ConnectionId Connection;
         }
 
-        private readonly ConcurrentQueue<ConnectionId> _requests =
-            new ConcurrentQueue<ConnectionId>();
+        private struct RecoveryRequest
+        {
+            public ConnectionId Connection;
+            public bool IsJoin;
+        }
+
+        private readonly ConcurrentQueue<RecoveryRequest> _requests =
+            new ConcurrentQueue<RecoveryRequest>();
         private readonly ConcurrentQueue<ControlEvent> _controls =
             new ConcurrentQueue<ControlEvent>();
         private readonly ConcurrentQueue<ConnectionId> _leaves =
@@ -47,6 +53,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly List<ConnectionId> _participants = new List<ConnectionId>();
         private readonly HashSet<int> _quiesced = new HashSet<int>();
         private readonly HashSet<int> _loaded = new HashSet<int>();
+        private readonly HashSet<int> _pendingJoinRequests = new HashSet<int>();
+        private readonly List<ConnectionId> _joiningParticipants = new List<ConnectionId>();
 
         private AutoSaveSystem _autoSave;
         private NetSyncSystem _netSync;
@@ -95,7 +103,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (service == null) return;
             MultiplayerSession session = service.Session;
             if (session.Role != SessionRole.Host || session.Status != SessionStatus.Connected)
+            {
+                ResetInactiveState();
                 return;
+            }
 
             long now = service.NowMs;
             DrainObserverEvents(session);
@@ -132,17 +143,52 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        /// <summary>
+        /// This system survives session restarts inside the same loaded city. Discard
+        /// observer events and join labels from the previous role/session so a later
+        /// host never attributes its first refresh to an old connection id.
+        /// </summary>
+        private void ResetInactiveState()
+        {
+            RecoveryRequest request;
+            while (_requests.TryDequeue(out request)) { }
+            ControlEvent control;
+            while (_controls.TryDequeue(out control)) { }
+            ConnectionId left;
+            while (_leaves.TryDequeue(out left)) { }
+
+            _state = RecoveryState.Idle;
+            _saveTask = null;
+            _participants.Clear();
+            _quiesced.Clear();
+            _loaded.Clear();
+            _pendingJoinRequests.Clear();
+            _joiningParticipants.Clear();
+            _recoveryRequested = false;
+            _rerunRequested = false;
+            _epoch = 0;
+            _deadlineMs = 0;
+            _cleanFrames = 0;
+            _lastResyncMs = -1;
+        }
+
         private void DrainObserverEvents(MultiplayerSession session)
         {
-            ConnectionId request;
+            RecoveryRequest request;
             while (_requests.TryDequeue(out request))
             {
+                if (request.IsJoin && !request.Connection.IsNone)
+                    _pendingJoinRequests.Add(request.Connection.Value);
                 if (_state == RecoveryState.Idle) _recoveryRequested = true;
                 else _rerunRequested = true;
             }
 
             ConnectionId left;
-            while (_leaves.TryDequeue(out left)) RemoveParticipant(left);
+            while (_leaves.TryDequeue(out left))
+            {
+                _pendingJoinRequests.Remove(left.Value);
+                RemoveParticipant(left);
+            }
 
             ControlEvent evt;
             while (_controls.TryDequeue(out evt))
@@ -177,6 +223,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 if (peer.Handshaked) _participants.Add(peer.Connection);
             if (_participants.Count == 0) return;
 
+            _joiningParticipants.Clear();
+            for (int i = 0; i < _participants.Count; i++)
+                if (_pendingJoinRequests.Contains(_participants[i].Value))
+                    _joiningParticipants.Add(_participants[i]);
+            service.PrepareHostWorldSyncUi(_joiningParticipants);
+
             _epoch = ++_epochCounter;
             if (!service.TryBeginHostWorldSync(_epoch, out _resumeSpeed))
             {
@@ -191,6 +243,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 ResetEpoch(now);
                 return;
             }
+            for (int i = 0; i < _joiningParticipants.Count; i++)
+                _pendingJoinRequests.Remove(_joiningParticipants[i].Value);
 
             _quiesced.Clear();
             _loaded.Clear();
@@ -242,6 +296,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _saveTask = _autoSave.PerformAutoSave(GameManager.instance.settings.general);
                 _saveStartMs = now;
                 _state = RecoveryState.Saving;
+                service.SetHostWorldSyncUiStage(HostWorldSyncUiStage.Saving);
                 Mod.log.Info("[MP] World sync epoch " + _epoch +
                              ": barrier closed; saving the authoritative world.");
                 CS2MultiplayerMod.Game.Diagnostics.FlightRecorder.Note(
@@ -279,6 +334,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _loaded.Clear();
             _deadlineMs = now + LoadTimeoutMs;
             _state = RecoveryState.WaitingForLoaded;
+            service.SetHostWorldSyncUiStage(HostWorldSyncUiStage.WaitingForLoaded);
             Mod.log.Info("[MP] World sync epoch " + _epoch + ": queued one " +
                          (snapshot.Length / 1024) + " KB snapshot for " + _participants.Count +
                          " participant(s); waiting for load acknowledgement(s). Save took " +
@@ -348,6 +404,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _participants.Clear();
             _quiesced.Clear();
             _loaded.Clear();
+            _joiningParticipants.Clear();
             _epoch = 0;
             _deadlineMs = 0;
             _cleanFrames = 0;
@@ -423,11 +480,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private sealed class Observer : SessionObserver
         {
-            private readonly ConcurrentQueue<ConnectionId> _requests;
+            private readonly ConcurrentQueue<RecoveryRequest> _requests;
             private readonly ConcurrentQueue<ControlEvent> _controls;
             private readonly ConcurrentQueue<ConnectionId> _leaves;
 
-            public Observer(ConcurrentQueue<ConnectionId> requests,
+            public Observer(ConcurrentQueue<RecoveryRequest> requests,
                 ConcurrentQueue<ControlEvent> controls, ConcurrentQueue<ConnectionId> leaves)
             {
                 _requests = requests;
@@ -437,7 +494,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             public override void OnPeerJoined(Peer peer)
             {
-                _requests.Enqueue(peer.Connection);
+                _requests.Enqueue(new RecoveryRequest
+                {
+                    Connection = peer.Connection,
+                    IsJoin = true,
+                });
                 Mod.log.Info("[MP] Queued atomic initial world sync for " + peer + ".");
             }
 
@@ -446,7 +507,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             public override void OnResyncRequested(int playerId, ConnectionId connection)
             {
-                _requests.Enqueue(connection);
+                _requests.Enqueue(new RecoveryRequest
+                {
+                    Connection = connection,
+                    IsJoin = false,
+                });
                 Mod.log.Info("[MP] Queued atomic world-sync request from player #" + playerId + ".");
             }
 

@@ -1,4 +1,5 @@
 using System;
+using System.Net.Sockets;
 using CS2MultiplayerMod.Core.Networking.Tcp;
 using CS2MultiplayerMod.Core.Protocol;
 
@@ -19,7 +20,7 @@ namespace CS2MultiplayerMod.Core.Session
             }
             catch (Exception ex)
             {
-                Fault("Failed to host: " + ex.Message);
+                Fault(DescribeStartupFailure("Failed to host", ex));
             }
         }
 
@@ -78,7 +79,7 @@ namespace CS2MultiplayerMod.Core.Session
             }
             catch (Exception ex)
             {
-                Fault("Failed to host: " + ex.Message);
+                Fault(DescribeStartupFailure("Failed to host", ex));
             }
         }
 
@@ -104,8 +105,15 @@ namespace CS2MultiplayerMod.Core.Session
             }
             catch (Exception ex)
             {
-                Fault("Failed to start joining: " + ex.Message);
+                Fault(DescribeStartupFailure("Failed to start joining", ex));
             }
+        }
+
+        private static string DescribeStartupFailure(string prefix, Exception ex)
+        {
+            var socket = ex as SocketException;
+            return prefix + (socket != null ? " [" + socket.SocketErrorCode + "]" : "") +
+                   ": " + ex.Message;
         }
 
         public void Stop()
@@ -124,6 +132,7 @@ namespace CS2MultiplayerMod.Core.Session
             }
 
             _peers.Clear();
+            _administrativeRemovals.Clear();
             _blobs.Clear();
             _blobTransferIds.Clear();
             ClearBlobProgress();

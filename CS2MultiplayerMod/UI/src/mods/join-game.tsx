@@ -238,6 +238,7 @@ const styles: Record<string, CSSProperties> = {
         marginBottom: "5rem",
     },
     progressTrack: {
+        position: "relative",
         height: "9rem",
         backgroundColor: "rgba(0, 0, 0, 0.4)",
         border: "1rem solid rgba(157, 193, 222, 0.25)",
@@ -249,6 +250,14 @@ const styles: Record<string, CSSProperties> = {
         backgroundColor: "#72c8f0",
         boxShadow: "0 0 8rem rgba(114, 200, 240, 0.45)",
         transition: "width 160ms linear",
+    },
+    progressSweep: {
+        position: "absolute",
+        top: 0,
+        bottom: 0,
+        width: "30%",
+        background:
+            "linear-gradient(90deg, rgba(114,200,240,0) 0%, rgba(114,200,240,0.9) 50%, rgba(114,200,240,0) 100%)",
     },
     buttons: {
         display: "flex",
@@ -306,20 +315,46 @@ const Field = ({ label, value, secret, disabled, onChange }: FieldProps) => {
     );
 };
 
-export const TransferProgress =({ percent, label }: { percent: number; label?: string }) => {
+const ProgressSweep = () => {
+    const [position, setPosition] = useState(-30);
+
+    useEffect(() => {
+        let raf = 0;
+        const tick = (time: number) => {
+            setPosition(((time * 0.06) % 160) - 30);
+            raf = requestAnimationFrame(tick);
+        };
+        raf = requestAnimationFrame(tick);
+        return () => cancelAnimationFrame(raf);
+    }, []);
+
+    return <div style={{ ...styles.progressSweep, left: `${position}%` }} />;
+};
+
+export const TransferProgress = ({
+    percent,
+    label,
+    indeterminate = false,
+}: {
+    percent: number;
+    label?: string;
+    indeterminate?: boolean;
+}) => {
     // Hook must run unconditionally (before the early return) to keep hook order stable.
     const t = useT();
-    if (percent < 0) return null;
+    if (percent < 0 && !indeterminate) return null;
 
     const clamped = Math.max(0, Math.min(100, Math.floor(percent)));
     return (
         <div style={styles.progress}>
             <div style={styles.progressHeader}>
                 <span>{label ?? t(LOC.worldTransfer, "World Transfer")}</span>
-                <span>{clamped}%</span>
+                {!indeterminate ? <span>{clamped}%</span> : null}
             </div>
             <div style={styles.progressTrack}>
-                <div style={{ ...styles.progressFill, width: `${clamped}%` }} />
+                {indeterminate
+                    ? <ProgressSweep />
+                    : <div style={{ ...styles.progressFill, width: `${clamped}%` }} />}
             </div>
         </div>
     );

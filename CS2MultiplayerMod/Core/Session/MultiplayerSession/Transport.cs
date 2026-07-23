@@ -84,6 +84,7 @@ namespace CS2MultiplayerMod.Core.Session
             if (_peers.TryGetValue(connection.Value, out peer))
             {
                 _peers.Remove(connection.Value);
+                bool removedByHost = _administrativeRemovals.Remove(connection.Value);
                 if (peer.Handshaked)
                 {
                     NotifyPeerLeft(peer, reason);
@@ -92,7 +93,9 @@ namespace CS2MultiplayerMod.Core.Session
                         // Mirror of the join notice: clients get no OnPeerLeft for each
                         // other, so this system chat line is how every machine learns of
                         // a leave (and the host's own UI via NotifyChat).
-                        string notice = peer.Name + " left.";
+                        string notice = removedByHost
+                            ? peer.Name + " was removed by the host."
+                            : peer.Name + " left.";
                         BroadcastToAll(new ChatMessage(null, notice), ConnectionId.None);
                         NotifyChat(null, notice);
                     }
@@ -221,6 +224,9 @@ namespace CS2MultiplayerMod.Core.Session
                     break;
                 case MessageType.WorldSyncControl:
                     HandleWorldSyncControl(connection, peer, (WorldSyncControlMessage)message);
+                    break;
+                case MessageType.DisconnectNotice:
+                    HandleDisconnectNotice(connection, peer, (DisconnectNoticeMessage)message);
                     break;
             }
         }

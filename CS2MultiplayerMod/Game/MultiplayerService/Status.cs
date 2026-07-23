@@ -1,3 +1,4 @@
+using System;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
 
@@ -27,7 +28,7 @@ namespace CS2MultiplayerMod.Game
                 if (_session.Role == SessionRole.None)
                     return string.IsNullOrEmpty(_lastFault)
                         ? L10n.T(L10n.Key.StatusOffline)
-                        : L10n.F(L10n.Key.OfflineFault, _lastFault);
+                        : L10n.F(L10n.Key.OfflineFault, FriendlyFaultSummary(_lastFault));
                 switch (_session.Status)
                 {
                     case SessionStatus.Connecting: return L10n.T(L10n.Key.StateConnecting);
@@ -77,12 +78,20 @@ namespace CS2MultiplayerMod.Game
             get
             {
                 if (_session.Role == SessionRole.None) return L10n.T(L10n.Key.WorldNone);
-                if (_worldSyncBarrierActive) return L10n.T(L10n.Key.PhaseSynchronizing);
+                if (_worldSyncBarrierActive)
+                {
+                    if (_session.Role == SessionRole.Host) return HostWorldSyncTitle();
+                    if (MapTransferPercent >= 0)
+                        return L10n.F(L10n.Key.WorldMapProgress, MapTransferPercent);
+                    return PhaseText(_phase);
+                }
                 if (_session.Role == SessionRole.Host) return L10n.T(L10n.Key.WorldHosting);
                 if (_session.IncomingBlobChannel == MapChannel && _session.IncomingBlobTotal > 0)
                     return L10n.F(L10n.Key.WorldMapProgress,
                         (int)(100L * _session.IncomingBlobReceived / _session.IncomingBlobTotal));
-                return _phase == ClientWorldPhase.InSession ? L10n.T(L10n.Key.WorldLoaded) : PhaseText(_phase);
+                return _phase == ClientWorldPhase.InSession
+                    ? L10n.T(L10n.Key.WorldLoaded)
+                    : PhaseText(_phase);
             }
         }
 
@@ -90,7 +99,8 @@ namespace CS2MultiplayerMod.Game
         {
             get
             {
-                if (_session.IncomingBlobChannel != MapChannel || _session.IncomingBlobTotal <= 0) return -1;
+                if (_session.IncomingBlobChannel != MapChannel ||
+                    _session.IncomingBlobTotal <= 0) return -1;
                 long percent = 100L * _session.IncomingBlobReceived / _session.IncomingBlobTotal;
                 if (percent < 0) return 0;
                 if (percent > 100) return 100;
@@ -100,8 +110,6 @@ namespace CS2MultiplayerMod.Game
 
         /// <summary>
         /// Host-side world-send progress (0-100), or -1 when no world is streaming out.
-        /// Lets the host show "Sending world X%" while the save drains to clients, instead
-        /// of the window appearing frozen.
         /// </summary>
         public int WorldSendPercent
         {
@@ -117,8 +125,8 @@ namespace CS2MultiplayerMod.Game
         }
 
         /// <summary>
-        /// Coarse status bucket for the join dialog's colored indicator:
-        /// "disabled", "offline", "connecting", "connected" or "error".
+        /// Coarse status bucket for UI accents:
+        /// disabled, offline, connecting, syncing, connected, or error.
         /// </summary>
         public string UiStatusKind
         {
@@ -130,78 +138,259 @@ namespace CS2MultiplayerMod.Game
                 if (_session.Status == SessionStatus.Faulted) return "error";
                 if (_worldSyncBarrierActive) return "syncing";
                 if (_session.Status == SessionStatus.Connecting ||
-                    (_session.Role == SessionRole.Client && _phase != ClientWorldPhase.InSession))
+                    (_session.Role == SessionRole.Client &&
+                     _phase != ClientWorldPhase.InSession))
                     return "connecting";
                 return "connected";
             }
         }
 
-        /// <summary>Short headline shown next to the join dialog's status indicator.</summary>
+        /// <summary>Short, contextual headline for every multiplayer UI.</summary>
         public string UiStatusTitle
         {
             get
             {
                 if (!ModEnabled) return L10n.T(L10n.Key.TitleModDisabled);
                 if (_session.Role == SessionRole.None)
-                    return L10n.T(string.IsNullOrEmpty(_lastFault) ? L10n.Key.StatusOffline : L10n.Key.TitleConnectionFailed);
-                if (_session.Status == SessionStatus.Faulted) return L10n.T(L10n.Key.TitleConnectionFailed);
-                if (_session.Status == SessionStatus.Connecting) return L10n.T(L10n.Key.StateConnecting);
-                if (_worldSyncBarrierActive) return L10n.T(L10n.Key.PhaseSynchronizing);
+                    return L10n.T(string.IsNullOrEmpty(_lastFault)
+                        ? L10n.Key.StatusOffline
+                        : L10n.Key.TitleConnectionFailed);
+                if (_session.Status == SessionStatus.Faulted)
+                    return L10n.T(L10n.Key.TitleConnectionFailed);
+                if (_session.Status == SessionStatus.Connecting)
+                    return L10n.T(L10n.Key.StateConnecting);
+                if (_session.Role == SessionRole.Host && _worldSyncBarrierActive)
+                    return HostWorldSyncTitle();
                 if (_session.Role == SessionRole.Client)
                 {
                     switch (_phase)
                     {
-                        case ClientWorldPhase.Connecting: return L10n.T(L10n.Key.StateConnecting);
-                        case ClientWorldPhase.WaitingForMap: return L10n.T(L10n.Key.PhaseWaitingForMap);
-                        case ClientWorldPhase.LoadingMap: return L10n.T(L10n.Key.PhaseLoadingMap);
-                        case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseSynchronizing);
+                        case ClientWorldPhase.Connecting:
+                            return L10n.T(L10n.Key.StateConnecting);
+                        case ClientWorldPhase.WaitingForMap:
+                            return L10n.T(L10n.Key.PhaseWaitingForMap);
+                        case ClientWorldPhase.LoadingMap:
+                            return L10n.T(L10n.Key.PhaseLoadingMap);
+                        case ClientWorldPhase.WaitingForResume:
+                            return L10n.T(L10n.Key.PhaseFinishingSetup);
                     }
                 }
-                return L10n.T(_session.Role == SessionRole.Host ? L10n.Key.TitleHosting : L10n.Key.StateConnected);
+                if (_worldSyncBarrierActive)
+                    return L10n.T(L10n.Key.PhaseSynchronizing);
+                return L10n.T(_session.Role == SessionRole.Host
+                    ? L10n.Key.TitleHosting
+                    : L10n.Key.StateConnected);
             }
         }
 
-        /// <summary>Secondary line under the status headline; empty while a state is in flight.</summary>
+        /// <summary>Plain-language secondary line under the status headline.</summary>
         public string UiStatusDetail
         {
             get
             {
                 if (!ModEnabled) return L10n.T(L10n.Key.DetailEnableMod);
                 string kind = UiStatusKind;
-                // Fault reasons are technical diagnostics produced by the session core;
-                // they are passed through untranslated by design.
-                if (kind == "error") return string.IsNullOrEmpty(_lastFault) ? "" : _lastFault;
+                if (kind == "error")
+                    return string.IsNullOrEmpty(_lastFault)
+                        ? ""
+                        : FriendlyFaultSummary(_lastFault);
+                if (_session.Role == SessionRole.Host && _worldSyncBarrierActive)
+                    return HostWorldSyncDetail();
+                if (_session.Role == SessionRole.Client &&
+                    (_session.Status == SessionStatus.Connecting ||
+                     _phase != ClientWorldPhase.InSession))
+                    return ClientWorldSyncDetail();
                 if (kind != "connected") return "";
 
-                int peers = HandshakedPeerCount();
+                int players = PlayerCount;
                 var sb = new System.Text.StringBuilder();
-                sb.Append(peers == 1 ? L10n.T(L10n.Key.DetailPlayersOne) : L10n.F(L10n.Key.DetailPlayersMany, peers))
-                  .Append(" · ")
-                  .Append(L10n.T(_session.PasswordProtected ? L10n.Key.DetailPasswordProtected : L10n.Key.DetailOpenAccess));
-                if (_session.PublicExposure) sb.Append(" · ").Append(L10n.T(L10n.Key.DetailPublic));
+                sb.Append(players == 1
+                        ? L10n.T(L10n.Key.DetailPlayersOne)
+                        : L10n.F(L10n.Key.DetailPlayersMany, players))
+                  .Append(" | ")
+                  .Append(L10n.T(_session.PasswordProtected
+                      ? L10n.Key.DetailPasswordProtected
+                      : L10n.Key.DetailOpenAccess));
+                if (_session.PublicExposure)
+                    sb.Append(" | ").Append(L10n.T(L10n.Key.DetailPublic));
                 return sb.ToString();
             }
         }
 
+        /// <summary>Actionable recovery steps for the current fault, or empty.</summary>
+        public string UiStatusHelp =>
+            UiStatusKind == "error" && !string.IsNullOrEmpty(_lastFault)
+                ? FriendlyFaultHelp(_lastFault)
+                : "";
+
+        /// <summary>
+        /// Progress presentation shared by the full-screen loader and in-game panel.
+        /// Determinate is used only while bytes move. Saving and map loading use an
+        /// activity sweep, so a completed transfer never looks frozen at 100%.
+        /// </summary>
+        public string UiProgressMode
+        {
+            get
+            {
+                if (!ModEnabled || UiStatusKind == "error") return "none";
+                if (_session.Role == SessionRole.Host && _worldSyncBarrierActive)
+                {
+                    if (_hostWorldSyncUiStage == HostWorldSyncUiStage.WaitingForLoaded &&
+                        _session.OutgoingBlobActive &&
+                        _session.OutgoingBlobTotal > 0)
+                        return "determinate";
+                    return "indeterminate";
+                }
+                if (_session.Role == SessionRole.Client &&
+                    (_session.Status == SessionStatus.Connecting ||
+                     _phase != ClientWorldPhase.InSession))
+                    return MapTransferPercent >= 0 ? "determinate" : "indeterminate";
+                return "none";
+            }
+        }
+
+        private string HostWorldSyncTitle()
+        {
+            if (_hostWorldSyncJoiningCount == 1 &&
+                !string.IsNullOrEmpty(_hostWorldSyncJoiningName))
+                return L10n.F(L10n.Key.TitlePlayerJoining, _hostWorldSyncJoiningName);
+            if (_hostWorldSyncJoiningCount > 1)
+                return L10n.F(L10n.Key.TitlePlayersJoining, _hostWorldSyncJoiningCount);
+            return L10n.T(L10n.Key.TitleRefreshingWorld);
+        }
+
+        private string HostWorldSyncDetail()
+        {
+            switch (_hostWorldSyncUiStage)
+            {
+                case HostWorldSyncUiStage.WaitingForQuiescence:
+                    return L10n.T(L10n.Key.DetailPausingWorld);
+                case HostWorldSyncUiStage.Saving:
+                    return L10n.T(L10n.Key.DetailSavingWorld);
+                case HostWorldSyncUiStage.WaitingForLoaded:
+                    if (_session.OutgoingBlobActive)
+                        return L10n.T(L10n.Key.DetailSendingWorld);
+                    if (_hostWorldSyncJoiningCount == 1 &&
+                        !string.IsNullOrEmpty(_hostWorldSyncJoiningName))
+                        return L10n.F(L10n.Key.DetailWaitingForPlayer,
+                            _hostWorldSyncJoiningName);
+                    int waiting = _hostWorldSyncJoiningCount > 1
+                        ? _hostWorldSyncJoiningCount
+                        : HandshakedPeerCount();
+                    return L10n.F(L10n.Key.DetailWaitingForPlayers,
+                        waiting < 1 ? 1 : waiting);
+                default:
+                    return L10n.T(L10n.Key.PhaseSynchronizing);
+            }
+        }
+
+        private string ClientWorldSyncDetail()
+        {
+            if (_session.Status == SessionStatus.Connecting ||
+                _phase == ClientWorldPhase.Connecting)
+                return L10n.T(L10n.Key.DetailContactingHost);
+            if (MapTransferPercent >= 0)
+                return L10n.F(L10n.Key.WorldMapProgress, MapTransferPercent);
+            switch (_phase)
+            {
+                case ClientWorldPhase.WaitingForMap:
+                    return L10n.T(L10n.Key.DetailHostPreparing);
+                case ClientWorldPhase.LoadingMap:
+                    return L10n.T(L10n.Key.DetailWorldReceived);
+                case ClientWorldPhase.WaitingForResume:
+                    return L10n.T(L10n.Key.DetailWorldLoaded);
+                default:
+                    return "";
+            }
+        }
+
+        private static bool FaultContains(string fault, string value) =>
+            !string.IsNullOrEmpty(fault) &&
+            fault.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private static string FriendlyFaultSummary(string fault)
+        {
+            if (FaultContains(fault, "removed you") || FaultContains(fault, "kicked"))
+                return L10n.T(L10n.Key.ErrorRemoved);
+            if (FaultContains(fault, "Incorrect password") ||
+                FaultContains(fault, "requires a password"))
+                return L10n.T(L10n.Key.ErrorPassword);
+            if (FaultContains(fault, "Protocol mismatch") ||
+                FaultContains(fault, "Mod version mismatch"))
+                return L10n.T(L10n.Key.ErrorModVersion);
+            if (FaultContains(fault, "Game version mismatch"))
+                return L10n.T(L10n.Key.ErrorGameVersion);
+            if (FaultContains(fault, "DLC mismatch"))
+                return L10n.T(L10n.Key.ErrorDlc);
+            if (FaultContains(fault, "Server is full"))
+                return L10n.T(L10n.Key.ErrorFull);
+            if (FaultContains(fault, "HostNotFound") ||
+                FaultContains(fault, "NoData") ||
+                FaultContains(fault, "could not be resolved"))
+                return L10n.T(L10n.Key.ErrorAddress);
+            if (FaultContains(fault, "ConnectionRefused"))
+                return L10n.T(L10n.Key.ErrorRefused);
+            if (FaultContains(fault, "TimedOut") ||
+                FaultContains(fault, "timed out"))
+                return L10n.T(L10n.Key.ErrorTimeout);
+            if (FaultContains(fault, "NetworkUnreachable") ||
+                FaultContains(fault, "HostUnreachable"))
+                return L10n.T(L10n.Key.ErrorNetwork);
+            if (FaultContains(fault, "AddressAlreadyInUse"))
+                return L10n.T(L10n.Key.ErrorPortInUse);
+            return L10n.T(L10n.Key.ErrorGeneric);
+        }
+
+        private static string FriendlyFaultHelp(string fault)
+        {
+            if (FaultContains(fault, "removed you") || FaultContains(fault, "kicked"))
+                return L10n.T(L10n.Key.ErrorRemovedHelp);
+            if (FaultContains(fault, "Incorrect password") ||
+                FaultContains(fault, "requires a password"))
+                return L10n.T(L10n.Key.ErrorPasswordHelp);
+            if (FaultContains(fault, "Protocol mismatch") ||
+                FaultContains(fault, "Mod version mismatch"))
+                return L10n.T(L10n.Key.ErrorModVersionHelp);
+            if (FaultContains(fault, "Game version mismatch"))
+                return L10n.T(L10n.Key.ErrorGameVersionHelp);
+            if (FaultContains(fault, "DLC mismatch"))
+                return L10n.T(L10n.Key.ErrorDlcHelp);
+            if (FaultContains(fault, "Server is full"))
+                return L10n.T(L10n.Key.ErrorFullHelp);
+            if (FaultContains(fault, "HostNotFound") ||
+                FaultContains(fault, "NoData") ||
+                FaultContains(fault, "could not be resolved"))
+                return L10n.T(L10n.Key.ErrorAddressHelp);
+            if (FaultContains(fault, "ConnectionRefused"))
+                return L10n.T(L10n.Key.ErrorRefusedHelp);
+            if (FaultContains(fault, "TimedOut") ||
+                FaultContains(fault, "timed out"))
+                return L10n.T(L10n.Key.ErrorTimeoutHelp);
+            if (FaultContains(fault, "NetworkUnreachable") ||
+                FaultContains(fault, "HostUnreachable"))
+                return L10n.T(L10n.Key.ErrorNetworkHelp);
+            if (FaultContains(fault, "AddressAlreadyInUse"))
+                return L10n.T(L10n.Key.ErrorPortInUseHelp);
+            return L10n.T(L10n.Key.ErrorGenericHelp);
+        }
 
         /// <summary>
         /// Players in the session including this machine. The host counts its
-        /// authenticated peers; a client only ever talks to the host, so it counts
-        /// the players whose relayed cursor states are fresh (everyone sends at
-        /// ~10 Hz, so a player silent for 10 s has left or the relay is stale).
+        /// authenticated peers; a client counts recently relayed cursors.
         /// </summary>
         public int PlayerCount
         {
             get
             {
-                if (_session.Role == SessionRole.Host) return HandshakedPeerCount() + 1;
+                if (_session.Role == SessionRole.Host)
+                    return HandshakedPeerCount() + 1;
                 if (_session.Role == SessionRole.Client)
                 {
                     int count = 1;
                     long now = NowMs;
                     foreach (var player in _remotePlayers.Values)
                         if (now - player.LastUpdateMs < 10000) count++;
-                    return count < 2 ? 2 : count; // at minimum self + host while connected
+                    return count < 2 ? 2 : count;
                 }
                 return 0;
             }

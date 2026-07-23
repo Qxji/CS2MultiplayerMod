@@ -96,7 +96,10 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
                     _log.Info("Join canceled while connecting to " + host + ":" + port + ".");
                     return;
                 }
-                Enqueue(TransportEvent.Disconnected(ConnectionId.Server, "connect failed: " + ex.Message));
+                var socketEx = ex as SocketException;
+                string errorCode = socketEx != null ? " [" + socketEx.SocketErrorCode + "]" : "";
+                Enqueue(TransportEvent.Disconnected(ConnectionId.Server,
+                    "connect failed" + errorCode + ": " + ex.Message));
                 _log.Warn("Connect to " + host + ":" + port + " failed after " + elapsed.ElapsedMilliseconds +
                           " ms: " + ex.Message + DescribeConnectFailure(ex));
                 return;

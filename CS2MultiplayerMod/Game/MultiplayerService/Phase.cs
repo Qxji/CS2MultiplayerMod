@@ -24,7 +24,7 @@ namespace CS2MultiplayerMod.Game
                 case ClientWorldPhase.Connecting: return L10n.T(L10n.Key.StateConnecting);
                 case ClientWorldPhase.WaitingForMap: return L10n.T(L10n.Key.PhaseWaitingForMap);
                 case ClientWorldPhase.LoadingMap: return L10n.T(L10n.Key.PhaseLoadingMap);
-                case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseSynchronizing);
+                case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseFinishingSetup);
                 default: return phase.ToString();
             }
         }

@@ -63,6 +63,10 @@ namespace CS2MultiplayerMod.Game
                 () => Mod.Service != null ? Mod.Service.UiStatusTitle : L10n.T(L10n.Key.StatusOffline)));
             AddUpdateBinding(new GetterValueBinding<string>(Group, "statusDetail",
                 () => Mod.Service != null ? Mod.Service.UiStatusDetail : ""));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "statusHelp",
+                () => Mod.Service != null ? Mod.Service.UiStatusHelp : ""));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "progressMode",
+                () => Mod.Service != null ? Mod.Service.UiProgressMode : "none"));
             AddUpdateBinding(new GetterValueBinding<int>(Group, "mapTransferPercent",
                 () => Mod.Service != null ? Mod.Service.MapTransferPercent : -1));
             AddUpdateBinding(new GetterValueBinding<int>(Group, "worldSendPercent",
@@ -97,6 +101,8 @@ namespace CS2MultiplayerMod.Game
                 () => Mod.Service != null && Mod.Service.Session.Role == SessionRole.Host));
             AddUpdateBinding(new GetterValueBinding<int>(Group, "playerCount",
                 () => Mod.Service != null ? Mod.Service.PlayerCount : 0));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "playerList",
+                () => Mod.Service != null ? Mod.Service.PlayerListJson : "[]"));
             // Hosting shares the loaded city, so it needs one — and no running session.
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "canHost",
                 () => Mod.Setting != null && !Mod.Setting.CannotStartHost() && MultiplayerService.ModEnabled));
@@ -127,6 +133,8 @@ namespace CS2MultiplayerMod.Game
 
             AddBinding(new TriggerBinding<string>(Group, "sendChat",
                 value => { if (Mod.Service != null) Mod.Service.SendChatFromUi(value); }));
+            AddBinding(new TriggerBinding<int>(Group, "kickPlayer",
+                playerId => { if (Mod.Service != null) Mod.Service.KickPlayerFromUi(playerId); }));
             AddBinding(new TriggerBinding(Group, "hostStart", () =>
             {
                 if (Mod.Service == null || Mod.Setting == null) return;

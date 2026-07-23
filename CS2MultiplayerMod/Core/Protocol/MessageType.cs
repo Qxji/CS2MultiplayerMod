@@ -56,5 +56,11 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// acknowledge quiescence and load completion, and the host explicitly resumes it.
         /// </summary>
         WorldSyncControl = 12,
+
+        /// <summary>
+        /// Host -> client: explains why the host is deliberately ending this player's
+        /// session (for example, an administrative kick) before closing the connection.
+        /// </summary>
+        DisconnectNotice = 13,
     }
 }

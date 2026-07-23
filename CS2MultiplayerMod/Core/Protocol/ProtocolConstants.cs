@@ -4,7 +4,9 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v21 carries complete transport-route topology: connected stop/owner identities,
+        /// Current v22 adds a host disconnect notice so kicked players receive a clear reason
+        /// before their connection closes. v21 carries complete transport-route topology:
+        /// connected stop/owner identities,
         /// closed-route state, and stable route-number identity for edits/deletes. v20 carries
         /// rootless asset-stamp object-tool graphs so prebuilt intersections
         /// retain their exact shared-node topology and commit atomically. v19 makes world
@@ -22,7 +24,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 21;
+        public const int ProtocolVersion = 22;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

@@ -13,7 +13,9 @@ const LOC = {
     multiplayer: "CS2MP.UI.Multiplayer",
     worldTransfer: "CS2MP.UI.WorldTransfer",
     loadingHint: "CS2MP.UI.LoadingHint",
+    hostLoadingHint: "CS2MP.UI.HostLoadingHint",
     connectionFailed: "CS2MP.Status.ConnectionFailed",
+    tryThis: "CS2MP.UI.TryThis",
     cancel: "CS2MP.UI.Cancel",
     close: "CS2MP.UI.Close",
 };
@@ -26,6 +28,8 @@ const useT = () => {
 const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
 const statusTitle$ = bindValue<string>(GROUP, "statusTitle", "");
 const statusDetail$ = bindValue<string>(GROUP, "statusDetail", "");
+const statusHelp$ = bindValue<string>(GROUP, "statusHelp", "");
+const progressMode$ = bindValue<string>(GROUP, "progressMode", "none");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const isHost$ = bindValue<boolean>(GROUP, "isHost", false);
@@ -139,11 +143,38 @@ const styles: Record<string, CSSProperties> = {
         textAlign: "center",
     },
     error: {
+        width: "640rem",
+        maxWidth: "85%",
+        padding: "22rem 26rem",
+        backgroundColor: "rgba(24, 33, 51, 0.92)",
+        borderLeft: "4rem solid #ff8a7a",
+        borderRadius: "4rem",
+        marginBottom: "10rem",
+        textAlign: "left",
+    },
+    errorTitle: {
+        fontSize: "22rem",
+        color: "#ff9c8f",
+        fontWeight: "bold",
+        marginBottom: "10rem",
+    },
+    errorSummary: {
         fontSize: "16rem",
-        color: "#ff8a7a",
-        marginBottom: "28rem",
+        color: "#ffffff",
+        lineHeight: "1.45",
+    },
+    helpTitle: {
+        marginTop: "18rem",
+        marginBottom: "5rem",
+        color: "#9dc1de",
+        fontSize: "14rem",
+        fontWeight: "bold",
+        textTransform: "uppercase",
+    },
+    errorHelp: {
+        fontSize: "14rem",
+        color: "rgba(255, 255, 255, 0.76)",
         maxWidth: "640rem",
-        textAlign: "center",
         lineHeight: "1.45",
     },
     cancel: {
@@ -185,6 +216,8 @@ export const JoinLoadingScreen = () => {
     const statusKind = useValue(statusKind$);
     const statusTitle = useValue(statusTitle$);
     const statusDetail = useValue(statusDetail$);
+    const statusHelp = useValue(statusHelp$);
+    const progressMode = useValue(progressMode$);
     const mapTransferPercent = useValue(mapTransferPercent$);
     const worldSendPercent = useValue(worldSendPercent$);
     const isHost = useValue(isHost$);
@@ -197,7 +230,10 @@ export const JoinLoadingScreen = () => {
     // backdrop element is still there to read; static for the whole attempt.
     const [backdropImage, setBackdropImage] = useState<string | null>(null);
     useEffect(() => {
-        if (statusKind === "syncing") {
+        if (statusKind === "error") {
+            setActive(true);
+            setBackdropImage((current) => current ?? currentMenuBackdropImage());
+        } else if (statusKind === "syncing") {
             setActive(true);
             setBackdropImage((current) => current ?? currentMenuBackdropImage());
         } else if (isHost) {
@@ -210,7 +246,6 @@ export const JoinLoadingScreen = () => {
             setActive(false);
             setBackdropImage(null);
         }
-        // "error": leave active unchanged so the error state stays on screen.
     }, [statusKind, isHost]);
 
     if (!active) return null;
@@ -225,6 +260,7 @@ export const JoinLoadingScreen = () => {
 
     const phaseTitle = statusTitle || t(LOC.joiningTitle, "Joining Multiplayer Game");
     const clamped = Math.max(0, Math.min(100, Math.floor(percent)));
+    const determinate = progressMode === "determinate" && percent >= 0;
 
     return (
         <Portal>
@@ -241,8 +277,16 @@ export const JoinLoadingScreen = () => {
                     {failed ? (
                         <>
                             <div style={styles.error}>
-                                {statusTitle || t(LOC.connectionFailed, "Connection failed")}
-                                {statusDetail ? " - " + statusDetail : ""}
+                                <div style={styles.errorTitle}>
+                                    {statusTitle || t(LOC.connectionFailed, "Connection failed")}
+                                </div>
+                                {statusDetail ? <div style={styles.errorSummary}>{statusDetail}</div> : null}
+                                {statusHelp ? (
+                                    <>
+                                        <div style={styles.helpTitle}>{t(LOC.tryThis, "Try this")}</div>
+                                        <div style={styles.errorHelp}>{statusHelp}</div>
+                                    </>
+                                ) : null}
                             </div>
                             <Button variant="primary" style={styles.cancel} onSelect={dismiss}>
                                 {t(LOC.close, "Close")}
@@ -253,20 +297,20 @@ export const JoinLoadingScreen = () => {
                             <div style={styles.barOuter}>
                                 <div style={styles.barHeader}>
                                     <span style={styles.phase}>{phaseTitle}</span>
-                                    {percent >= 0 ? <span style={styles.percent}>{clamped}%</span> : null}
+                                    {determinate ? <span style={styles.percent}>{clamped}%</span> : null}
                                 </div>
-                                {percent >= 0 ? (
+                                {determinate ? (
                                     <div style={styles.track}>
                                         <div style={{ ...styles.fill, width: `${clamped}%` }} />
                                     </div>
                                 ) : (
                                     <IndeterminateBar />
                                 )}
-                                <div style={styles.detail}>
-                                    {percent >= 0 ? t(LOC.worldTransfer, "World Transfer") : statusDetail}
-                                </div>
+                                <div style={styles.detail}>{statusDetail}</div>
                                 <div style={styles.hint}>
-                                    {t(LOC.loadingHint, "Keep this window open while the host's city is transferred.")}
+                                    {isHost
+                                        ? t(LOC.hostLoadingHint, "The city will resume when every player is ready.")
+                                        : t(LOC.loadingHint, "Keep this window open while the host's city is transferred.")}
                                 </div>
                             </div>
                             {!synchronizing || !isHost ? (

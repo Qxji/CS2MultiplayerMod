@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
@@ -8,6 +10,14 @@ using Unity.Entities;
 
 namespace CS2MultiplayerMod.Game
 {
+    internal enum HostWorldSyncUiStage
+    {
+        None,
+        WaitingForQuiescence,
+        Saving,
+        WaitingForLoaded,
+    }
+
     public sealed partial class MultiplayerService
     {
         private World _currentWorld;
@@ -15,10 +25,41 @@ namespace CS2MultiplayerMod.Game
         private bool _worldSyncHadUsableWorld;
         private long _activeWorldSyncEpoch;
         private float _worldSyncResumeSpeed = 1f;
+        private HostWorldSyncUiStage _hostWorldSyncUiStage;
+        private string _hostWorldSyncJoiningName;
+        private int _hostWorldSyncJoiningCount;
 
         /// <summary>True while all gameplay traffic and local tools are quiesced for a snapshot.</summary>
         public bool WorldSyncBarrierActive => _worldSyncBarrierActive;
         public long ActiveWorldSyncEpoch => _activeWorldSyncEpoch;
+
+        /// <summary>
+        /// Capture which newly connected players caused this epoch. Periodic/manual
+        /// re-syncs pass an empty list and receive neutral "refreshing world" copy.
+        /// </summary>
+        internal void PrepareHostWorldSyncUi(IList<ConnectionId> joiningPlayers)
+        {
+            _hostWorldSyncJoiningName = null;
+            _hostWorldSyncJoiningCount = 0;
+            if (joiningPlayers == null || joiningPlayers.Count == 0) return;
+
+            for (int i = 0; i < joiningPlayers.Count; i++)
+            {
+                foreach (Peer peer in _session.Peers)
+                {
+                    if (!peer.Handshaked || peer.Connection != joiningPlayers[i]) continue;
+                    _hostWorldSyncJoiningCount++;
+                    if (_hostWorldSyncJoiningCount == 1)
+                        _hostWorldSyncJoiningName = peer.Name;
+                    break;
+                }
+            }
+        }
+
+        internal void SetHostWorldSyncUiStage(HostWorldSyncUiStage stage)
+        {
+            _hostWorldSyncUiStage = stage;
+        }
 
         /// <summary>
         /// Host-side half of Begin. Captures the shared speed, pauses the local simulation, drops
@@ -34,6 +75,7 @@ namespace CS2MultiplayerMod.Game
             _worldSyncHadUsableWorld = true;
             _activeWorldSyncEpoch = epoch;
             _worldSyncBarrierActive = true;
+            _hostWorldSyncUiStage = HostWorldSyncUiStage.WaitingForQuiescence;
             SyncInbox.DrainAll();
             MaintainWorldSyncBarrier();
             resumeSpeed = _worldSyncResumeSpeed;
@@ -163,6 +205,9 @@ namespace CS2MultiplayerMod.Game
             _worldSyncBarrierActive = false;
             _activeWorldSyncEpoch = 0;
             _worldSyncHadUsableWorld = false;
+            _hostWorldSyncUiStage = HostWorldSyncUiStage.None;
+            _hostWorldSyncJoiningName = null;
+            _hostWorldSyncJoiningCount = 0;
 
             if (!restoreSpeed || _currentWorld == null) return;
             try

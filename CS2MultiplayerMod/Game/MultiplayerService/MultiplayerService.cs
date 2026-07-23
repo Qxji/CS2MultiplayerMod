@@ -222,6 +222,7 @@ namespace CS2MultiplayerMod.Game
         private readonly List<ChatLogEntry> _chatLog = new List<ChatLogEntry>();
         private int _nextChatId = 1;
         private string _chatLogJson = "[]";
+        private string _playerListJson = "[]";
 
         /// <summary>
         /// The chat/event feed as a JSON array for the hub panel binding:
@@ -230,6 +231,58 @@ namespace CS2MultiplayerMod.Game
         /// the same string instance instead of re-serializing the whole log.
         /// </summary>
         public string ChatLogJson { get { lock (_chatLock) return _chatLogJson; } }
+
+        /// <summary>
+        /// Host-side participant list used by the in-game panel. It is rebuilt only
+        /// when session membership changes, avoiding a fresh JSON allocation every UI
+        /// frame. The local host is included and is never kickable.
+        /// </summary>
+        public string PlayerListJson { get { lock (_chatLock) return _playerListJson; } }
+
+        /// <summary>Remove one authenticated client selected in the host player list.</summary>
+        public void KickPlayerFromUi(int playerId)
+        {
+            if (!_session.KickPlayer(playerId))
+                _log.Warn("[MP] Ignored kick request for unavailable player #" + playerId + ".");
+        }
+
+        private void RefreshPlayerListJson()
+        {
+            lock (_chatLock)
+            {
+                if (_session.Role != SessionRole.Host)
+                {
+                    _playerListJson = "[]";
+                    return;
+                }
+
+                var peers = new List<Peer>();
+                foreach (Peer peer in _session.Peers)
+                    if (peer.Handshaked) peers.Add(peer);
+                peers.Sort((a, b) => a.PlayerId.CompareTo(b.PlayerId));
+
+                var sb = new System.Text.StringBuilder((peers.Count + 1) * 56 + 2);
+                sb.Append("[{\"id\":").Append(_session.LocalPlayerId).Append(",\"name\":");
+                AppendJsonString(sb, _session.LocalPlayerName);
+                sb.Append(",\"isHost\":true}]");
+
+                if (peers.Count > 0)
+                {
+                    // Replace the closing bracket while appending keeps this a single,
+                    // small allocation and reuses the chat JSON escaping rules.
+                    sb.Length--;
+                    for (int i = 0; i < peers.Count; i++)
+                    {
+                        Peer peer = peers[i];
+                        sb.Append(",{\"id\":").Append(peer.PlayerId).Append(",\"name\":");
+                        AppendJsonString(sb, peer.Name);
+                        sb.Append(",\"isHost\":false}");
+                    }
+                    sb.Append(']');
+                }
+                _playerListJson = sb.ToString();
+            }
+        }
 
 
 
@@ -355,6 +408,7 @@ namespace CS2MultiplayerMod.Game
                 }
                 else if (status == SessionStatus.Faulted)
                     _service.AppendChatEntry(null, string.IsNullOrEmpty(detail) ? "Connection failed." : detail);
+                _service.RefreshPlayerListJson();
                 _lastStatus = status;
             }
 
@@ -364,6 +418,7 @@ namespace CS2MultiplayerMod.Game
             {
                 _log.Info("[MP] Peer joined: " + peer);
                 Diagnostics.FlightRecorder.Note("peer joined #" + peer.PlayerId);
+                _service.RefreshPlayerListJson();
                 // WorldResyncSystem observes joins too and pushes the live world to the newcomer.
             }
             public override void OnPeerLeft(Peer peer, string reason)
@@ -372,6 +427,7 @@ namespace CS2MultiplayerMod.Game
                 Diagnostics.FlightRecorder.Note("peer left #" + peer.PlayerId + " (" + reason + ")");
                 RemotePlayer removed;
                 _service._remotePlayers.TryRemove(peer.PlayerId, out removed);
+                _service.RefreshPlayerListJson();
             }
             public override void OnChatReceived(string sender, string text)
             {

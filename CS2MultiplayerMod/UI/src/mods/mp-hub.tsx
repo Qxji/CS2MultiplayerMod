@@ -2,7 +2,7 @@ import { bindValue, trigger, useValue } from "cs2/api";
 import { InputActionBarrier } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
-import { Button, Portal, Tooltip } from "cs2/ui";
+import { Button, Panel, Portal, Tooltip } from "cs2/ui";
 import { CSSProperties, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { TransferProgress } from "mods/join-game";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
@@ -27,6 +27,12 @@ const LOC = {
     sendingWorld: "CS2MP.UI.SendingWorld",
     lockedInSession: "CS2MP.UI.LockedInSession",
     players: "CS2MP.UI.Players",
+    host: "CS2MP.UI.Host",
+    you: "CS2MP.UI.You",
+    kick: "CS2MP.UI.Kick",
+    confirmKick: "CS2MP.UI.ConfirmKick",
+    cancelKick: "CS2MP.UI.CancelKick",
+    tryThis: "CS2MP.UI.TryThis",
     playerName: "CS2MP.UI.PlayerName",
     port: "CS2MP.UI.Port",
     password: "CS2MP.UI.Password",
@@ -54,6 +60,8 @@ const playerCount$ = bindValue<number>(GROUP, "playerCount", 0);
 const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
 const statusTitle$ = bindValue<string>(GROUP, "statusTitle", "Offline");
 const statusDetail$ = bindValue<string>(GROUP, "statusDetail", "");
+const statusHelp$ = bindValue<string>(GROUP, "statusHelp", "");
+const progressMode$ = bindValue<string>(GROUP, "progressMode", "none");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const playerName$ = bindValue<string>(GROUP, "playerName", "Player");
@@ -62,12 +70,19 @@ const hostPassword$ = bindValue<string>(GROUP, "hostPassword", "");
 const maxPlayers$ = bindValue<string>(GROUP, "maxPlayers", "8");
 const lanOnly$ = bindValue<boolean>(GROUP, "lanOnly", false);
 const resyncMinutes$ = bindValue<string>(GROUP, "resyncMinutes", "15");
+const playerList$ = bindValue<string>(GROUP, "playerList", "[]");
 
 interface ChatEntry {
     id: number;
     sender: string | null; // null = system/event line ("X joined.")
     text: string;
     time: string;
+}
+
+interface PlayerEntry {
+    id: number;
+    name: string;
+    isHost: boolean;
 }
 
 const parseChatLog = (json: string): ChatEntry[] => {
@@ -79,24 +94,40 @@ const parseChatLog = (json: string): ChatEntry[] => {
     }
 };
 
+const parsePlayerList = (json: string): PlayerEntry[] => {
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
 // Vanilla right-menu styling so the button is indistinguishable from the
 // Chirper/notification buttons below it. The module paths are vanilla-internal
 // and may move on a game update, hence the inline fallback look.
-const tryClasses = (path: string): Record<string, string> | null => {
+const tryModule = (path: string, exportName: string): any => {
     try {
-        return getModule(path, "classes");
+        return getModule(path, exportName);
     } catch {
         return null;
     }
 };
+const tryClasses = (path: string): Record<string, string> | null =>
+    tryModule(path, "classes");
 const rmButton = tryClasses("game-ui/game/components/right-menu/right-menu-button.module.scss");
 const rmMenu = tryClasses("game-ui/game/components/right-menu/right-menu.module.scss");
+const chirperPanel = tryClasses("game-ui/game/components/chirper/chirper-panel.module.scss");
+const lightPanelTheme = tryClasses("game-ui/common/panel/themes/light-opaque.module.scss");
+const VanillaPanelTitleBar =
+    tryModule("game-ui/common/panel/panel-title-bar.tsx", "PanelTitleBar");
 
 // Status-kind accents shared with the join dialog's indicator (used for the dot).
 const kindColors: Record<string, string> = {
     offline: "#8fa0b3",
     disabled: "#8fa0b3",
     connecting: "#72c8f0",
+    syncing: "#72c8f0",
     connected: "#8ee08c",
     error: "#ff8a7a",
 };
@@ -185,21 +216,28 @@ const styles: Record<string, CSSProperties> = {
         right: "64rem",
         top: "50%",
         transform: "translateY(-50%)",
-        width: "440rem",
+        width: "var(--rightPanelWidth, 440rem)",
         // Definite height: the flex chain below (body → chat list) can only
         // distribute space the panel actually has, so "auto" would re-introduce
         // the buttons-in-the-middle look.
-        height: "520rem",
-        display: "flex",
-        flexDirection: "column",
-        backgroundColor: "rgba(24, 33, 51, 0.97)",
-        borderRadius: "4rem",
-        boxShadow: "0 16rem 48rem rgba(0, 0, 0, 0.45)",
+        height: "calc(100rem + var(--rightPanelHeight, 420rem))",
         zIndex: 900,
         pointerEvents: "auto",
         // Content must never paint outside the panel background — when the user
         // resizes below the natural content height, the inner areas scroll instead.
+    },
+    panelInner: {
+        width: "100%",
+        height: "100%",
         overflow: "hidden",
+        boxShadow: "0 16rem 48rem rgba(0, 0, 0, 0.38)",
+    },
+    fallbackPanelInner: {
+        backgroundColor: "#ececec",
+        color: "#504c53",
+        borderRadius: "4rem",
+        display: "flex",
+        flexDirection: "column",
     },
     header: {
         display: "flex",
@@ -208,16 +246,23 @@ const styles: Record<string, CSSProperties> = {
         borderBottom: "1rem solid rgba(157, 193, 222, 0.2)",
         flexShrink: 0,
     },
-    headerIcon: {
-        width: "20rem",
-        height: "20rem",
-        marginRight: "10rem",
-    },
     headerTitle: {
         flex: 1,
         fontSize: "18rem",
         color: "#ffffff",
         textTransform: "uppercase",
+    },
+    nativeHeaderContent: {
+        width: "100%",
+        minWidth: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+    },
+    nativeHeaderTitle: {
+        flexGrow: 1,
+        minWidth: 0,
+        textAlign: "center",
     },
     headerButton: {
         width: "32rem",
@@ -238,11 +283,11 @@ const styles: Record<string, CSSProperties> = {
         display: "flex",
         flexDirection: "column",
         padding: "12rem 14rem",
-        flexGrow: 1,
-        flexShrink: 1,
-        flexBasis: "0%",
+        height: "100%",
+        boxSizing: "border-box",
         minHeight: 0,
         overflow: "hidden",
+        color: "#504c53",
     },
     // Fields live in here so a small panel scrolls them while the footer
     // (action buttons) stays pinned to the panel bottom.
@@ -257,7 +302,7 @@ const styles: Record<string, CSSProperties> = {
         marginBottom: "6rem",
         flexShrink: 0,
         fontSize: "13rem",
-        color: "#9dc1de",
+        color: "#526f84",
         textTransform: "uppercase",
     },
     chatList: {
@@ -266,36 +311,36 @@ const styles: Record<string, CSSProperties> = {
         flexBasis: "0%",
         minHeight: "80rem",
         overflowY: "auto",
-        backgroundColor: "rgba(0, 0, 0, 0.3)",
-        border: "1rem solid rgba(157, 193, 222, 0.2)",
+        backgroundColor: "rgba(42, 52, 65, 0.07)",
+        border: "1rem solid rgba(80, 76, 83, 0.18)",
         borderRadius: "3rem",
         padding: "8rem 10rem",
         marginBottom: "10rem",
     },
     chatEmpty: {
         fontSize: "13rem",
-        color: "rgba(255, 255, 255, 0.45)",
+        color: "rgba(80, 76, 83, 0.55)",
         fontStyle: "italic",
         textAlign: "center",
         marginTop: "12rem",
     },
     chatLine: {
         fontSize: "14rem",
-        color: "#ffffff",
+        color: "#504c53",
         marginBottom: "4rem",
         wordBreak: "break-word",
     },
     chatTime: {
-        color: "rgba(255, 255, 255, 0.4)",
+        color: "rgba(80, 76, 83, 0.5)",
         fontSize: "11rem",
         marginRight: "6rem",
     },
     chatSender: {
-        color: "#9dc1de",
+        color: "#276885",
     },
     systemLine: {
         fontSize: "12.5rem",
-        color: "#72c8f0",
+        color: "#26759a",
         fontStyle: "italic",
         margin: "3rem 0 5rem 0",
         textAlign: "center",
@@ -310,9 +355,9 @@ const styles: Record<string, CSSProperties> = {
     chatInput: {
         flex: 1,
         fontSize: "14rem",
-        color: "#ffffff",
-        backgroundColor: "rgba(0, 0, 0, 0.35)",
-        border: "1rem solid rgba(157, 193, 222, 0.35)",
+        color: "#34313a",
+        backgroundColor: "rgba(255, 255, 255, 0.72)",
+        border: "1rem solid rgba(80, 76, 83, 0.28)",
         borderRadius: "3rem",
         padding: "6rem 10rem",
     },
@@ -331,18 +376,38 @@ const styles: Record<string, CSSProperties> = {
     },
     hint: {
         fontSize: "12.5rem",
-        color: "rgba(255, 255, 255, 0.55)",
+        color: "rgba(80, 76, 83, 0.68)",
         margin: "2rem 0 12rem 0",
     },
     errorLine: {
-        fontSize: "12.5rem",
-        color: "#ff8a7a",
-        marginBottom: "10rem",
+        fontSize: "13rem",
+        color: "#7a302a",
+        backgroundColor: "rgba(205, 82, 70, 0.12)",
+        borderLeft: "3rem solid #d45e52",
+        borderRadius: "3rem",
+        padding: "9rem 10rem",
+        margin: "4rem 0 10rem 0",
         wordBreak: "break-word",
+    },
+    errorTitle: {
+        fontWeight: "bold",
+        marginBottom: "4rem",
+    },
+    errorHelpTitle: {
+        marginTop: "8rem",
+        color: "#526f84",
+        fontSize: "11.5rem",
+        fontWeight: "bold",
+        textTransform: "uppercase",
+    },
+    errorHelp: {
+        marginTop: "3rem",
+        color: "#5e5862",
+        lineHeight: "1.35",
     },
     lockedNote: {
         fontSize: "12rem",
-        color: "rgba(255, 200, 130, 0.8)",
+        color: "#8a5c28",
         marginBottom: "10rem",
     },
     row: {
@@ -353,16 +418,16 @@ const styles: Record<string, CSSProperties> = {
     label: {
         width: "150rem",
         fontSize: "13.5rem",
-        color: "#9dc1de",
+        color: "#526f84",
         textTransform: "uppercase",
         flexShrink: 0,
     },
     input: {
         flex: 1,
         fontSize: "14rem",
-        color: "#ffffff",
-        backgroundColor: "rgba(0, 0, 0, 0.35)",
-        border: "1rem solid rgba(157, 193, 222, 0.35)",
+        color: "#34313a",
+        backgroundColor: "rgba(255, 255, 255, 0.72)",
+        border: "1rem solid rgba(80, 76, 83, 0.28)",
         borderRadius: "3rem",
         padding: "5rem 10rem",
     },
@@ -374,8 +439,8 @@ const styles: Record<string, CSSProperties> = {
         width: "22rem",
         height: "22rem",
         borderRadius: "3rem",
-        backgroundColor: "rgba(0, 0, 0, 0.35)",
-        border: "1rem solid rgba(157, 193, 222, 0.35)",
+        backgroundColor: "rgba(255, 255, 255, 0.72)",
+        border: "1rem solid rgba(80, 76, 83, 0.28)",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
@@ -397,8 +462,84 @@ const styles: Record<string, CSSProperties> = {
         bottom: "3rem",
         width: 0,
         height: 0,
-        borderBottom: "11rem solid rgba(157, 193, 222, 0.45)",
+        borderBottom: "11rem solid rgba(80, 76, 83, 0.45)",
         borderLeft: "11rem solid transparent",
+    },
+    activityDetail: {
+        marginTop: "-9rem",
+        marginBottom: "10rem",
+        color: "#5e6872",
+        fontSize: "12rem",
+        lineHeight: "1.3",
+    },
+    playerSection: {
+        flexShrink: 0,
+        marginBottom: "10rem",
+    },
+    sectionHeader: {
+        display: "flex",
+        alignItems: "baseline",
+        justifyContent: "space-between",
+        marginBottom: "5rem",
+        color: "#526f84",
+        fontSize: "12.5rem",
+        textTransform: "uppercase",
+    },
+    playerList: {
+        backgroundColor: "rgba(42, 52, 65, 0.07)",
+        border: "1rem solid rgba(80, 76, 83, 0.18)",
+        borderRadius: "3rem",
+        maxHeight: "145rem",
+        overflowY: "auto",
+    },
+    playerRow: {
+        minHeight: "36rem",
+        padding: "4rem 7rem",
+        display: "flex",
+        alignItems: "center",
+        borderBottom: "1rem solid rgba(80, 76, 83, 0.12)",
+    },
+    playerInitial: {
+        width: "25rem",
+        height: "25rem",
+        borderRadius: "50%",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        marginRight: "8rem",
+        color: "#ffffff",
+        backgroundColor: "#4f8dab",
+        fontSize: "12rem",
+        fontWeight: "bold",
+        textTransform: "uppercase",
+    },
+    playerName: {
+        flexGrow: 1,
+        minWidth: 0,
+        color: "#45414a",
+        fontSize: "13.5rem",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+    },
+    playerBadge: {
+        marginLeft: "6rem",
+        color: "#6f6a72",
+        fontSize: "10.5rem",
+        textTransform: "uppercase",
+    },
+    kickButton: {
+        marginLeft: "7rem",
+        padding: "3rem 8rem",
+        minWidth: "52rem",
+        fontSize: "11.5rem",
+    },
+    confirmKickButton: {
+        marginLeft: "5rem",
+        padding: "3rem 7rem",
+        fontSize: "11.5rem",
+        color: "#a63e35",
     },
 };
 
@@ -557,6 +698,7 @@ const HostSetupView = () => {
     const statusKind = useValue(statusKind$);
     const statusTitle = useValue(statusTitle$);
     const statusDetail = useValue(statusDetail$);
+    const statusHelp = useValue(statusHelp$);
 
     return (
         <div style={styles.body}>
@@ -565,8 +707,14 @@ const HostSetupView = () => {
                 <SettingsFields />
                 {statusKind === "error" ? (
                     <div style={styles.errorLine}>
-                        {statusTitle}
-                        {statusDetail ? " - " + statusDetail : ""}
+                        <div style={styles.errorTitle}>{statusTitle}</div>
+                        {statusDetail ? <div>{statusDetail}</div> : null}
+                        {statusHelp ? (
+                            <>
+                                <div style={styles.errorHelpTitle}>{t(LOC.tryThis, "Try this")}</div>
+                                <div style={styles.errorHelp}>{statusHelp}</div>
+                            </>
+                        ) : null}
                     </div>
                 ) : null}
             </div>
@@ -598,13 +746,79 @@ const SettingsView = () => {
     );
 };
 
+const HostPlayerList = ({ players }: { players: PlayerEntry[] }) => {
+    const t = useT();
+    const [confirmingId, setConfirmingId] = useState<number | null>(null);
+
+    useEffect(() => {
+        if (confirmingId !== null && !players.some((player) => player.id === confirmingId))
+            setConfirmingId(null);
+    }, [players, confirmingId]);
+
+    return (
+        <div style={styles.playerSection}>
+            <div style={styles.sectionHeader}>
+                <span>{t(LOC.players, "Players")}</span>
+                <span>{players.length}</span>
+            </div>
+            <div style={styles.playerList}>
+                {players.map((player) => {
+                    const confirming = confirmingId === player.id;
+                    const initial = player.name.trim().charAt(0) || "?";
+                    return (
+                        <div key={player.id} style={styles.playerRow}>
+                            <div style={styles.playerInitial}>{initial}</div>
+                            <div style={styles.playerName}>{player.name}</div>
+                            {player.isHost ? (
+                                <>
+                                    <span style={styles.playerBadge}>{t(LOC.host, "Host")}</span>
+                                    <span style={styles.playerBadge}>{t(LOC.you, "You")}</span>
+                                </>
+                            ) : confirming ? (
+                                <>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.confirmKickButton}
+                                        onSelect={() => {
+                                            trigger(GROUP, "kickPlayer", player.id);
+                                            setConfirmingId(null);
+                                        }}>
+                                        {t(LOC.confirmKick, "Remove?")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.confirmKickButton}
+                                        onSelect={() => setConfirmingId(null)}>
+                                        {t(LOC.cancelKick, "Cancel")}
+                                    </Button>
+                                </>
+                            ) : (
+                                <Button
+                                    variant="flat"
+                                    style={styles.kickButton}
+                                    onSelect={() => setConfirmingId(player.id)}>
+                                    {t(LOC.kick, "Kick")}
+                                </Button>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+
 // Active session: player count, chat feed (player lines + "X joined." event
 // lines), send box, world sync and disconnect.
-const SessionView = ({ entries }: { entries: ChatEntry[] }) => {
+const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: PlayerEntry[] }) => {
     const t = useT();
     const playerCount = useValue(playerCount$);
     const mapTransferPercent = useValue(mapTransferPercent$);
     const worldSendPercent = useValue(worldSendPercent$);
+    const isHost = useValue(isHost$);
+    const progressMode = useValue(progressMode$);
+    const statusTitle = useValue(statusTitle$);
+    const statusDetail = useValue(statusDetail$);
     const [draft, setDraft] = useState("");
     const [typing, setTyping] = useState(false);
     const listRef = useRef<HTMLDivElement | null>(null);
@@ -625,13 +839,26 @@ const SessionView = ({ entries }: { entries: ChatEntry[] }) => {
         setDraft("");
     };
 
+    const activityPercent = isHost ? worldSendPercent : mapTransferPercent;
+    const showActivity = progressMode !== "none";
+
     return (
         <div style={styles.body}>
             {/* Single string child: Gameface puts each adjacent bare text node on
                 its own line, which split "Players: 3" into three lines. */}
-            <div style={styles.playerCountRow}>{t(LOC.players, "Players") + ": " + playerCount}</div>
-            <TransferProgress percent={mapTransferPercent} />
-            <TransferProgress percent={worldSendPercent} label={t(LOC.sendingWorld, "Sending World")} />
+            {isHost
+                ? <HostPlayerList players={players} />
+                : <div style={styles.playerCountRow}>{t(LOC.players, "Players") + ": " + playerCount}</div>}
+            {showActivity ? (
+                <>
+                    <TransferProgress
+                        percent={activityPercent}
+                        label={statusTitle}
+                        indeterminate={progressMode === "indeterminate"}
+                    />
+                    {statusDetail ? <div style={styles.activityDetail}>{statusDetail}</div> : null}
+                </>
+            ) : null}
             <div ref={listRef} style={styles.chatList}>
                 {entries.length === 0 ? (
                     <div style={styles.chatEmpty}>{t(LOC.noMessages, "No messages yet.")}</div>
@@ -707,8 +934,9 @@ interface DragState {
     baseH: number;
 }
 
-export const MultiplayerPanel = ({ entries, geometry, onGeometry, onClose }: {
+export const MultiplayerPanel = ({ entries, players, geometry, onGeometry, onClose }: {
     entries: ChatEntry[];
+    players: PlayerEntry[];
     geometry: PanelGeometry;
     onGeometry: (geometry: PanelGeometry) => void;
     onClose: () => void;
@@ -782,31 +1010,63 @@ export const MultiplayerPanel = ({ entries, geometry, onGeometry, onClose }: {
         panelStyle.maxHeight = "none";
     }
 
+    const titleText = showSettings
+        ? t(LOC.sessionSettings, "Session Settings")
+        : t(LOC.multiplayer, "Multiplayer");
+    const headerContent = (
+        <div style={styles.nativeHeaderContent} onMouseDown={(e) => beginDrag(e, "move")}>
+            <div style={styles.nativeHeaderTitle}>{titleText}</div>
+            {inSession ? (
+                <HeaderIconButton
+                    src={ICON_GEAR}
+                    tooltip={t(LOC.sessionSettings, "Session Settings")}
+                    selected={showSettings}
+                    onSelect={() => setShowSettings(!showSettings)}
+                />
+            ) : null}
+        </div>
+    );
+    const header = VanillaPanelTitleBar ? (
+        // No title icon: this is the same title-bar structure and light-opaque
+        // theme used by Chirper, with only the settings and close controls.
+        <VanillaPanelTitleBar>{headerContent}</VanillaPanelTitleBar>
+    ) : (
+        <div style={styles.header} onMouseDown={(e) => beginDrag(e, "move")}>
+            <div style={styles.headerTitle}>{titleText}</div>
+            {inSession ? (
+                <HeaderIconButton
+                    src={ICON_GEAR}
+                    tooltip={t(LOC.sessionSettings, "Session Settings")}
+                    selected={showSettings}
+                    onSelect={() => setShowSettings(!showSettings)}
+                />
+            ) : null}
+            <HeaderIconButton
+                src={ICON_CLOSE}
+                tooltip={t(LOC.back, "Back")}
+                onSelect={onClose}
+            />
+        </div>
+    );
+    const panelInnerStyle = lightPanelTheme
+        ? styles.panelInner
+        : { ...styles.panelInner, ...styles.fallbackPanelInner };
+
     return (
         <Portal>
             <div ref={panelRef} style={panelStyle} onMouseDown={(e) => e.stopPropagation()}>
-                <div style={styles.header} onMouseDown={(e) => beginDrag(e, "move")}>
-                    <img src={ICON_MULTIPLAYER} style={styles.headerIcon} />
-                    <div style={styles.headerTitle}>
-                        {showSettings
-                            ? t(LOC.sessionSettings, "Session Settings")
-                            : t(LOC.multiplayer, "Multiplayer")}
-                    </div>
-                    {inSession ? (
-                        <HeaderIconButton
-                            src={ICON_GEAR}
-                            tooltip={t(LOC.sessionSettings, "Session Settings")}
-                            selected={showSettings}
-                            onSelect={() => setShowSettings(!showSettings)}
-                        />
-                    ) : null}
-                    <HeaderIconButton
-                        src={ICON_CLOSE}
-                        tooltip={t(LOC.back, "Back")}
-                        onSelect={onClose}
-                    />
-                </div>
-                {showSettings && inSession ? <SettingsView /> : inSession ? <SessionView entries={entries} /> : <HostSetupView />}
+                <Panel
+                    theme={lightPanelTheme ?? undefined}
+                    className={chirperPanel ? chirperPanel.chirperPanel : undefined}
+                    style={panelInnerStyle}
+                    header={header}
+                    onClose={onClose}>
+                    {showSettings && inSession
+                        ? <SettingsView />
+                        : inSession
+                            ? <SessionView entries={entries} players={players} />
+                            : <HostSetupView />}
+                </Panel>
                 <div style={styles.resizeHandle} onMouseDown={(e) => beginDrag(e, "resize")}>
                     <div style={styles.resizeGrip} />
                 </div>
@@ -839,10 +1099,12 @@ export const MultiplayerRightMenuButton = () => {
     const [open, setOpen] = useState(false);
     const [geometry, setGeometry] = useState<PanelGeometry>({ pos: null, size: null });
     const chatJson = useValue(chatLog$);
+    const playerJson = useValue(playerList$);
     const inSession = useValue(inSession$);
     const statusKind = useValue(statusKind$);
     const accepted = useValue(disclaimerAccepted$);
     const entries = useMemo(() => parseChatLog(chatJson), [chatJson]);
+    const players = useMemo(() => parsePlayerList(playerJson), [playerJson]);
 
     // Read marker: everything up to this id has been seen with the panel open.
     const [readSeenId, setReadSeenId] = useState(0);
@@ -906,6 +1168,7 @@ export const MultiplayerRightMenuButton = () => {
                 accepted ? (
                     <MultiplayerPanel
                         entries={entries}
+                        players={players}
                         geometry={geometry}
                         onGeometry={setGeometry}
                         onClose={() => setOpen(false)}
