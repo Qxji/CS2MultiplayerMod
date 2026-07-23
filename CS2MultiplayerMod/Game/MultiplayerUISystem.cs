@@ -135,6 +135,8 @@ namespace CS2MultiplayerMod.Game
                 value => { if (Mod.Service != null) Mod.Service.SendChatFromUi(value); }));
             AddBinding(new TriggerBinding<int>(Group, "kickPlayer",
                 playerId => { if (Mod.Service != null) Mod.Service.KickPlayerFromUi(playerId); }));
+            AddBinding(new TriggerBinding<int>(Group, "banPlayer",
+                playerId => { if (Mod.Service != null) Mod.Service.BanPlayerFromUi(playerId); }));
             AddBinding(new TriggerBinding(Group, "hostStart", () =>
             {
                 if (Mod.Service == null || Mod.Setting == null) return;

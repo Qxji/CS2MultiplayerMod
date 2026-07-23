@@ -29,7 +29,7 @@ Host-authoritative and friend-focused: set a password, share your IP-address, an
 	<RequiredDLC Value="" />
 	<!--Change log for new version. Single line or multi line. Supports minimal markdown subset-->
 	<ChangeLog>
-		Updated the Ingame UI, enhanced the Host connection Experience, added a way to kick player, added an automatic server close/disconnect on Host closing World/Game aswell for clients.
+		Updated the Ingame UI, enhanced the Host connection Experience, added a way to kick player, added an automatic server close/disconnect on Host closing World/Game aswell for clients and fixed some smal Bugs.
 	</ChangeLog>
 	<!--External link, can be set multiple times. supported types are "discord", "github", "youtube", "twitch", "x", "paypal", "patreon", "buymeacoffee", "kofi", "crowdin", "gitlab", "gofundme"-->
 	<ExternalLink Type="discord" Url="https://discord.gg/KFZTW2YSJt" />

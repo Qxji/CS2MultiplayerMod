@@ -39,6 +39,7 @@ namespace CS2MultiplayerMod.Core.Session
         private readonly Dictionary<string, int> _allowedBlobChannels = new Dictionary<string, int>();
         private readonly HashSet<ushort> _allowedCommandIds = new HashSet<ushort>();
         private readonly HashSet<int> _administrativeRemovals = new HashSet<int>();
+        private readonly HashSet<string> _hostBannedAddresses = new HashSet<string>();
         private readonly FailedAuthTracker _failedAuth = new FailedAuthTracker();
 
         private ITransport _transport;

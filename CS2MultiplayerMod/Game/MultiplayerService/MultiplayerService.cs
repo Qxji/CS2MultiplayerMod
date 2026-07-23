@@ -83,6 +83,7 @@ namespace CS2MultiplayerMod.Game
                 ZonePaintCommand.Id, TerrainBrushCommand.Id,
                 UpgradePlacementCommand.Id, ObjectMoveCommand.Id, NetUpgradeCommand.Id,
                 AreaCreateCommand.Id, AreaUpdateCommand.Id, AreaDeleteCommand.Id,
+                OwnedAreaSnapshotCommand.Id,
                 RouteCreateCommand.Id, RouteUpdateCommand.Id, RouteDeleteCommand.Id,
                 TilePurchaseCommand.Id, EntityPolicyCommand.Id, DevTreePurchaseCommand.Id,
                 NetReplaceCommand.Id, ObjectToolOperationCommand.Id,
@@ -193,6 +194,7 @@ namespace CS2MultiplayerMod.Game
                 case TilePurchaseCommand.Id: return "tile-purchase";
                 case EntityPolicyCommand.Id: return "policy-edit";
                 case AreaUpdateCommand.Id: return "area-update";
+                case OwnedAreaSnapshotCommand.Id: return "owned-area-snapshot";
                 case RouteUpdateCommand.Id: return "route-update";
                 case DevTreePurchaseCommand.Id: return "dev-tree-purchase";
                 case NetReplaceCommand.Id: return "net-replace";
@@ -244,6 +246,13 @@ namespace CS2MultiplayerMod.Game
         {
             if (!_session.KickPlayer(playerId))
                 _log.Warn("[MP] Ignored kick request for unavailable player #" + playerId + ".");
+        }
+
+        /// <summary>Remove a client and block its address for the current hosting session.</summary>
+        public void BanPlayerFromUi(int playerId)
+        {
+            if (!_session.BanPlayer(playerId))
+                _log.Warn("[MP] Ignored ban request for unavailable player #" + playerId + ".");
         }
 
         private void RefreshPlayerListJson()

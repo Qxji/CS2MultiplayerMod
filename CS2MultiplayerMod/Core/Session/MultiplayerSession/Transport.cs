@@ -40,6 +40,16 @@ namespace CS2MultiplayerMod.Core.Session
                     return;
                 }
 
+                if (!string.IsNullOrEmpty(address) && _hostBannedAddresses.Contains(address))
+                {
+                    _log.Warn("[security] Refused " + connection + " (" + address +
+                              "): banned by the host for this session.");
+                    SendTo(connection, HandshakeResponse.Reject(
+                        "The host banned this connection for the current hosting session."));
+                    _transport.DisconnectAfterFlush(connection);
+                    return;
+                }
+
                 // Cap the number of sockets sitting in the pre-handshake state.
                 int pending = 0;
                 foreach (var pair in _peers)

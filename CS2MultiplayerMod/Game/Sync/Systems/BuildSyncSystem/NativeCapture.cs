@@ -34,7 +34,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private ObjectToolOperationCommand _pendingSpecializedObjectOperation;
         private ObjectToolDefinitionIntent _pendingSpecializedAreaDefinition;
         private Entity _pendingSpecializedArea;
-        private Entity _pendingSpecializedOwner;
         private bool _completeSpecializedAreaThisFrame;
 
         /// <summary>
@@ -93,18 +92,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     }
                     else
                     {
-                        TryFindTopOwner(recreate, out _pendingSpecializedOwner);
-                        ObjectToolDefinitionIntent areaDefinition;
-                        if (TryCaptureSpecializedAreaDefinition(definitions, recreate,
-                                _pendingSpecializedObjectOperation, out areaDefinition))
-                            _pendingSpecializedAreaDefinition = areaDefinition;
-
                         // On the completion frame AreaToolSystem switches activeTool back to the
                         // object tool, while ToolSystem.applyMode still belongs to the area tool
-                        // that produced this output batch.
+                        // that produced this output batch. The committed live area is captured at
+                        // ModificationEnd; the final click does not emit a new definition batch.
                         if (active is ObjectToolSystem &&
-                            _toolSystem.applyMode == ApplyMode.Apply &&
-                            _pendingSpecializedAreaDefinition != null)
+                            _toolSystem.applyMode == ApplyMode.Apply)
                             _completeSpecializedAreaThisFrame = true;
                         return;
                     }
@@ -546,7 +539,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             ForgetRecentLocalObjectOperation(_cachedLocalObjectOperation);
             _pendingSpecializedObjectOperation = _cachedLocalObjectOperation;
             _pendingSpecializedArea = recreate;
-            TryFindTopOwner(recreate, out _pendingSpecializedOwner);
             _pendingSpecializedAreaDefinition = null;
             _cachedLocalObjectOperation = null;
             return true;
@@ -586,53 +578,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 root.Object.RotZ, root.Object.RotW);
             return math.abs(math.dot(ownerTransform.m_Rotation.value,
                        wantedRotation.value)) >= 0.98f;
-        }
-
-        private bool TryCaptureSpecializedAreaDefinition(NativeArray<Entity> definitions,
-            Entity recreate, ObjectToolOperationCommand operation,
-            out ObjectToolDefinitionIntent result)
-        {
-            result = null;
-            ObjectToolDefinitionIntent root = operation.Definitions[operation.RootIndex];
-            for (int i = 0; i < definitions.Length; i++)
-            {
-                Entity entity = definitions[i];
-                if (!EntityManager.Exists(entity) ||
-                    !EntityManager.HasComponent<CreationDefinition>(entity) ||
-                    !EntityManager.HasBuffer<global::Game.Areas.Node>(entity)) continue;
-
-                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
-                if (creation.m_Original != recreate || creation.m_Prefab == Entity.Null ||
-                    !IsSpecializedAreaPrefab(creation.m_Prefab)) continue;
-
-                ObjectToolDefinitionIntent captured;
-                if (!TryCaptureObjectToolDefinition(entity, out captured) ||
-                    captured.Kind != ObjectToolDefinitionKind.Area ||
-                    captured.AreaNodes == null || captured.AreaNodes.Length < 3) continue;
-
-                // More than one definition targeting the recreated specialized lot would be
-                // ambiguous; retain the last known-good preview instead of sending a partial graph.
-                if (result != null) return false;
-
-                // The sender edits its already-created owned area. The receiver is creating the
-                // whole graph for the first time, so remove sender-local entity references and
-                // recreation flags, then bind the area to the new root by stable owner identity.
-                captured.Original = default(PortableEntityRef);
-                captured.Owner = default(PortableEntityRef);
-                captured.Attached = default(PortableEntityRef);
-                captured.CreationFlags = 0;
-                captured.HasOwnerDefinition = true;
-                captured.OwnerDefinitionPrefabName = root.PrefabName;
-                captured.OwnerDefinitionX = root.Object.PosX;
-                captured.OwnerDefinitionY = root.Object.PosY;
-                captured.OwnerDefinitionZ = root.Object.PosZ;
-                captured.OwnerDefinitionRotX = root.Object.RotX;
-                captured.OwnerDefinitionRotY = root.Object.RotY;
-                captured.OwnerDefinitionRotZ = root.Object.RotZ;
-                captured.OwnerDefinitionRotW = root.Object.RotW;
-                result = captured;
-            }
-            return result != null;
         }
 
         private bool IsSpecializedAreaPrefab(Entity prefab)
@@ -684,9 +629,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             try
             {
                 if (TryPublishLocalObjectOperation(operation))
+                {
                     Diagnostics.FlightRecorder.Note("specialized object/area operation captured op=" +
                         operation.OperationId + " defs=" + operation.Definitions.Length +
                         " areaNodes=" + _pendingSpecializedAreaDefinition.AreaNodes.Length);
+                    PublishOwnedAreaSnapshot(root, _pendingSpecializedAreaDefinition);
+                }
             }
             catch (System.Exception ex)
             {
@@ -702,12 +650,58 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        private void PublishOwnedAreaSnapshot(ObjectToolDefinitionIntent root,
+            ObjectToolDefinitionIntent area)
+        {
+            if (root == null || area == null ||
+                !IsClosedAreaNodeRing(area.AreaNodes)) return;
+            MultiplayerService service = Mod.Service;
+            if (service == null || !service.GameplaySyncReady) return;
+
+            int count = area.AreaNodes.Length - 1;
+            var command = new OwnedAreaSnapshotCommand
+            {
+                AreaPrefabName = area.PrefabName,
+                OwnerPrefabName = root.PrefabName,
+                OwnerX = root.Object.PosX,
+                OwnerY = root.Object.PosY,
+                OwnerZ = root.Object.PosZ,
+                OwnerRotX = root.Object.RotX,
+                OwnerRotY = root.Object.RotY,
+                OwnerRotZ = root.Object.RotZ,
+                OwnerRotW = root.Object.RotW,
+                NodeX = new float[count],
+                NodeY = new float[count],
+                NodeZ = new float[count],
+                NodeElevation = new float[count],
+            };
+            for (int i = 0; i < count; i++)
+            {
+                command.NodeX[i] = area.AreaNodes[i].X;
+                command.NodeY[i] = area.AreaNodes[i].Y;
+                command.NodeZ[i] = area.AreaNodes[i].Z;
+                command.NodeElevation[i] = area.AreaNodes[i].Elevation;
+            }
+
+            try
+            {
+                service.Session.SendCommand(0, OwnedAreaSnapshotCommand.Id,
+                    command.Encode());
+                Diagnostics.FlightRecorder.Note("specialized owned-area safeguard sent nodes=" +
+                                                  count);
+            }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] BuildSync: owned-area safeguard was not sent: " +
+                             ex.Message);
+            }
+        }
+
         private void ClearSpecializedAreaCapture()
         {
             _pendingSpecializedObjectOperation = null;
             _pendingSpecializedAreaDefinition = null;
             _pendingSpecializedArea = Entity.Null;
-            _pendingSpecializedOwner = Entity.Null;
             _completeSpecializedAreaThisFrame = false;
         }
 
@@ -720,73 +714,93 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (!_completeSpecializedAreaThisFrame) return;
             _completeSpecializedAreaThisFrame = false;
-            if (!CompletedSpecializedAreaMatchesCapture())
+            ObjectToolDefinitionIntent completed;
+            if (!TryCaptureCompletedSpecializedArea(out completed))
             {
                 Diagnostics.FlightRecorder.Note("specialized object/area apply not observed");
                 ClearSpecializedAreaCapture();
                 return;
             }
+            _pendingSpecializedAreaDefinition = completed;
             PublishSpecializedAreaOperation();
         }
 
-        private bool CompletedSpecializedAreaMatchesCapture()
+        private bool TryCaptureCompletedSpecializedArea(
+            out ObjectToolDefinitionIntent completed)
         {
-            ObjectToolDefinitionIntent expected = _pendingSpecializedAreaDefinition;
-            if (expected == null || !SpecializedObjectMatchesRoot(_pendingSpecializedOwner,
-                    _pendingSpecializedObjectOperation)) return false;
-
-            NativeArray<Entity> areas = _portableAreas.ToEntityArray(Allocator.Temp);
-            try
-            {
-                for (int i = 0; i < areas.Length; i++)
-                {
-                    Entity area = areas[i];
-                    Entity topOwner;
-                    if (!TryFindTopOwner(area, out topOwner) ||
-                        topOwner != _pendingSpecializedOwner) continue;
-                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(area).m_Prefab;
-                    if (_prefabSystem.GetPrefabName(prefab) != expected.PrefabName) continue;
-                    DynamicBuffer<global::Game.Areas.Node> actual =
-                        EntityManager.GetBuffer<global::Game.Areas.Node>(area, isReadOnly: true);
-                    if (PolygonMatches(actual, expected.AreaNodes)) return true;
-                }
+            completed = null;
+            ObjectToolOperationCommand operation = _pendingSpecializedObjectOperation;
+            if (operation == null || operation.Definitions == null ||
+                operation.RootIndex < 0 || operation.RootIndex >= operation.Definitions.Length)
                 return false;
-            }
-            finally
-            {
-                areas.Dispose();
-            }
-        }
 
-        private static bool PolygonMatches(DynamicBuffer<global::Game.Areas.Node> actual,
-            ObjectAreaNodeIntent[] expected)
-        {
-            if (expected == null || actual.Length != expected.Length || actual.Length < 3)
-                return false;
-            for (int start = 0; start < actual.Length; start++)
+            Entity area = _pendingSpecializedArea;
+            if (area == Entity.Null || !EntityManager.Exists(area) ||
+                !EntityManager.HasComponent<global::Game.Areas.Area>(area) ||
+                !EntityManager.HasComponent<PrefabRef>(area) ||
+                !EntityManager.HasBuffer<global::Game.Areas.Node>(area)) return false;
+
+            Entity topOwner;
+            if (!TryFindTopOwner(area, out topOwner) ||
+                !SpecializedObjectMatchesRoot(topOwner, operation)) return false;
+
+            global::Game.Areas.Area areaData =
+                EntityManager.GetComponentData<global::Game.Areas.Area>(area);
+            if ((areaData.m_Flags & global::Game.Areas.AreaFlags.Complete) == 0) return false;
+
+            Entity areaPrefab = EntityManager.GetComponentData<PrefabRef>(area).m_Prefab;
+            Entity ownerPrefab = EntityManager.GetComponentData<PrefabRef>(topOwner).m_Prefab;
+            if (!IsSpecializedAreaPrefab(areaPrefab) ||
+                !PrefabDeclaresOwnedArea(ownerPrefab, areaPrefab)) return false;
+            string areaPrefabName = _prefabSystem.GetPrefabName(areaPrefab);
+            if (string.IsNullOrEmpty(areaPrefabName)) return false;
+
+            DynamicBuffer<global::Game.Areas.Node> liveNodes =
+                EntityManager.GetBuffer<global::Game.Areas.Node>(area, isReadOnly: true);
+            int liveCount = liveNodes.Length;
+            if (liveCount >= 4 &&
+                liveNodes[0].m_Position.Equals(liveNodes[liveCount - 1].m_Position))
+                liveCount--;
+            if (liveCount < 3 ||
+                liveCount >= ObjectToolOperationCommand.MaxAreaNodesPerDefinition) return false;
+
+            // A live complete area stores only its polygon vertices. GenerateAreasSystem expects a
+            // repeated first vertex in a new definition to recognize and commit a closed polygon.
+            var wireNodes = new ObjectAreaNodeIntent[liveCount + 1];
+            for (int i = 0; i < liveCount; i++)
             {
-                if (!AreaNodeMatches(actual[start], expected[0])) continue;
-                bool forward = true;
-                bool reverse = true;
-                for (int i = 1; i < expected.Length && (forward || reverse); i++)
+                global::Game.Areas.Node node = liveNodes[i];
+                wireNodes[i] = new ObjectAreaNodeIntent
                 {
-                    forward &= AreaNodeMatches(actual[(start + i) % actual.Length], expected[i]);
-                    int reverseIndex = (start - i + actual.Length) % actual.Length;
-                    reverse &= AreaNodeMatches(actual[reverseIndex], expected[i]);
-                }
-                if (forward || reverse) return true;
+                    X = node.m_Position.x,
+                    Y = node.m_Position.y,
+                    Z = node.m_Position.z,
+                    Elevation = node.m_Elevation,
+                };
             }
-            return false;
-        }
+            wireNodes[liveCount] = wireNodes[0];
 
-        private static bool AreaNodeMatches(global::Game.Areas.Node actual,
-            ObjectAreaNodeIntent expected)
-        {
-            float3 wanted = new float3(expected.X, expected.Y, expected.Z);
-            if (math.distancesq(actual.m_Position, wanted) > 0.0625f) return false;
-            if (actual.m_Elevation == float.MinValue || expected.Elevation == float.MinValue)
-                return actual.m_Elevation == expected.Elevation;
-            return math.abs(actual.m_Elevation - expected.Elevation) <= 0.25f;
+            ObjectToolDefinitionIntent root = operation.Definitions[operation.RootIndex];
+            completed = new ObjectToolDefinitionIntent
+            {
+                Kind = ObjectToolDefinitionKind.Area,
+                PrefabName = areaPrefabName,
+                CreationFlags = 0,
+                RandomSeed = EntityManager.HasComponent<PseudoRandomSeed>(area)
+                    ? EntityManager.GetComponentData<PseudoRandomSeed>(area).m_Seed
+                    : 0,
+                HasOwnerDefinition = true,
+                OwnerDefinitionPrefabName = root.PrefabName,
+                OwnerDefinitionX = root.Object.PosX,
+                OwnerDefinitionY = root.Object.PosY,
+                OwnerDefinitionZ = root.Object.PosZ,
+                OwnerDefinitionRotX = root.Object.RotX,
+                OwnerDefinitionRotY = root.Object.RotY,
+                OwnerDefinitionRotZ = root.Object.RotZ,
+                OwnerDefinitionRotW = root.Object.RotW,
+                AreaNodes = wireNodes,
+            };
+            return true;
         }
 
         /// <summary>
@@ -941,7 +955,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 !TryPrefabName(creation.m_SubPrefab, out value.SubPrefabName)) return false;
             if (!TryCapturePortableRef(creation.m_Original, out value.Original) ||
                 !TryCapturePortableRef(creation.m_Owner, out value.Owner) ||
-                !TryCapturePortableRef(creation.m_Attached, out value.Attached)) return false;
+                !TryCaptureAttachment(creation.m_Attached, creation.m_Prefab,
+                    creation.m_Flags, out value.Attached,
+                    out value.AttachedPrefabName)) return false;
 
             if (EntityManager.HasComponent<OwnerDefinition>(entity))
             {
@@ -1033,6 +1049,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             result = value;
             return true;
+        }
+
+        private bool TryCaptureAttachment(Entity attached, Entity objectPrefab,
+            CreationFlags flags, out PortableEntityRef portable, out string prefabName)
+        {
+            portable = new PortableEntityRef { Kind = PortableEntityKind.None };
+            prefabName = null;
+            if (attached == Entity.Null) return true;
+
+            // Placeholder facilities emit their visible level-one building as a second object
+            // definition whose attachment target is the placeholder prefab entity itself. That is
+            // a local prefab relationship, not a live-world entity reference.
+            if (EntityManager.Exists(attached) &&
+                EntityManager.HasComponent<PrefabData>(attached))
+            {
+                if ((flags & CreationFlags.Attach) == 0 ||
+                    objectPrefab == Entity.Null ||
+                    !EntityManager.Exists(objectPrefab) ||
+                    !EntityManager.HasComponent<SpawnableBuildingData>(objectPrefab) ||
+                    !EntityManager.HasComponent<PlaceholderBuildingData>(attached) ||
+                    !TryPrefabName(attached, out prefabName))
+                    return false;
+                return true;
+            }
+
+            return TryCapturePortableRef(attached, out portable);
         }
 
         private bool TryCaptureCoursePosition(CoursePos data,

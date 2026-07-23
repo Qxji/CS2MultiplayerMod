@@ -51,6 +51,9 @@ namespace CS2MultiplayerMod.Localization
             public const string UiYou = "CS2MP.UI.You";
             public const string UiKick = "CS2MP.UI.Kick";
             public const string UiConfirmKick = "CS2MP.UI.ConfirmKick";
+            public const string UiBan = "CS2MP.UI.Ban";
+            public const string UiConfirmBan = "CS2MP.UI.ConfirmBan";
+            public const string UiBanHint = "CS2MP.UI.BanHint";
             public const string UiCancelKick = "CS2MP.UI.CancelKick";
             public const string UiSendingWorld = "CS2MP.UI.SendingWorld";
             public const string UiTryThis = "CS2MP.UI.TryThis";

@@ -96,6 +96,12 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public PortableEntityRef Original;
         public PortableEntityRef Owner;
         public PortableEntityRef Attached;
+        /// <summary>
+        /// A prefab-local attachment target used by placeholder-building definitions. Unlike
+        /// <see cref="Attached"/>, this names a prefab entity from the same native placement graph,
+        /// not an already-existing simulation entity.
+        /// </summary>
+        public string AttachedPrefabName;
         public uint CreationFlags;
         public int RandomSeed;
 
@@ -133,6 +139,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         private const uint KnownCreationFlags = 0xfffffu;
         private const uint KnownCoursePosFlags = 0x7fffu;
         private const uint StampingCreationFlag = 0x80000u;
+        private const uint AttachCreationFlag = 0x8u;
         private const uint UnsafeAssetStampCreationFlags = 0x60835u;
 
         public long OperationId;
@@ -204,6 +211,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                 if (definition.Original.Kind != PortableEntityKind.None ||
                     definition.Owner.Kind != PortableEntityKind.None ||
                     definition.Attached.Kind != PortableEntityKind.None ||
+                    !string.IsNullOrEmpty(definition.AttachedPrefabName) ||
                     definition.HasOwnerDefinition)
                     throw new ProtocolException("A rootless asset stamp may not reference an external owner or original.");
                 if ((definition.CreationFlags & ~KnownCreationFlags) != 0 ||
@@ -247,6 +255,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         private static void WriteDefinition(NetworkWriter writer, ObjectToolDefinitionIntent value)
         {
             if (value == null) throw new ProtocolException("Null object-tool definition.");
+            ValidatePrefabAttachment(value);
             writer.WriteByte((byte)value.Kind);
             writer.WriteBool(value.PrefabIsNull);
             if (!value.PrefabIsNull) writer.WriteString(value.PrefabName);
@@ -254,6 +263,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             WriteEntityRef(writer, value.Original);
             WriteEntityRef(writer, value.Owner);
             WriteEntityRef(writer, value.Attached);
+            WriteOptionalName(writer, value.AttachedPrefabName);
             writer.WriteInt(unchecked((int)value.CreationFlags));
             writer.WriteInt(value.RandomSeed);
 
@@ -312,6 +322,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             value.Original = ReadEntityRef(reader);
             value.Owner = ReadEntityRef(reader);
             value.Attached = ReadEntityRef(reader);
+            value.AttachedPrefabName = ReadOptionalName(reader);
             if (value.PrefabIsNull && value.Original.Kind == PortableEntityKind.None)
                 throw new ProtocolException("Null-prefab object definition has no original.");
             value.CreationFlags = unchecked((uint)reader.ReadInt());
@@ -319,6 +330,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             if ((value.CreationFlags & ~KnownCreationFlags) != 0)
                 throw new ProtocolException("Unknown object creation flags 0x" +
                                             value.CreationFlags.ToString("x") + ".");
+            ValidatePrefabAttachment(value);
 
             value.HasOwnerDefinition = reader.ReadBool();
             if (value.HasOwnerDefinition)
@@ -364,6 +376,16 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                 value.UpgradeRight = unchecked((uint)reader.ReadInt());
             }
             return value;
+        }
+
+        private static void ValidatePrefabAttachment(ObjectToolDefinitionIntent value)
+        {
+            if (string.IsNullOrEmpty(value.AttachedPrefabName)) return;
+            if (value.Kind != ObjectToolDefinitionKind.Object || value.PrefabIsNull ||
+                value.Attached.Kind != PortableEntityKind.None ||
+                (value.CreationFlags & AttachCreationFlag) == 0)
+                throw new ProtocolException(
+                    "A prefab-local attachment must be an attached object definition.");
         }
 
         private static void WriteObject(NetworkWriter writer, ObjectDefinitionIntent value)

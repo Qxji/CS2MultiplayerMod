@@ -13,6 +13,20 @@ namespace CS2MultiplayerMod.Core.Session
         /// </summary>
         public bool KickPlayer(int playerId)
         {
+            return RemovePlayer(playerId, false);
+        }
+
+        /// <summary>
+        /// Host-only removal that also blocks the client's address from reconnecting
+        /// until the current hosting session ends.
+        /// </summary>
+        public bool BanPlayer(int playerId)
+        {
+            return RemovePlayer(playerId, true);
+        }
+
+        private bool RemovePlayer(int playerId, bool ban)
+        {
             if (Role != SessionRole.Host || Status != SessionStatus.Connected ||
                 playerId <= 0 || playerId == LocalPlayerId || _transport == null)
                 return false;
@@ -28,12 +42,17 @@ namespace CS2MultiplayerMod.Core.Session
                 }
             }
             if (selected == null) return false;
+            if (ban && string.IsNullOrEmpty(selected.RemoteAddress)) return false;
 
-            const string reason = "The host removed you from this multiplayer session.";
+            if (ban) _hostBannedAddresses.Add(selected.RemoteAddress);
+
+            string reason = ban
+                ? "The host banned you for the rest of this hosting session."
+                : "The host removed you from this multiplayer session.";
             _administrativeRemovals.Add(selected.Connection.Value);
             SendTo(selected.Connection, new DisconnectNoticeMessage(reason));
             _transport.DisconnectAfterFlush(selected.Connection);
-            _log.Info("Host removed " + selected + " from the session.");
+            _log.Info("Host " + (ban ? "banned " : "removed ") + selected + " from the session.");
             return true;
         }
 

@@ -133,6 +133,7 @@ namespace CS2MultiplayerMod.Core.Session
 
             _peers.Clear();
             _administrativeRemovals.Clear();
+            _hostBannedAddresses.Clear();
             _blobs.Clear();
             _blobTransferIds.Clear();
             ClearBlobProgress();

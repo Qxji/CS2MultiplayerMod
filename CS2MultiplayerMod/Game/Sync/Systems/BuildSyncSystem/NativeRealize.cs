@@ -233,7 +233,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool TryFindUnsafeSimulationReference(ObjectToolOperationCommand command,
             out string prefabName)
         {
-            bool allowSpecializedRoot = IsSpecializedIndustryPlacement(command);
+            bool specializedPlacement = IsSpecializedIndustryPlacement(command);
             for (int i = 0; i < command.Definitions.Length; i++)
             {
                 ObjectToolDefinitionIntent definition = command.Definitions[i];
@@ -247,7 +247,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                          definition.Original.Kind == PortableEntityKind.None &&
                          EntityManager.HasComponent<SpawnableBuildingData>(prefab) &&
                          !EntityManager.HasComponent<SignatureBuildingData>(prefab) &&
-                         !(i == command.RootIndex && allowSpecializedRoot)))
+                         !(specializedPlacement &&
+                           IsAllowedSpecializedSpawnable(command, i, prefab))))
                     {
                         prefabName = definition.PrefabName;
                         return true;
@@ -255,6 +256,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
 
                 if (IsMovingPrefabName(definition.SubPrefabName, out prefabName) ||
+                    IsMovingPrefabName(definition.AttachedPrefabName, out prefabName) ||
                     (definition.HasOwnerDefinition &&
                      IsMovingPrefabName(definition.OwnerDefinitionPrefabName, out prefabName)) ||
                     IsMovingPortableReference(definition.Original, out prefabName) ||
@@ -273,10 +275,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         /// <summary>
-        /// A specialized-industry main building can use the same spawnable prefab machinery as
-        /// zone growth, but its object-tool transaction is distinguishable: a newly-created root
-        /// owns an extractor/storage area declared by that root prefab. Require that complete
-        /// contract before exempting only the root from the generic growable rejection.
+        /// A specialized-industry placement is distinguishable from arbitrary growable creation:
+        /// its new root owns a closed extractor/storage area declared by that root prefab. Some
+        /// facilities use a placeholder root plus one level-one spawnable building attached to the
+        /// placeholder prefab; older/direct variants use a spawnable root. Require the complete
+        /// graph before exempting either exact form from the generic growable rejection.
         /// </summary>
         private bool IsSpecializedIndustryPlacement(ObjectToolOperationCommand command)
         {
@@ -286,7 +289,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (root == null || root.Kind != ObjectToolDefinitionKind.Object || root.PrefabIsNull ||
                 root.Original.Kind != PortableEntityKind.None ||
                 root.Owner.Kind != PortableEntityKind.None ||
-                root.Attached.Kind != PortableEntityKind.None) return false;
+                root.Attached.Kind != PortableEntityKind.None ||
+                !string.IsNullOrEmpty(root.AttachedPrefabName)) return false;
 
             CreationFlags rootFlags = (CreationFlags)root.CreationFlags;
             if ((rootFlags & (CreationFlags.Delete | CreationFlags.Relocate |
@@ -294,9 +298,31 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                               CreationFlags.Permanent)) != 0) return false;
 
             Entity rootPrefab;
-            if (!_prefabIndex.TryResolve(root.PrefabName, out rootPrefab) ||
-                !EntityManager.HasComponent<SpawnableBuildingData>(rootPrefab) ||
-                EntityManager.HasComponent<SignatureBuildingData>(rootPrefab)) return false;
+            if (!_prefabIndex.TryResolve(root.PrefabName, out rootPrefab)) return false;
+            bool directSpawnable =
+                EntityManager.HasComponent<SpawnableBuildingData>(rootPrefab) &&
+                !EntityManager.HasComponent<SignatureBuildingData>(rootPrefab);
+            bool placeholder =
+                EntityManager.HasComponent<PlaceholderBuildingData>(rootPrefab) &&
+                EntityManager.HasComponent<BuildingData>(rootPrefab);
+            if (!directSpawnable && !placeholder) return false;
+
+            bool hasPlaceholderAttachment = false;
+            if (placeholder)
+            {
+                for (int i = 0; i < command.Definitions.Length; i++)
+                {
+                    Entity candidatePrefab;
+                    if (i != command.RootIndex &&
+                        TryGetSpecializedPlaceholderAttachment(command, i, root,
+                            rootPrefab, out candidatePrefab))
+                    {
+                        hasPlaceholderAttachment = true;
+                        break;
+                    }
+                }
+                if (!hasPlaceholderAttachment) return false;
+            }
 
             for (int i = 0; i < command.Definitions.Length; i++)
             {
@@ -307,8 +333,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     area.Original.Kind != PortableEntityKind.None ||
                     area.Owner.Kind != PortableEntityKind.None ||
                     area.Attached.Kind != PortableEntityKind.None ||
+                    !string.IsNullOrEmpty(area.AttachedPrefabName) ||
                     area.CreationFlags != 0 || area.AreaNodes == null ||
-                    area.AreaNodes.Length < 3) continue;
+                    !IsClosedAreaNodeRing(area.AreaNodes)) continue;
 
                 float3 rootPosition = new float3(root.Object.PosX, root.Object.PosY,
                     root.Object.PosZ);
@@ -329,6 +356,109 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return true;
             }
             return false;
+        }
+
+        private bool IsAllowedSpecializedSpawnable(ObjectToolOperationCommand command,
+            int definitionIndex, Entity definitionPrefab)
+        {
+            ObjectToolDefinitionIntent root = command.Definitions[command.RootIndex];
+            Entity rootPrefab;
+            if (!_prefabIndex.TryResolve(root.PrefabName, out rootPrefab)) return false;
+            if (definitionIndex == command.RootIndex)
+                return definitionPrefab == rootPrefab &&
+                       EntityManager.HasComponent<SpawnableBuildingData>(rootPrefab);
+
+            Entity attachmentPrefab;
+            return TryGetSpecializedPlaceholderAttachment(command, definitionIndex,
+                       root, rootPrefab, out attachmentPrefab) &&
+                   attachmentPrefab == definitionPrefab;
+        }
+
+        private bool TryGetSpecializedPlaceholderAttachment(
+            ObjectToolOperationCommand command, int definitionIndex,
+            ObjectToolDefinitionIntent root, Entity rootPrefab, out Entity attachmentPrefab)
+        {
+            attachmentPrefab = Entity.Null;
+            if (definitionIndex < 0 || definitionIndex >= command.Definitions.Length ||
+                rootPrefab == Entity.Null ||
+                !EntityManager.HasComponent<PlaceholderBuildingData>(rootPrefab))
+                return false;
+
+            ObjectToolDefinitionIntent definition =
+                command.Definitions[definitionIndex];
+            if (definition == null ||
+                definition.Kind != ObjectToolDefinitionKind.Object ||
+                definition.PrefabIsNull ||
+                definition.Original.Kind != PortableEntityKind.None ||
+                definition.Owner.Kind != PortableEntityKind.None ||
+                definition.Attached.Kind != PortableEntityKind.None ||
+                definition.HasOwnerDefinition ||
+                definition.AttachedPrefabName != root.PrefabName ||
+                definition.CreationFlags != (uint)CreationFlags.Attach ||
+                !_prefabIndex.TryResolve(definition.PrefabName,
+                    out attachmentPrefab))
+                return false;
+
+            return IsCompatiblePlaceholderAttachment(definition,
+                attachmentPrefab, rootPrefab);
+        }
+
+        private bool IsCompatiblePlaceholderAttachment(
+            ObjectToolDefinitionIntent definition, Entity attachmentPrefab,
+            Entity placeholderPrefab)
+        {
+            if (definition == null ||
+                definition.Kind != ObjectToolDefinitionKind.Object ||
+                ((CreationFlags)definition.CreationFlags &
+                 CreationFlags.Attach) == 0 ||
+                attachmentPrefab == Entity.Null ||
+                placeholderPrefab == Entity.Null ||
+                !EntityManager.HasComponent<PrefabData>(attachmentPrefab) ||
+                !EntityManager.HasComponent<ObjectData>(attachmentPrefab) ||
+                !EntityManager.HasComponent<SpawnableBuildingData>(attachmentPrefab) ||
+                !EntityManager.HasComponent<BuildingData>(attachmentPrefab) ||
+                !EntityManager.HasComponent<PrefabData>(placeholderPrefab) ||
+                !EntityManager.HasComponent<ObjectData>(placeholderPrefab) ||
+                !EntityManager.HasComponent<PlaceholderBuildingData>(placeholderPrefab) ||
+                !EntityManager.HasComponent<BuildingData>(placeholderPrefab))
+                return false;
+
+            SpawnableBuildingData attachment =
+                EntityManager.GetComponentData<SpawnableBuildingData>(
+                    attachmentPrefab);
+            PlaceholderBuildingData placeholder =
+                EntityManager.GetComponentData<PlaceholderBuildingData>(
+                    placeholderPrefab);
+            if (attachment.m_Level != 1 ||
+                attachment.m_ZonePrefab == Entity.Null ||
+                placeholder.m_ZonePrefab == Entity.Null ||
+                !EntityManager.HasComponent<ZoneData>(attachment.m_ZonePrefab) ||
+                !EntityManager.HasComponent<ZoneData>(placeholder.m_ZonePrefab))
+                return false;
+
+            ZoneData attachmentZone =
+                EntityManager.GetComponentData<ZoneData>(attachment.m_ZonePrefab);
+            ZoneData placeholderZone =
+                EntityManager.GetComponentData<ZoneData>(placeholder.m_ZonePrefab);
+            if (!attachmentZone.m_ZoneType.Equals(
+                    placeholderZone.m_ZoneType))
+                return false;
+
+            BuildingData attachmentBuilding =
+                EntityManager.GetComponentData<BuildingData>(attachmentPrefab);
+            BuildingData placeholderBuilding =
+                EntityManager.GetComponentData<BuildingData>(placeholderPrefab);
+            return math.all(attachmentBuilding.m_LotSize <=
+                            placeholderBuilding.m_LotSize);
+        }
+
+        private static bool IsClosedAreaNodeRing(ObjectAreaNodeIntent[] nodes)
+        {
+            if (nodes == null || nodes.Length < 4 ||
+                nodes.Length > ObjectToolOperationCommand.MaxAreaNodesPerDefinition) return false;
+            ObjectAreaNodeIntent first = nodes[0];
+            ObjectAreaNodeIntent last = nodes[nodes.Length - 1];
+            return first.X == last.X && first.Y == last.Y && first.Z == last.Z;
         }
 
         private bool PrefabDeclaresOwnedArea(Entity objectPrefab, Entity areaPrefab)
@@ -471,6 +601,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 {
                     reason = "original, owner, or attachment is not present";
                     return false;
+                }
+                if (!string.IsNullOrEmpty(definition.AttachedPrefabName))
+                {
+                    Entity attachedPrefab;
+                    if (target.Attached != Entity.Null ||
+                        !_prefabIndex.TryResolve(definition.AttachedPrefabName,
+                            out attachedPrefab) ||
+                        !IsCompatiblePlaceholderAttachment(definition,
+                            target.Prefab, attachedPrefab))
+                    {
+                        reason = "prefab-local attachment is unavailable or incompatible";
+                        return false;
+                    }
+                    target.Attached = attachedPrefab;
                 }
                 if (definition.PrefabIsNull && target.Original == Entity.Null)
                 {
