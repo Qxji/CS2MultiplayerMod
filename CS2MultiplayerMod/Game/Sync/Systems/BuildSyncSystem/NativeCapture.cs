@@ -1040,7 +1040,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             value = new ObjectCoursePositionIntent();
             PortableEntityRef target;
-            if (!TryCapturePortableRef(data.m_Entity, out target)) return false;
+            if (!TryCaptureCourseTarget(data.m_Entity, out target)) return false;
             value.Entity = target;
             value.PosX = data.m_Position.x; value.PosY = data.m_Position.y;
             value.PosZ = data.m_Position.z;
@@ -1053,6 +1053,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             value.Flags = (uint)data.m_Flags;
             value.ParentMesh = data.m_ParentMesh;
             return true;
+        }
+
+        private bool TryCaptureCourseTarget(Entity entity, out PortableEntityRef value)
+        {
+            value = new PortableEntityRef { Kind = PortableEntityKind.None };
+            // Course endpoints in a standing object preview can point at the previous preview's
+            // Temp nodes. Those entity handles only exist on this machine. Follow their live
+            // original when there is one; a preview-only endpoint must be regenerated from the
+            // transmitted course position, just as it is for a fresh native sub-network.
+            const int maxTempDepth = 16;
+            Entity stable = entity;
+            for (int depth = 0; stable != Entity.Null && depth < maxTempDepth; depth++)
+            {
+                if (!EntityManager.Exists(stable)) return false;
+                if (!EntityManager.HasComponent<Temp>(stable))
+                {
+                    if (EntityManager.HasComponent<Deleted>(stable)) return false;
+                    return TryCapturePortableRef(stable, out value);
+                }
+
+                Entity original = EntityManager.GetComponentData<Temp>(stable).m_Original;
+                if (original == stable) return false;
+                stable = original;
+            }
+
+            return stable == Entity.Null;
         }
 
         private bool TryCapturePortableRef(Entity entity, out PortableEntityRef value)

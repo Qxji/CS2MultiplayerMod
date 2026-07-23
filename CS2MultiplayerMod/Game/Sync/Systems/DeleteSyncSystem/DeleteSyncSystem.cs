@@ -72,7 +72,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
 
             // Top-level objects being deleted this frame. Temp excludes tool previews;
-            // Owner excludes sub-objects (they die with their owner on both machines).
+            // Owner keeps the dependent object graph off the wire because realization traverses
+            // InstalledUpgrade/SubObject ownership and deletes that graph with this single root.
             // Vehicles/creatures are per-sim churn each machine despawns on its own; a
             // replicated despawn can only mis-match remotely (the two sims never agree
             // on where a vehicle is), so they stay off the wire entirely.

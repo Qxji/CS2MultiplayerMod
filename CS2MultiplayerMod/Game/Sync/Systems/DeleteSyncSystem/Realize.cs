@@ -31,7 +31,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (targets.Count == 0) return;
 
             float radiusSq = ObjectMatchRadius * ObjectMatchRadius;
-            int deleted = 0, waiting = 0, expired = 0;
+            int deleted = 0, deletedOwned = 0, waiting = 0, expired = 0;
 
             NativeArray<Entity> entities = _liveObjects.ToEntityArray(Allocator.Temp);
             int n = entities.Length;
@@ -83,8 +83,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
                     if (best != Entity.Null)
                     {
+                        List<Entity> ownedDeleteGraph;
                         string invalidReason;
-                        if (!ValidateObjectDeleteGraph(best, out invalidReason))
+                        if (!TryCollectObjectDeleteGraph(best, out ownedDeleteGraph,
+                                out invalidReason))
                         {
                             if (now < commands[t].deadline)
                             {
@@ -117,9 +119,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         // sign only drops its effect if the parent re-selects its composition now.
                         Entity attachParent = NetAttachment.GetNetParent(EntityManager, best);
 
+                        // Object-shaped service extensions are not removed merely because their
+                        // building receives Deleted. Delete owned descendants deepest-first so the
+                        // normal reference and sub-element systems can remove every upgrade,
+                        // extension network, and area without leaving an orphan behind.
+                        for (int i = ownedDeleteGraph.Count - 1; i >= 0; i--)
+                            EntityManager.AddComponent<Deleted>(ownedDeleteGraph[i]);
                         EntityManager.AddComponent<Deleted>(best);
                         if (attachParent != Entity.Null) NetAttachment.TagParentUpdated(EntityManager, attachParent);
                         taken.Add(best);
+                        deletedOwned += ownedDeleteGraph.Count;
                         deleted++;
                     }
                     else if (now < commands[t].deadline)
@@ -140,39 +149,77 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             if (deleted > 0 || waiting > 0 || expired > 0)
-                Mod.Verbose("[MP] DeleteSync: removed " + deleted + " object(s); " + waiting +
+                Mod.Verbose("[MP] DeleteSync: removed " + deleted + " object root(s) and " +
+                             deletedOwned + " owned upgrade/subobject(s); " + waiting +
                              " awaiting a local match, " + expired + " gave up (already gone, or geometry diverged).");
         }
 
-        private bool ValidateObjectDeleteGraph(Entity root, out string reason)
+        private bool TryCollectObjectDeleteGraph(Entity root, out List<Entity> ownedObjects,
+            out string reason)
         {
-            if (!EntityManager.Exists(root) || EntityManager.HasComponent<Deleted>(root) ||
-                EntityManager.HasComponent<Temp>(root))
+            ownedObjects = new List<Entity>();
+            var visited = new HashSet<Entity>();
+            var pending = new List<Entity> { root };
+
+            while (pending.Count > 0)
             {
-                reason = "root is no longer live";
-                return false;
+                int last = pending.Count - 1;
+                Entity owner = pending[last];
+                pending.RemoveAt(last);
+                if (!visited.Add(owner)) continue;
+                if (!EntityManager.Exists(owner) || EntityManager.HasComponent<Deleted>(owner) ||
+                    EntityManager.HasComponent<Temp>(owner))
+                {
+                    reason = owner == root
+                        ? "root is no longer live"
+                        : "owned object is no longer live";
+                    return false;
+                }
+                if (owner != root) ownedObjects.Add(owner);
+
+                if (EntityManager.HasBuffer<InstalledUpgrade>(owner))
+                {
+                    DynamicBuffer<InstalledUpgrade> upgrades =
+                        EntityManager.GetBuffer<InstalledUpgrade>(owner, isReadOnly: true);
+                    for (int i = 0; i < upgrades.Length; i++)
+                    {
+                        Entity child = upgrades[i].m_Upgrade;
+                        if (!ValidateOwnedDeleteElement(owner, child, out reason)) return false;
+                        pending.Add(child);
+                    }
+                }
+                if (EntityManager.HasBuffer<global::Game.Objects.SubObject>(owner))
+                {
+                    DynamicBuffer<global::Game.Objects.SubObject> children =
+                        EntityManager.GetBuffer<global::Game.Objects.SubObject>(owner,
+                            isReadOnly: true);
+                    for (int i = 0; i < children.Length; i++)
+                    {
+                        Entity child = children[i].m_SubObject;
+                        if (!ValidateOwnedDeleteElement(owner, child, out reason)) return false;
+                        pending.Add(child);
+                    }
+                }
+                if (EntityManager.HasBuffer<global::Game.Net.SubNet>(owner))
+                {
+                    DynamicBuffer<global::Game.Net.SubNet> children =
+                        EntityManager.GetBuffer<global::Game.Net.SubNet>(owner,
+                            isReadOnly: true);
+                    for (int i = 0; i < children.Length; i++)
+                        if (!ValidateOwnedDeleteElement(owner, children[i].m_SubNet,
+                                out reason)) return false;
+                }
+                if (EntityManager.HasBuffer<global::Game.Areas.SubArea>(owner))
+                {
+                    DynamicBuffer<global::Game.Areas.SubArea> children =
+                        EntityManager.GetBuffer<global::Game.Areas.SubArea>(owner,
+                            isReadOnly: true);
+                    for (int i = 0; i < children.Length; i++)
+                        if (!ValidateOwnedDeleteElement(owner, children[i].m_Area,
+                                out reason)) return false;
+                }
             }
-            if (EntityManager.HasBuffer<global::Game.Objects.SubObject>(root))
-            {
-                DynamicBuffer<global::Game.Objects.SubObject> children =
-                    EntityManager.GetBuffer<global::Game.Objects.SubObject>(root, isReadOnly: true);
-                for (int i = 0; i < children.Length; i++)
-                    if (!ValidateOwnedDeleteElement(root, children[i].m_SubObject, out reason)) return false;
-            }
-            if (EntityManager.HasBuffer<global::Game.Net.SubNet>(root))
-            {
-                DynamicBuffer<global::Game.Net.SubNet> children =
-                    EntityManager.GetBuffer<global::Game.Net.SubNet>(root, isReadOnly: true);
-                for (int i = 0; i < children.Length; i++)
-                    if (!ValidateOwnedDeleteElement(root, children[i].m_SubNet, out reason)) return false;
-            }
-            if (EntityManager.HasBuffer<global::Game.Areas.SubArea>(root))
-            {
-                DynamicBuffer<global::Game.Areas.SubArea> children =
-                    EntityManager.GetBuffer<global::Game.Areas.SubArea>(root, isReadOnly: true);
-                for (int i = 0; i < children.Length; i++)
-                    if (!ValidateOwnedDeleteElement(root, children[i].m_Area, out reason)) return false;
-            }
+
             reason = null;
             return true;
         }

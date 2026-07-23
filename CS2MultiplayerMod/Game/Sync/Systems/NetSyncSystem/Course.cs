@@ -196,21 +196,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         /// <summary>
-        /// True when <paramref name="node"/> has no live (existing, non-<see cref="Deleted"/>) connected
-        /// edge - i.e. a bulldoze this frame is tearing it down. See the crash guard on
-        /// <see cref="FindNodeAt"/>. A node with no <see cref="ConnectedEdge"/> buffer at all is left
-        /// reusable (it isn't attached to a being-deleted edge, so it can't trigger that crash).
+        /// True when <paramref name="node"/> had connected edges but none remains live (existing and
+        /// non-<see cref="Deleted"/>) - i.e. a bulldoze this frame is tearing it down. See the crash
+        /// guard on <see cref="FindNodeAt"/>. A missing or empty <see cref="ConnectedEdge"/> buffer
+        /// carries no teardown evidence and remains reusable; in particular, an unused building rail
+        /// connector is represented by an owned node with an empty buffer.
         /// </summary>
         private bool IsNodeBeingDeleted(Entity node)
         {
             if (!EntityManager.HasBuffer<ConnectedEdge>(node)) return false;
             DynamicBuffer<ConnectedEdge> edges = EntityManager.GetBuffer<ConnectedEdge>(node, isReadOnly: true);
+            if (edges.Length == 0) return false;
             for (int i = 0; i < edges.Length; i++)
             {
                 Entity e = edges[i].m_Edge;
                 if (EntityManager.Exists(e) && !EntityManager.HasComponent<Deleted>(e)) return false;
             }
-            return true; // empty buffer or every connected edge gone/Deleted -> being torn down
+            return true; // every previously connected edge is gone/Deleted -> being torn down
         }
 
         /// <summary>

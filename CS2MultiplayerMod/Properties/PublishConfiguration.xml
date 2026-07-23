@@ -30,16 +30,21 @@ Host-authoritative and friend-focused: set a password, share your IP-address, an
 	<!--Change log for new version. Single line or multi line. Supports minimal markdown subset-->
 	<ChangeLog>
 		# Version 0.1.4 is now available!
-
+		
+		Sorry for the delay, we got deep into the code and fixed a lot of issues.
 		This update focuses on synchronization improvements, crash fixes, and a smoother multiplayer experience.
 
 		## Bug Fixes
 
 		* Fixed large intersections being placed incorrectly.
 		* Fixed missing details when placing streets.
-		* Fixed buildings incorrectly displaying “Not connected” due to pathway issues.
-		* Added a synchronization screen for the host when joining or resyncing, helping both players maintain the same world state.
+		* Fixed public transportation lines not syncing at all.
+		* Fixed bus stations not syncing correctly, making it impossible to create bus lines.
+		* Fixed buildings incorrectly displaying “Not connected” due to pathway issues after Upgrading them or adding Extensions.
+		* Fixed railways not correctly adding to Trainstations, making it impossible to create train lines.
+		
 		* Fixed special industries not syncing correctly and potentially causing crashes.
+		* Added a synchronization screen for the host when joining or resyncing, helping both players maintain the same world state.
 		* Reviewed the submitted crash logs, identified their causes, and implemented fixes.
 
 		## Quality-of-Life Improvements
