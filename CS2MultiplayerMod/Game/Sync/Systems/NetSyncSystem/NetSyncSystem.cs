@@ -180,9 +180,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private readonly List<Entity> _isolatedLocalTemps = new List<Entity>();
         private readonly List<Entity> _protectedRemoteNetTemps = new List<Entity>();
         private readonly List<Entity> _committingRemoteNetTemps = new List<Entity>();
-        // Rejected native transactions are only tagged Deleted by the game's clear path; actual
-        // destruction is deferred. Keep their exact entity identities until none remains Temp so a
-        // retry can never overlap the stale native ownership/connectivity graph.
+        // Rejected uncommitted transactions are only tagged Deleted by the clear path, while a
+        // committed transaction that misses its drain window must remain untouched. Keep either
+        // graph's exact identities until none remains Temp so recovery/retry can never overlap stale
+        // native ownership/connectivity state.
         private readonly List<Entity> _invalidatedRemoteTemps = new List<Entity>();
         private readonly List<Entity> _isolatedLocalBrushTemps = new List<Entity>();
         private bool _clearLocalNetIsolationAfterBarrier;
@@ -504,11 +505,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             // Never leave an isolated remote Temp transaction behind for a later local click. Which
             // side is enabled depends on whether this frame had protected the remote batch.
+            // Uncommitted work is safe to clear. Once an apply pass has been scheduled, however,
+            // deleting its graph manually can race native apply/cleanup jobs; quarantine it and wait
+            // for its exact entities to leave Temp state instead.
             if (_protectedRemoteNetTemps.Count > 0)
             {
                 TrackInvalidatedTemps(_protectedRemoteNetTemps);
-                ClearTrackedTemps(_protectedRemoteNetTemps, clearPreview: true);
-                _protectedRemoteNetTemps.Clear();
+                if (_awaitingDrain)
+                    ReleaseTrackedTemps(_protectedRemoteNetTemps);
+                else
+                {
+                    ClearTrackedTemps(_protectedRemoteNetTemps, clearPreview: true);
+                    _protectedRemoteNetTemps.Clear();
+                }
             }
             else if (_pendingApply)
             {
@@ -518,8 +527,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (_committingRemoteNetTemps.Count > 0)
             {
                 TrackInvalidatedTemps(_committingRemoteNetTemps);
-                ClearTrackedTemps(_committingRemoteNetTemps, clearPreview: true);
-                _committingRemoteNetTemps.Clear();
+                // Also removes a short-lived commit shield, if present. The entities themselves
+                // remain untouched so the already-scheduled native transaction can finish safely.
+                ReleaseTrackedTemps(_committingRemoteNetTemps);
             }
             ReleaseAllIsolation();
             SyncInbox.Clear(_incoming);

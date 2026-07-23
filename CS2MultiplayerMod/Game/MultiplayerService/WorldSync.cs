@@ -4,6 +4,7 @@ using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
+using CS2MultiplayerMod.Game.Sync.Systems.Net;
 using Game.Simulation;
 using Game.Tools;
 using Unity.Entities;
@@ -24,10 +25,14 @@ namespace CS2MultiplayerMod.Game
         private bool _worldSyncBarrierActive;
         private bool _worldSyncHadUsableWorld;
         private long _activeWorldSyncEpoch;
+        private bool _clientQuiescencePending;
+        private int _clientQuiescenceCleanFrames;
+        private long _clientQuiescedEpoch;
         private float _worldSyncResumeSpeed = 1f;
         private HostWorldSyncUiStage _hostWorldSyncUiStage;
         private string _hostWorldSyncJoiningName;
         private int _hostWorldSyncJoiningCount;
+        private const int RequiredClientQuiescenceFrames = 2;
 
         /// <summary>True while all gameplay traffic and local tools are quiesced for a snapshot.</summary>
         public bool WorldSyncBarrierActive => _worldSyncBarrierActive;
@@ -118,14 +123,19 @@ namespace CS2MultiplayerMod.Game
                     _activeWorldSyncEpoch = epoch;
                     _worldSyncResumeSpeed = SanitizeSpeed(resumeSpeed);
                     _worldSyncBarrierActive = true;
+                    _clientQuiescencePending = true;
+                    _clientQuiescenceCleanFrames = 0;
+                    _clientQuiescedEpoch = 0;
                     SyncInbox.DrainAll();
                     SetPhase(ClientWorldPhase.WaitingForMap);
                     _log.Info("[MP] World sync epoch " + epoch +
-                              " began; local gameplay is quiesced before snapshot transfer.");
-                    Diagnostics.FlightRecorder.Note("world-sync client quiesced epoch=" + epoch);
+                              " began; local gameplay is paused while native transactions drain.");
+                    Diagnostics.FlightRecorder.Note(
+                        "world-sync client draining native work epoch=" + epoch);
                 }
                 MaintainWorldSyncBarrier();
-                _session.SendWorldSyncStage(epoch, WorldSyncStage.Quiesced);
+                if (_clientQuiescedEpoch == epoch)
+                    _session.SendWorldSyncStage(epoch, WorldSyncStage.Quiesced);
                 return;
             }
 
@@ -187,6 +197,48 @@ namespace CS2MultiplayerMod.Game
             }
         }
 
+        /// <summary>
+        /// A client acknowledges Begin only after its already-scheduled native transaction has
+        /// actually left Temp state. Loading a replacement world while that graph is still being
+        /// applied would recreate the same cleanup race the distributed barrier is meant to close.
+        /// </summary>
+        private void PumpClientWorldSyncQuiescence()
+        {
+            if (!_clientQuiescencePending || !_worldSyncBarrierActive ||
+                _session.Role != SessionRole.Client || _activeWorldSyncEpoch <= 0)
+                return;
+
+            bool quiescent = false;
+            try
+            {
+                NetSyncSystem netSync = _currentWorld != null
+                    ? _currentWorld.GetExistingSystemManaged<NetSyncSystem>()
+                    : null;
+                quiescent = netSync == null || netSync.IsRecoveryQuiescent;
+            }
+            catch
+            {
+                // A world is replaced only after this acknowledgement. Until then, inability to
+                // inspect its native pipeline is not evidence that the pipeline is safe.
+                quiescent = false;
+            }
+
+            if (!quiescent)
+            {
+                _clientQuiescenceCleanFrames = 0;
+                return;
+            }
+            if (++_clientQuiescenceCleanFrames < RequiredClientQuiescenceFrames) return;
+
+            long epoch = _activeWorldSyncEpoch;
+            _clientQuiescencePending = false;
+            _clientQuiescedEpoch = epoch;
+            _session.SendWorldSyncStage(epoch, WorldSyncStage.Quiesced);
+            _log.Info("[MP] World sync epoch " + epoch +
+                      ": local native transactions drained; quiescence acknowledged.");
+            Diagnostics.FlightRecorder.Note("world-sync client quiesced epoch=" + epoch);
+        }
+
         private float ReadSimulationSpeed()
         {
             if (_currentWorld == null) return 1f;
@@ -205,6 +257,9 @@ namespace CS2MultiplayerMod.Game
             _worldSyncBarrierActive = false;
             _activeWorldSyncEpoch = 0;
             _worldSyncHadUsableWorld = false;
+            _clientQuiescencePending = false;
+            _clientQuiescenceCleanFrames = 0;
+            _clientQuiescedEpoch = 0;
             _hostWorldSyncUiStage = HostWorldSyncUiStage.None;
             _hostWorldSyncJoiningName = null;
             _hostWorldSyncJoiningCount = 0;

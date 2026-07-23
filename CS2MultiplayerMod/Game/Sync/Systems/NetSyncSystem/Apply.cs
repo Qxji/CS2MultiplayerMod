@@ -18,8 +18,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// <summary>How long an armed batch may wait for its commit before it is discarded and re-queued.</summary>
         private const int ApplyWindowMs = 3000;
 
-        /// <summary>How long a committed batch's Temps may linger before they are force-cleared.</summary>
+        /// <summary>How long a committed batch's Temps may linger before recovery is requested.</summary>
         private const int DrainWindowMs = 3000;
+
+        /// <summary>
+        /// A wall-clock stall is not evidence that the native pipeline is stuck. Observe several
+        /// complete update frames before quarantining a committed graph.
+        /// </summary>
+        private const int MinimumDrainFramesBeforeRecovery = 8;
 
         /// <summary>
         /// Called by <see cref="SyncRealizeSystem"/> once per frame BEFORE any net-pipeline feeder
@@ -68,10 +74,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 return;
             }
 
-            // A rejected graph has only been tagged Deleted at this point. Unity's cleanup systems
-            // remove it later; rebuilding while it still exists is the native crash seen in the
-            // supplied host log. Pump cleanup and return for the whole frame, even when replay just
-            // became eligible, so generation happens on a subsequent frame.
+            // A rejected uncommitted graph may only be tagged Deleted, while a committed graph that
+            // missed its drain window is deliberately left untouched. In both cases, keep native
+            // work blocked until the exact tracked Temps disappear; rebuilding beside either graph
+            // can make the apply pipeline consume stale ownership/connectivity state.
             if (_invalidatedBatchDraining)
             {
                 PumpInvalidatedBatchDrain(allowReplay: true);
@@ -121,10 +127,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     if (completed != null) completed();
                     Diagnostics.FlightRecorder.Note("remote transaction drain completed");
                 }
-                else if (System.Environment.TickCount - _drainArmTick > DrainWindowMs)
+                else if (_drainFrames >= MinimumDrainFramesBeforeRecovery &&
+                         System.Environment.TickCount - _drainArmTick > DrainWindowMs)
                 {
                     TrackInvalidatedTemps(_committingRemoteNetTemps);
-                    ClearTrackedTemps(_committingRemoteNetTemps, clearPreview: true);
+                    int quarantinedCount = _committingRemoteNetTemps.Count;
+                    // Apply has already been scheduled for this graph. Tagging its entities Deleted
+                    // here races the native apply/cleanup jobs and was the immediate precursor to a
+                    // process crash. Leave the graph intact, keep its identities quarantined, and
+                    // let the native pipeline drain it before recovery or any later transaction.
+                    ReleaseTrackedTemps(_protectedRemoteNetTemps);
                     _committingRemoteNetTemps.Clear();
                     _committingNetConstructionCharge = 0;
                     _committingNetConstructionChargeCourses = 0;
@@ -136,10 +148,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     _invalidatedDrainArmTick = System.Environment.TickCount;
                     _invalidatedCleanFrames = 0;
                     _invalidatedDrainTimedOut = false;
-                    Mod.log.Warn("[MP] NetApply: isolated remote commit did not drain; " +
-                                 "further native work is blocked until its Temps are gone.");
+                    Mod.log.Warn("[MP] NetApply: isolated remote commit remained Temp after " +
+                                 _drainFrames + " frames (tracked=" + quarantinedCount +
+                                 "); quarantined without destructive cleanup and requesting " +
+                                 "world recovery.");
                     Diagnostics.FlightRecorder.Note(
-                        "net isolated commit did not drain; waiting for temp destruction");
+                        "net isolated commit quarantined frames=" + _drainFrames +
+                        " tracked=" + quarantinedCount);
                     SyncInbox.RequestResync("remote transaction failed to drain");
                 }
             }
@@ -160,7 +175,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         public bool IsCommitBusy => _pendingApply || _awaitingDrain || _invalidatedBatchDraining;
 
         /// <summary>
-        /// Host recovery may take its save only after no armed/committing/rejected remote native
+        /// Host recovery may take its save only after no armed/committing/quarantined remote native
         /// graph remains. Deleted-but-not-destroyed Temps are intentionally still considered live.
         /// </summary>
         public bool IsRecoveryQuiescent =>
@@ -575,11 +590,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 {
                     _invalidatedDrainTimedOut = true;
                     _replayAfterInvalidatedDrain = null;
-                    Mod.log.Error("[MP] NetApply: rejected native transaction did not leave Temp " +
+                    Mod.log.Error("[MP] NetApply: quarantined native transaction did not leave Temp " +
                                   "state; blocking further native work and requesting world recovery.");
                     Diagnostics.FlightRecorder.Note(
-                        "invalidated net temps failed to drain; native work remains blocked");
-                    SyncInbox.RequestResync("rejected native transaction failed to drain");
+                        "quarantined net temps failed to drain; native work remains blocked");
+                    SyncInbox.RequestResync("quarantined native transaction failed to drain");
                 }
                 return;
             }
@@ -839,6 +854,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
                     members.Add(entity);
                 }
+                HashSet<Entity> enabledTransactionConnections =
+                    CollectEnabledTransactionConnections(members);
 
                 int objectRoots = 0;
                 int netStructures = 0;
@@ -875,10 +892,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
                     if (isNode || isEdge)
                     {
-                        if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge, out reason))
+                        if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge,
+                                enabledTransactionConnections, out reason))
                             return false;
                         if (isNode && !ValidateTempNode(entity, temp, out reason)) return false;
-                        if (isEdge && !ValidateTempEdge(entity, temp, members, out reason)) return false;
+                        if (isEdge && !ValidateTempEdge(entity, temp, members,
+                                enabledTransactionConnections, out reason)) return false;
                     }
 
                     if (isArea && !ValidateAreaEntity(entity, temp, out reason)) return false;
@@ -1072,6 +1091,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
                     members.Add(entity);
                 }
+                HashSet<Entity> enabledTransactionConnections =
+                    CollectEnabledTransactionConnections(members);
 
                 int structuralEntities = 0;
                 for (int i = 0; i < temps.Length; i++)
@@ -1090,9 +1111,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     if (isNode || isEdge) structuralEntities++;
 
                     if (!ValidateTransactionOwner(entity, members, out reason)) return false;
-                    if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge, out reason)) return false;
+                    if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge,
+                            enabledTransactionConnections, out reason)) return false;
                     if (isNode && !ValidateTempNode(entity, temp, out reason)) return false;
-                    if (isEdge && !ValidateTempEdge(entity, temp, members, out reason)) return false;
+                    if (isEdge && !ValidateTempEdge(entity, temp, members,
+                            enabledTransactionConnections, out reason)) return false;
 
                     bool missingReplacementOriginal =
                         isEdge && (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) != 0 ||
@@ -1155,7 +1178,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private bool ValidateTransactionOriginal(Entity entity, Temp temp, bool isNode, bool isEdge,
-            out string reason)
+            HashSet<Entity> enabledTransactionConnections, out string reason)
         {
             reason = null;
             Entity original = temp.m_Original;
@@ -1166,10 +1189,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 reason = "a referenced original vanished between arm and commit";
                 return false;
             }
-            // Do not infer teardown from the original node's connected edges here. A valid
-            // split/replacement marks its old edges Deleted inside this same Temp transaction,
-            // which is indistinguishable from teardown until the transaction commits. The
-            // entity-level Deleted check above remains the authoritative stale-original guard.
+            // A valid split/replacement can mark every old edge Deleted inside this transaction.
+            // Treat that as safe only when the generated graph below supplies replacement
+            // connectivity; an unrelated teardown has no such enabled transaction edge.
             if (isNode)
             {
                 bool replacesEdge = (temp.m_Flags & TempFlags.Replace) != 0 &&
@@ -1177,6 +1199,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 if (!EntityManager.HasComponent<Node>(original) && !replacesEdge)
                 {
                     reason = "a generated node has an invalid original type";
+                    return false;
+                }
+                if (!replacesEdge && (temp.m_Flags & TempFlags.Delete) == 0 &&
+                    IsNodeBeingDeleted(original) &&
+                    !enabledTransactionConnections.Contains(entity))
+                {
+                    // A node whose complete old connectivity is being removed is safe only when
+                    // this same transaction supplies its replacement edge. Otherwise ApplyNetSystem
+                    // can consume the lingering node after its last real edge has vanished.
+                    reason = "a referenced original node is being torn down without replacement connectivity";
                     return false;
                 }
                 // GenerateNodesSystem deliberately gives a split node the original Edge and
@@ -1228,7 +1260,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private bool ValidateTempEdge(Entity entity, Temp temp, HashSet<Entity> members,
-            out string reason)
+            HashSet<Entity> enabledTransactionConnections, out string reason)
         {
             reason = null;
             if ((temp.m_Flags & TempFlags.Delete) != 0) return true;
@@ -1240,13 +1272,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
 
             Edge edge = EntityManager.GetComponentData<Edge>(entity);
-            if (!ValidateTempEndpoint(edge.m_Start, members, out reason) ||
-                !ValidateTempEndpoint(edge.m_End, members, out reason)) return false;
+            if (!ValidateTempEndpoint(edge.m_Start, members,
+                    enabledTransactionConnections, out reason) ||
+                !ValidateTempEndpoint(edge.m_End, members,
+                    enabledTransactionConnections, out reason)) return false;
 
             DynamicBuffer<ConnectedNode> nodes =
                 EntityManager.GetBuffer<ConnectedNode>(entity, isReadOnly: true);
             for (int i = 0; i < nodes.Length; i++)
-                if (!ValidateConnectedNodeForApply(nodes[i].m_Node, out reason)) return false;
+                if (!ValidateConnectedNodeForApply(nodes[i].m_Node,
+                        enabledTransactionConnections, out reason)) return false;
 
             if (temp.m_Original != Entity.Null &&
                 (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) == 0)
@@ -1266,7 +1301,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             return true;
         }
 
-        private bool ValidateTempEndpoint(Entity node, HashSet<Entity> members, out string reason)
+        private bool ValidateTempEndpoint(Entity node, HashSet<Entity> members,
+            HashSet<Entity> enabledTransactionConnections, out string reason)
         {
             if (node == Entity.Null || !members.Contains(node) || !EntityManager.Exists(node) ||
                 !EntityManager.HasComponent<Temp>(node) || !EntityManager.HasComponent<Node>(node) ||
@@ -1276,10 +1312,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 reason = "a generated edge endpoint is outside the enabled Temp transaction";
                 return false;
             }
-            return ValidateConnectedNodeForApply(node, out reason);
+            return ValidateConnectedNodeForApply(node, enabledTransactionConnections, out reason);
         }
 
-        private bool ValidateConnectedNodeForApply(Entity node, out string reason)
+        private bool ValidateConnectedNodeForApply(Entity node,
+            HashSet<Entity> enabledTransactionConnections,
+            out string reason)
         {
             reason = null;
             if (!EntityManager.Exists(node) || !EntityManager.HasComponent<Node>(node))
@@ -1302,7 +1340,50 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 reason = "a generated edge resolves to a node without connectivity data";
                 return false;
             }
+            if (IsNodeBeingDeleted(effective) &&
+                !enabledTransactionConnections.Contains(node) &&
+                !enabledTransactionConnections.Contains(effective))
+            {
+                reason = "a generated edge resolves to a node being torn down";
+                return false;
+            }
             return true;
+        }
+
+        private HashSet<Entity> CollectEnabledTransactionConnections(HashSet<Entity> members)
+        {
+            var result = new HashSet<Entity>();
+            if (members == null) return result;
+            foreach (Entity candidate in members)
+            {
+                if (!EntityManager.Exists(candidate) ||
+                    !EntityManager.HasComponent<Temp>(candidate) ||
+                    !EntityManager.HasComponent<Edge>(candidate) ||
+                    EntityManager.HasComponent<Deleted>(candidate) ||
+                    EntityManager.HasComponent<Disabled>(candidate))
+                    continue;
+
+                Temp edgeTemp = EntityManager.GetComponentData<Temp>(candidate);
+                if ((edgeTemp.m_Flags & TempFlags.Delete) != 0) continue;
+                Edge edge = EntityManager.GetComponentData<Edge>(candidate);
+                AddEffectiveTransactionConnection(result, edge.m_Start);
+                AddEffectiveTransactionConnection(result, edge.m_End);
+            }
+            return result;
+        }
+
+        private void AddEffectiveTransactionConnection(HashSet<Entity> connections, Entity node)
+        {
+            if (node == Entity.Null) return;
+            connections.Add(node);
+            if (!EntityManager.Exists(node) || !EntityManager.HasComponent<Temp>(node)) return;
+
+            Temp temp = EntityManager.GetComponentData<Temp>(node);
+            if (temp.m_Original != Entity.Null &&
+                (temp.m_Flags & (TempFlags.Delete | TempFlags.Replace)) == 0 &&
+                EntityManager.Exists(temp.m_Original) &&
+                EntityManager.HasComponent<Node>(temp.m_Original))
+                connections.Add(temp.m_Original);
         }
 
         private bool ValidateNetPrefabReference(Entity entity, out string reason)

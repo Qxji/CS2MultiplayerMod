@@ -44,6 +44,7 @@ namespace CS2MultiplayerMod.Game
             }
             PumpWorldPhase();
             MaintainWorldSyncBarrier();
+            PumpClientWorldSyncQuiescence();
         }
 
         /// <summary>
