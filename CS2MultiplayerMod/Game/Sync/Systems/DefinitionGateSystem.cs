@@ -8,7 +8,7 @@ using CS2MultiplayerMod.Game.Sync.Systems.Net;
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
-    /// Keeps freshly buffered local tool definitions out of an armed remote net transaction. Tool
+    /// Keeps freshly buffered local tool definitions out of an armed remote tool transaction. Tool
     /// definitions become visible only after <see cref="ToolOutputBarrier"/>; this system runs in
     /// that gap and removes non-Permanent local definitions while the remote batch is still waiting
     /// to materialise. Sync-created definitions carry Deleted from birth and are excluded by the
@@ -67,9 +67,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // preview; publish that cached graph before observing this frame's definitions,
                 // which describe the replacement preview generated after the click.
                 buildSync.ObserveLocalObjectToolOutput(definitions,
-                    !_netSync.HasArmedNetCommit);
+                    !_netSync.HasArmedToolCommit);
 
-                if (!_netSync.HasArmedNetCommit) return;
+                if (!_netSync.HasArmedToolCommit) return;
                 for (int i = 0; i < definitions.Length; i++)
                 {
                     CreationDefinition def =

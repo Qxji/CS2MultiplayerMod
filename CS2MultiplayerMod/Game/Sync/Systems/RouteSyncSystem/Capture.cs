@@ -13,6 +13,41 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     public partial class RouteSyncSystem
     {
+        /// <summary>
+        /// Treat routes already present when gameplay synchronization opens as world state, not as
+        /// local edits. A route whose graph is still initializing remains in the baseline set until
+        /// a complete snapshot can be read, preventing a freshly loaded world from echoing all of
+        /// its lines back as new commands.
+        /// </summary>
+        private void BaselineLiveRoutes()
+        {
+            _knownRoutes.Clear();
+            _nextRoutes.Clear();
+            _needsCreateCapture.Clear();
+            _baselinePendingRoutes.Clear();
+
+            NativeArray<Entity> entities = _liveRoutes.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                {
+                    RouteSnapshot snapshot;
+                    if (TryCaptureSnapshot(entities[i], out snapshot))
+                        _knownRoutes[entities[i]] = snapshot;
+                    else
+                        _baselinePendingRoutes.Add(entities[i]);
+                }
+            }
+            finally
+            {
+                entities.Dispose();
+            }
+
+            if (Mod.Service != null) _lastEditScanMs = Mod.Service.NowMs;
+            Diagnostics.FlightRecorder.Note("route baseline live=" + _knownRoutes.Count +
+                                              " pending=" + _baselinePendingRoutes.Count);
+        }
+
         private bool TryCaptureSnapshot(Entity route, out RouteSnapshot snapshot)
         {
             snapshot = default(RouteSnapshot);
@@ -154,7 +189,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     RouteSnapshot snapshot;
                     if (!TryCaptureSnapshot(entity, out snapshot))
                     {
-                        _needsCreateCapture.Add(entity);
+                        if (!_baselinePendingRoutes.Contains(entity))
+                            _needsCreateCapture.Add(entity);
+                        continue;
+                    }
+
+                    if (_baselinePendingRoutes.Remove(entity))
+                    {
+                        _needsCreateCapture.Remove(entity);
+                        _knownRoutes[entity] = snapshot;
+                        continue;
+                    }
+                    RouteSnapshot known;
+                    if (_knownRoutes.TryGetValue(entity, out known) &&
+                        SnapshotsEqual(known, snapshot))
+                    {
+                        _needsCreateCapture.Remove(entity);
                         continue;
                     }
                     _needsCreateCapture.Remove(entity);
@@ -218,6 +268,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         session.SendCommand(0, RouteDeleteCommand.Id, command.Encode());
                     }
                     _needsCreateCapture.Remove(entity);
+                    _baselinePendingRoutes.Remove(entity);
                     _knownRoutes.Remove(entity);
                 }
             }
@@ -235,6 +286,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 RouteKey("route", name, snapshot.RouteNumber, first), now);
             guarded |= _guard.Consume(
                 RouteShapeKey("route", name, snapshot.Waypoints), now);
+            guarded |= MatchesPendingCreate(name, snapshot.Waypoints);
             if (!guarded)
             {
                 var command = new RouteCreateCommand
@@ -254,6 +306,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                             snapshot.RouteNumber + ").");
             }
             _knownRoutes[entity] = snapshot;
+        }
+
+        private bool MatchesPendingCreate(string prefabName,
+            RouteWaypointIntent[] waypoints)
+        {
+            for (int i = 0; i < _pendingCreateMetadata.Count; i++)
+            {
+                PendingCreateMetadata pending = _pendingCreateMetadata[i];
+                if (string.Equals(pending.PrefabName, prefabName,
+                        StringComparison.Ordinal) &&
+                    WaypointsMatchIntent(waypoints, pending.Waypoints))
+                    return true;
+            }
+            return false;
         }
 
         private bool TryGetDeleteFallback(Entity entity, out float3 first,
@@ -314,8 +380,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return false;
             for (int i = 0; i < local.Length; i++)
             {
+                float waypointToleranceSq =
+                    string.IsNullOrEmpty(intent[i].StopPrefabName)
+                        ? 0.01f
+                        : StopMatchDistanceSq;
                 if (math.distancesq(WaypointPosition(local[i]),
-                        WaypointPosition(intent[i])) > 0.01f ||
+                        WaypointPosition(intent[i])) > waypointToleranceSq ||
                     !string.Equals(local[i].StopPrefabName,
                         intent[i].StopPrefabName, StringComparison.Ordinal) ||
                     !string.Equals(local[i].OwnerPrefabName,
@@ -367,6 +437,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _needsCreateCapture.RemoveWhere(entity =>
                     !EntityManager.Exists(entity) ||
                     EntityManager.HasComponent<Deleted>(entity));
+            if (_baselinePendingRoutes.Count != 0)
+                _baselinePendingRoutes.RemoveWhere(entity =>
+                    !EntityManager.Exists(entity) ||
+                    EntityManager.HasComponent<Deleted>(entity));
             _nextRoutes.Clear();
             NativeArray<Entity> entities = _liveRoutes.ToEntityArray(Allocator.Temp);
             try
@@ -380,6 +454,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         RouteSnapshot retained;
                         if (_knownRoutes.TryGetValue(entity, out retained))
                             _nextRoutes[entity] = retained;
+                        continue;
+                    }
+
+                    if (_pendingUpdateCommit != null &&
+                        _pendingUpdateCommit.Route == entity &&
+                        IsExpectedPendingUpdateState(snapshot, _pendingUpdateCommit))
+                    {
+                        RouteSnapshot retained;
+                        if (_knownRoutes.TryGetValue(entity, out retained))
+                            _nextRoutes[entity] = retained;
+                        continue;
+                    }
+
+                    if (_baselinePendingRoutes.Remove(entity))
+                    {
+                        _needsCreateCapture.Remove(entity);
+                        _nextRoutes[entity] = snapshot;
                         continue;
                     }
 
@@ -435,6 +526,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Dictionary<Entity, RouteSnapshot> swap = _knownRoutes;
             _knownRoutes = _nextRoutes;
             _nextRoutes = swap;
+        }
+
+        private static bool IsExpectedPendingUpdateState(RouteSnapshot snapshot,
+            PendingUpdateCommit pending)
+        {
+            bool expectedGraph =
+                WaypointsMatchIntent(snapshot.Waypoints, pending.Original.Waypoints) ||
+                WaypointsMatchIntent(snapshot.Waypoints, pending.Desired.Waypoints);
+            bool expectedCompletion =
+                snapshot.IsComplete == pending.Original.IsComplete ||
+                snapshot.IsComplete == pending.Desired.IsComplete;
+            return expectedGraph && expectedCompletion &&
+                   snapshot.RouteNumber == pending.Desired.RouteNumber &&
+                   snapshot.Rgba == pending.Desired.Rgba;
         }
     }
 }

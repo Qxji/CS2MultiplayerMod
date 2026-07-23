@@ -20,6 +20,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private RealizeResult RealizeCreate(RouteCreateCommand command, int originPlayerId, long now)
         {
+            if (_netSync == null || !_netSync.CanBuildDefinitions)
+                return RealizeResult.Retry;
+
             Entity prefab;
             if (!_prefabIndex.TryResolve(command.PrefabName, out prefab))
             {
@@ -89,9 +92,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             HashSet<Entity> preexistingShapeMatches =
                 CaptureShapeMatches(prefab, command.Waypoints);
 
+            Entity definition = Entity.Null;
+            PendingCreateMetadata metadata = null;
+            bool commitArmed = false;
             try
             {
-                Entity definition = EntityManager.CreateEntity();
+                _netSync.PrepareDefinitionFrame();
+                definition = EntityManager.CreateEntity();
                 EntityManager.AddComponentData(definition, new CreationDefinition
                 {
                     m_Prefab = prefab,
@@ -108,8 +115,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 EntityManager.AddComponent<Updated>(definition);
                 EntityManager.AddComponent<Deleted>(definition);
 
-                MarkCreateGuards(command, now);
-                _pendingCreateMetadata.Add(new PendingCreateMetadata
+                metadata = new PendingCreateMetadata
                 {
                     Prefab = prefab,
                     PrefabName = command.PrefabName,
@@ -119,7 +125,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     Rgba = PackColor(command.ColorR, command.ColorG,
                         command.ColorB, command.ColorA),
                     DeadlineMs = now + RetryWindowMs,
-                });
+                    Source = command,
+                    OriginPlayerId = originPlayerId,
+                };
+                _pendingCreateMetadata.Add(metadata);
+                commitArmed = _netSync.ArmRouteCommit(
+                        () => ReplayCreateAfterCommitLoss(metadata),
+                        () => CompleteCreateCommit(metadata),
+                        "create");
+                if (!commitArmed)
+                {
+                    _pendingCreateMetadata.Remove(metadata);
+                    EntityManager.DestroyEntity(definition);
+                    _netSync.CancelPreparedDefinitionFrame();
+                    return RealizeResult.Retry;
+                }
+
+                MarkCreateGuards(command, now);
+                Diagnostics.FlightRecorder.Note("route create definition armed stops=" +
+                                                  command.Waypoints.Length);
                 Mod.Verbose("[MP] RouteSync create: submitted complete line '" +
                             command.PrefabName + "' (" + command.Waypoints.Length +
                             " stops, number " + command.RouteNumber + ") from player " +
@@ -128,6 +152,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             catch (Exception ex)
             {
+                if (!commitArmed)
+                {
+                    if (metadata != null) _pendingCreateMetadata.Remove(metadata);
+                    if (definition != Entity.Null && EntityManager.Exists(definition))
+                        EntityManager.DestroyEntity(definition);
+                    if (_netSync != null) _netSync.CancelPreparedDefinitionFrame();
+                }
                 SyncInbox.RequestResync("route creation failed");
                 Mod.log.Error("[MP] RouteSync create FAILED for '" +
                               command.PrefabName + "': " + ex);
@@ -183,12 +214,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             _mutatedRoutesThisFrame.Add(route);
 
+            bool rebuildGraph = !RouteGraphMatches(route, command.Waypoints, connections) ||
+                                local.IsComplete != command.IsComplete;
+            Entity definition = Entity.Null;
+            PendingUpdateCommit pendingCommit = null;
+            bool commitArmed = false;
             try
             {
-                if (!RouteGraphMatches(route, command.Waypoints, connections) ||
-                    local.IsComplete != command.IsComplete)
+                if (rebuildGraph)
                 {
-                    Entity definition = EntityManager.CreateEntity();
+                    pendingCommit = new PendingUpdateCommit
+                    {
+                        Route = route,
+                        Source = command,
+                        OriginPlayerId = originPlayerId,
+                        DeadlineMs = now + RetryWindowMs,
+                        Original = local,
+                        Desired = new RouteSnapshot
+                        {
+                            Waypoints = command.Waypoints,
+                            Rgba = rgba,
+                            RouteNumber = command.RouteNumber,
+                            IsComplete = command.IsComplete,
+                        },
+                    };
+                    _pendingUpdateCommit = pendingCommit;
+                    _netSync.PrepareDefinitionFrame();
+                    definition = EntityManager.CreateEntity();
                     EntityManager.AddComponentData(definition, new CreationDefinition
                     {
                         m_Prefab = prefab,
@@ -203,6 +255,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         route, appendClosure: false);
                     EntityManager.AddComponent<Updated>(definition);
                     EntityManager.AddComponent<Deleted>(definition);
+
+                    commitArmed = _netSync.ArmRouteCommit(
+                            () => ReplayUpdateAfterCommitLoss(pendingCommit),
+                            () => CompleteUpdateCommit(pendingCommit),
+                            "update");
+                    if (!commitArmed)
+                    {
+                        EntityManager.DestroyEntity(definition);
+                        _netSync.CancelPreparedDefinitionFrame();
+                        _pendingUpdateCommit = null;
+                        return RealizeResult.Retry;
+                    }
                 }
 
                 // GenerateRoutesSystem retains the original route color during an edit, so metadata
@@ -221,13 +285,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     command.RouteNumber, first), now);
                 _guard.Mark(RouteShapeKey("routeupd", command.PrefabName,
                     command.Waypoints), now);
-                _knownRoutes[route] = new RouteSnapshot
+                if (!rebuildGraph)
                 {
-                    Waypoints = command.Waypoints,
-                    Rgba = rgba,
-                    RouteNumber = command.RouteNumber,
-                    IsComplete = command.IsComplete,
-                };
+                    _knownRoutes[route] = new RouteSnapshot
+                    {
+                        Waypoints = command.Waypoints,
+                        Rgba = rgba,
+                        RouteNumber = command.RouteNumber,
+                        IsComplete = command.IsComplete,
+                    };
+                }
+                else
+                {
+                    Diagnostics.FlightRecorder.Note("route update definition armed stops=" +
+                                                      command.Waypoints.Length);
+                }
                 Mod.Verbose("[MP] RouteSync update: applied line '" +
                             command.PrefabName + "' (" + command.Waypoints.Length +
                             " stops, number " + command.RouteNumber + ") from player " +
@@ -236,6 +308,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             catch (Exception ex)
             {
+                if (!commitArmed)
+                {
+                    if (pendingCommit != null && _pendingUpdateCommit == pendingCommit)
+                        _pendingUpdateCommit = null;
+                    if (definition != Entity.Null && EntityManager.Exists(definition))
+                        EntityManager.DestroyEntity(definition);
+                    if (_netSync != null) _netSync.CancelPreparedDefinitionFrame();
+                    TryApplyMetadata(route, prefab, local.RouteNumber, local.Rgba);
+                }
                 SyncInbox.RequestResync("route update failed");
                 Mod.log.Error("[MP] RouteSync update FAILED for '" +
                               command.PrefabName + "': " + ex);
@@ -445,13 +526,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             for (int i = 0; i < desired.Length; i++)
             {
                 float3 wantedPosition = WaypointPosition(desired[i]);
+                float positionToleranceSq =
+                    connections[i] == Entity.Null ? 0.01f : StopMatchDistanceSq;
                 for (int j = 0; j < original.Length; j++)
                 {
                     if (used[j]) continue;
                     Entity waypoint = original[j].m_Waypoint;
                     if (!EntityManager.HasComponent<Position>(waypoint) ||
                         math.distancesq(EntityManager.GetComponentData<Position>(waypoint).m_Position,
-                            wantedPosition) > 0.01f)
+                            wantedPosition) > positionToleranceSq)
                         continue;
 
                     Entity oldConnection = Entity.Null;
@@ -480,11 +563,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             for (int i = 0; i < desired.Length; i++)
             {
                 Entity waypoint = current[i].m_Waypoint;
+                float positionToleranceSq =
+                    connections[i] == Entity.Null ? 0.01f : StopMatchDistanceSq;
                 if (!EntityManager.Exists(waypoint) ||
                     !EntityManager.HasComponent<Position>(waypoint) ||
                     math.distancesq(EntityManager
                             .GetComponentData<Position>(waypoint).m_Position,
-                        WaypointPosition(desired[i])) > 0.01f)
+                        WaypointPosition(desired[i])) > positionToleranceSq)
                     return false;
                 Entity connection = Entity.Null;
                 if (EntityManager.HasComponent<Connected>(waypoint))
@@ -677,6 +762,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             for (int i = _pendingCreateMetadata.Count - 1; i >= 0; i--)
             {
                 PendingCreateMetadata pending = _pendingCreateMetadata[i];
+                if (!pending.GraphCommitted) continue;
                 bool ambiguous;
                 Entity route = FindMetadataTarget(pending, claimed, out ambiguous);
                 if (route != Entity.Null)
@@ -718,6 +804,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     RouteSnapshot snapshot;
                     if (TryCaptureSnapshot(route, out snapshot))
                         _knownRoutes[route] = snapshot;
+                    Diagnostics.FlightRecorder.Note("route create finalized number=" +
+                                                      pending.RouteNumber + " stops=" +
+                                                      pending.Waypoints.Length);
+                    Mod.Verbose("[MP] RouteSync finalized line '" +
+                                pending.PrefabName + "' number " +
+                                pending.RouteNumber + ".");
                 }
                 _pendingCreateMetadata.Remove(pending);
             }
@@ -768,6 +860,74 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 new float3(command.WaypointX, command.WaypointY, command.WaypointZ),
                 RouteAnchorMatchDistanceSq, out ambiguous);
             return ambiguous || route != Entity.Null;
+        }
+
+        private void CompleteCreateCommit(PendingCreateMetadata pending)
+        {
+            if (!_pendingCreateMetadata.Contains(pending)) return;
+            pending.GraphCommitted = true;
+            if (Mod.Service != null)
+                pending.DeadlineMs = Mod.Service.NowMs + RetryWindowMs;
+            Diagnostics.FlightRecorder.Note("route create graph committed; awaiting identity");
+        }
+
+        private void ReplayCreateAfterCommitLoss(PendingCreateMetadata pending)
+        {
+            if (!_pendingCreateMetadata.Remove(pending)) return;
+            QueueCommitReplay(new PendingRouteCommand
+            {
+                Create = pending.Source,
+                OriginPlayerId = pending.OriginPlayerId,
+                DeadlineMs = pending.DeadlineMs,
+            }, "create");
+        }
+
+        private void CompleteUpdateCommit(PendingUpdateCommit pending)
+        {
+            if (_pendingUpdateCommit != pending) return;
+            _pendingUpdateCommit = null;
+
+            RouteSnapshot snapshot;
+            if (EntityManager.Exists(pending.Route) &&
+                TryCaptureSnapshot(pending.Route, out snapshot))
+                _knownRoutes[pending.Route] = snapshot;
+            else
+                _knownRoutes[pending.Route] = pending.Desired;
+            Diagnostics.FlightRecorder.Note("route update graph committed");
+        }
+
+        private void ReplayUpdateAfterCommitLoss(PendingUpdateCommit pending)
+        {
+            if (_pendingUpdateCommit != pending) return;
+            _pendingUpdateCommit = null;
+            QueueCommitReplay(new PendingRouteCommand
+            {
+                Update = pending.Source,
+                OriginPlayerId = pending.OriginPlayerId,
+                DeadlineMs = pending.DeadlineMs,
+            }, "update");
+        }
+
+        private void QueueCommitReplay(PendingRouteCommand command, string operation)
+        {
+            MultiplayerService service = Mod.Service;
+            long now = service != null ? service.NowMs : 0;
+            if (service == null || !service.GameplaySyncReady ||
+                now >= command.DeadlineMs ||
+                _pendingCommands.Count >= MaxPendingCommands)
+            {
+                SyncInbox.RequestResync("route " + operation +
+                                         " commit could not be replayed");
+                Mod.log.Warn("[MP] RouteSync " + operation +
+                             " commit was lost and could not be replayed safely.");
+                return;
+            }
+
+            command.NextAttemptMs = now;
+            command.RetryDelayMs = InitialRetryDelayMs;
+            _pendingCommands.Insert(0, command);
+            Diagnostics.FlightRecorder.Note("route " + operation +
+                                              " commit re-queued");
         }
 
         private void MarkCreateGuards(RouteCreateCommand command, long now)

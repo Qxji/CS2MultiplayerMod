@@ -159,6 +159,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private global::Game.Tools.ApplyObjectsSystem _applyObjectsSystem;
         private global::Game.Tools.ApplyAreasSystem _applyAreasSystem;
         private global::Game.Tools.ApplyBrushesSystem _applyBrushesSystem;
+        private global::Game.Tools.ApplyRoutesSystem _applyRoutesSystem;
         // Exact entity set consumed by the net apply pass. A road transaction is not only its
         // visible nodes and edges: generated lanes and street-name aggregates participate too.
         // Every isolation, validation, commit, drain, and discard must use this same boundary.
@@ -168,6 +169,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // apply domains. Other tools can legitimately create unrelated Temp shapes in the same
         // frame; including them would make them look like a partial remote object transaction.
         private EntityQuery _objectTransactionTemps;
+        // Route definitions always generate a Temp root plus owned waypoint/segment Temps. Keep
+        // that exact apply-domain boundary separate from nets and object graphs so a synchronized
+        // line can be validated and committed without consuming an interactive route preview.
+        private EntityQuery _routeTransactionTemps;
         // A standing interactive preview can span several domains (for example a building plus
         // owned driveway nets). It must be frozen and restored as one graph.
         private EntityQuery _standingTemps;
@@ -183,12 +188,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private bool _clearLocalNetIsolationAfterBarrier;
         private bool _localToolOutputProtectedThisFrame;
         private bool _pendingApply;
-        private enum RemoteToolTransactionKind : byte { None, Net, ObjectGraph, AssetStampGraph }
+        private enum RemoteToolTransactionKind : byte
+        {
+            None,
+            Net,
+            ObjectGraph,
+            AssetStampGraph,
+            Route,
+        }
         private RemoteToolTransactionKind _pendingTransactionKind;
         private RemoteToolTransactionKind _committingTransactionKind;
         private static bool IsObjectGraphTransaction(RemoteToolTransactionKind kind) =>
             kind == RemoteToolTransactionKind.ObjectGraph ||
             kind == RemoteToolTransactionKind.AssetStampGraph;
+        private static bool IsRouteTransaction(RemoteToolTransactionKind kind) =>
+            kind == RemoteToolTransactionKind.Route;
         private System.Action _onCommitComplete;
         private bool _objectCommitThisFrame;
         private long _pendingNetConstructionCharge;
@@ -293,6 +307,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _applyObjectsSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyObjectsSystem>();
             _applyAreasSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyAreasSystem>();
             _applyBrushesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyBrushesSystem>();
+            _applyRoutesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyRoutesSystem>();
             // Mirror the net apply pass's complete transaction query, including any Temp already
             // carrying Deleted. Such an entity makes validation reject the whole batch; silently
             // omitting it here would still leave it visible to the apply pass and defeat isolation.
@@ -319,6 +334,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     ComponentType.ReadOnly<Lane>(),
                     ComponentType.ReadOnly<Aggregate>(),
                     ComponentType.ReadOnly<global::Game.Areas.Area>(),
+                },
+            });
+
+            _routeTransactionTemps = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<Temp>() },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<global::Game.Routes.Route>(),
+                    ComponentType.ReadOnly<global::Game.Routes.Waypoint>(),
+                    ComponentType.ReadOnly<global::Game.Routes.Segment>(),
                 },
             });
 

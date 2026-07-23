@@ -93,6 +93,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _moveSync.RealizePending();
             if (!deferNetworkDependents) _netUpgradeSync.RealizePending();
             _areaSync.RealizePending();
+            _routeSync.FinalizePending();
             if (!deferNetworkDependents) _routeSync.RealizePending();
             _tileSync.RealizePending();
         }

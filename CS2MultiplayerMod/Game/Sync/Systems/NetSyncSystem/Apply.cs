@@ -43,7 +43,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// before they can materialise beside the isolated remote batch. The flag clears before the
         /// gate on the actual commit frame, so the player's preview resumes immediately afterward.
         /// </summary>
-        public bool HasArmedNetCommit => _pendingApply;
+        public bool HasArmedToolCommit => _pendingApply;
 
         /// <summary>True only on the ToolUpdate frame an isolated object graph was committed.</summary>
         public bool DidCommitObjectGraphThisFrame => _objectCommitThisFrame;
@@ -87,9 +87,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 EntityQuery transactionQuery = ActiveTransactionQuery();
                 int isolatedCount = transactionQuery.CalculateEntityCount();
                 string invalidReason;
-                bool valid = IsObjectGraphTransaction(_pendingTransactionKind)
-                    ? ValidateArmedObjectTransaction(out invalidReason)
-                    : ValidateArmedNetTransaction(out invalidReason);
+                bool valid;
+                if (IsObjectGraphTransaction(_pendingTransactionKind))
+                    valid = ValidateArmedObjectTransaction(out invalidReason);
+                else if (IsRouteTransaction(_pendingTransactionKind))
+                    valid = ValidateArmedRouteTransaction(out invalidReason);
+                else
+                    valid = ValidateArmedNetTransaction(out invalidReason);
                 if (isolatedCount > 0 && !valid)
                 {
                     InvalidateArmedBatch(invalidReason, isolatedCount);
@@ -201,6 +205,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             DisableQueryEntities(_standingTemps, _isolatedLocalTemps);
             if (_isolatedLocalTemps.Count > 0)
                 Diagnostics.FlightRecorder.Note("tool preview isolated=" + _isolatedLocalTemps.Count);
+        }
+
+        /// <summary>
+        /// Roll back a definition-frame reservation when its caller could not create or arm any
+        /// transaction. No remote graph exists yet, so restoring the exact isolated preview set is
+        /// sufficient and keeps the active tool responsive.
+        /// </summary>
+        public void CancelPreparedDefinitionFrame()
+        {
+            if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining) return;
+            if (_isolatedLocalTemps.Count > 0)
+            {
+                ReleaseTrackedTemps(_isolatedLocalTemps);
+                ForceActiveToolUpdate();
+            }
+            _prepDoneThisFrame = false;
         }
 
         private void DisableQueryEntities(EntityQuery query, List<Entity> destination)
@@ -348,9 +368,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 " (remote=" + _protectedRemoteNetTemps.Count + ")");
         }
 
-        private EntityQuery ActiveTransactionQuery() =>
-            IsObjectGraphTransaction(_pendingTransactionKind)
-                ? _objectTransactionTemps : _netTransactionTemps;
+        private EntityQuery ActiveTransactionQuery()
+        {
+            if (IsObjectGraphTransaction(_pendingTransactionKind))
+                return _objectTransactionTemps;
+            if (IsRouteTransaction(_pendingTransactionKind))
+                return _routeTransactionTemps;
+            return _netTransactionTemps;
+        }
 
         private void CommitRemoteTemps(EntityQuery transactionQuery, int count)
         {
@@ -380,6 +405,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     _applyNetSystem.Update();
                     _applyAreasSystem.Update();
                     _objectCommitThisFrame = true;
+                }
+                else if (IsRouteTransaction(_pendingTransactionKind))
+                {
+                    _applyRoutesSystem.Update();
                 }
                 else
                 {
@@ -426,7 +455,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _drainFrames = 0;
             _suppressCaptureThisFrame = true;
             _clearLocalNetIsolationAfterBarrier = true;
-            Diagnostics.FlightRecorder.Note("net commit isolated (temps=" + count + ")");
+            Diagnostics.FlightRecorder.Note("remote " +
+                _committingTransactionKind.ToString().ToLowerInvariant() +
+                " commit isolated (temps=" + count + ")");
         }
 
         private bool CommittedRemoteTempsRemain()
@@ -613,6 +644,170 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         {
             if (_isolatedLocalBrushTemps.Count > 0) ReleaseTrackedTemps(_isolatedLocalBrushTemps);
             DisableQueryEntities(_localBrushTemps, _isolatedLocalBrushTemps);
+        }
+
+        /// <summary>
+        /// Verify the complete route graph immediately before its isolated apply. Route application
+        /// dereferences every root buffer entry and every non-null original, so a missing child or
+        /// stale original rejects the whole graph instead of allowing a partially connected line.
+        /// </summary>
+        private bool ValidateArmedRouteTransaction(out string reason)
+        {
+            NativeArray<Entity> temps = _routeTransactionTemps.ToEntityArray(Allocator.Temp);
+            try
+            {
+                if (temps.Length == 0)
+                {
+                    reason = "the generated route transaction was empty";
+                    return false;
+                }
+
+                int routeCount = 0;
+                int waypointCount = 0;
+                int segmentCount = 0;
+                for (int i = 0; i < temps.Length; i++)
+                {
+                    Entity entity = temps[i];
+                    if (!EntityManager.Exists(entity) ||
+                        EntityManager.HasComponent<Deleted>(entity))
+                    {
+                        reason = "the generated route transaction contains a deleted entity";
+                        return false;
+                    }
+
+                    bool isRoute =
+                        EntityManager.HasComponent<global::Game.Routes.Route>(entity);
+                    bool isWaypoint =
+                        EntityManager.HasComponent<global::Game.Routes.Waypoint>(entity);
+                    bool isSegment =
+                        EntityManager.HasComponent<global::Game.Routes.Segment>(entity);
+                    if (!isRoute && !isWaypoint && !isSegment)
+                    {
+                        reason = "the route transaction contains an unknown Temp entity";
+                        return false;
+                    }
+
+                    Temp temp = EntityManager.GetComponentData<Temp>(entity);
+                    if (temp.m_Original != Entity.Null)
+                    {
+                        if (!EntityManager.Exists(temp.m_Original) ||
+                            EntityManager.HasComponent<Deleted>(temp.m_Original) ||
+                            EntityManager.HasComponent<Temp>(temp.m_Original))
+                        {
+                            reason = "a generated route entity has a stale original";
+                            return false;
+                        }
+                        if ((isRoute &&
+                             !EntityManager.HasComponent<global::Game.Routes.Route>(
+                                 temp.m_Original)) ||
+                            (isWaypoint &&
+                             !EntityManager.HasComponent<global::Game.Routes.Waypoint>(
+                                 temp.m_Original)) ||
+                            (isSegment &&
+                             !EntityManager.HasComponent<global::Game.Routes.Segment>(
+                                 temp.m_Original)))
+                        {
+                            reason = "a generated route entity has a mismatched original";
+                            return false;
+                        }
+                    }
+
+                    if (isWaypoint)
+                    {
+                        waypointCount++;
+                        if (EntityManager.HasComponent<global::Game.Routes.Connected>(entity))
+                        {
+                            Entity connected =
+                                EntityManager
+                                    .GetComponentData<global::Game.Routes.Connected>(entity)
+                                    .m_Connected;
+                            if (connected != Entity.Null &&
+                                (!EntityManager.Exists(connected) ||
+                                 EntityManager.HasComponent<Deleted>(connected)))
+                            {
+                                reason = "a generated route waypoint has a stale connection";
+                                return false;
+                            }
+                        }
+                    }
+                    if (isSegment) segmentCount++;
+                    if (!isRoute) continue;
+
+                    routeCount++;
+                    if (!EntityManager.HasBuffer<global::Game.Routes.RouteWaypoint>(entity) ||
+                        !EntityManager.HasBuffer<global::Game.Routes.RouteSegment>(entity))
+                    {
+                        reason = "the generated route root is missing its graph buffers";
+                        return false;
+                    }
+                    if (temp.m_Original != Entity.Null &&
+                        (!EntityManager
+                             .HasBuffer<global::Game.Routes.RouteWaypoint>(temp.m_Original) ||
+                         !EntityManager
+                             .HasBuffer<global::Game.Routes.RouteSegment>(temp.m_Original)))
+                    {
+                        reason = "the existing route root is missing its graph buffers";
+                        return false;
+                    }
+
+                    DynamicBuffer<global::Game.Routes.RouteWaypoint> waypoints =
+                        EntityManager.GetBuffer<global::Game.Routes.RouteWaypoint>(
+                            entity, isReadOnly: true);
+                    DynamicBuffer<global::Game.Routes.RouteSegment> segments =
+                        EntityManager.GetBuffer<global::Game.Routes.RouteSegment>(
+                            entity, isReadOnly: true);
+                    if (waypoints.Length < 2 || segments.Length != waypoints.Length)
+                    {
+                        reason = "the generated route graph is incomplete";
+                        return false;
+                    }
+                    for (int j = 0; j < waypoints.Length; j++)
+                    {
+                        Entity child = waypoints[j].m_Waypoint;
+                        if (child == Entity.Null || !EntityManager.Exists(child) ||
+                            !EntityManager.HasComponent<Temp>(child) ||
+                            !EntityManager
+                                .HasComponent<global::Game.Routes.Waypoint>(child) ||
+                            EntityManager.HasComponent<Deleted>(child))
+                        {
+                            reason = "the generated route has a missing waypoint";
+                            return false;
+                        }
+                    }
+                    for (int j = 0; j < segments.Length; j++)
+                    {
+                        Entity child = segments[j].m_Segment;
+                        if (child == Entity.Null || !EntityManager.Exists(child) ||
+                            !EntityManager.HasComponent<Temp>(child) ||
+                            !EntityManager
+                                .HasComponent<global::Game.Routes.Segment>(child) ||
+                            EntityManager.HasComponent<Deleted>(child))
+                        {
+                            reason = "the generated route has a missing segment";
+                            return false;
+                        }
+                    }
+                }
+
+                if (routeCount != 1)
+                {
+                    reason = "the route transaction contains " + routeCount +
+                             " roots instead of one";
+                    return false;
+                }
+                if (waypointCount < 2 || segmentCount < 2)
+                {
+                    reason = "the route transaction is missing owned graph entities";
+                    return false;
+                }
+
+                reason = null;
+                return true;
+            }
+            finally
+            {
+                temps.Dispose();
+            }
         }
 
         /// <summary>
@@ -1156,6 +1351,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _onCommitLost = onCommitLost;
             _onCommitComplete = null;
             Diagnostics.FlightRecorder.Note("net " + source + " batch armed");
+        }
+
+        /// <summary>
+        /// Arm one route root and its complete waypoint/segment graph. Definitions materialize as
+        /// Temps later in the frame; the next quiet ToolUpdate validates and applies only that
+        /// isolated route domain.
+        /// </summary>
+        public bool ArmRouteCommit(System.Action onCommitLost,
+            System.Action onCommitComplete, string source)
+        {
+            if (_pendingApply || _awaitingDrain || _invalidatedBatchDraining ||
+                _applyRoutesSystem == null)
+                return false;
+            _pendingApply = true;
+            _pendingTransactionKind = RemoteToolTransactionKind.Route;
+            _armTick = System.Environment.TickCount;
+            _pendingNetConstructionCharge = 0;
+            _pendingNetConstructionChargeCourses = 0;
+            _onCommitLost = onCommitLost;
+            _onCommitComplete = onCommitComplete;
+            Diagnostics.FlightRecorder.Note("route " + source + " operation armed");
+            return true;
         }
 
         /// <summary>

@@ -11,6 +11,7 @@ using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
 using CS2MultiplayerMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Systems.Net;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
@@ -33,11 +34,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private Dictionary<Entity, RouteSnapshot> _knownRoutes = new Dictionary<Entity, RouteSnapshot>();
         private Dictionary<Entity, RouteSnapshot> _nextRoutes = new Dictionary<Entity, RouteSnapshot>();
         private readonly HashSet<Entity> _needsCreateCapture = new HashSet<Entity>();
+        private readonly HashSet<Entity> _baselinePendingRoutes = new HashSet<Entity>();
         private readonly HashSet<Entity> _mutatedRoutesThisFrame = new HashSet<Entity>();
         private readonly List<PendingRouteCommand> _pendingCommands = new List<PendingRouteCommand>();
         private readonly List<PendingCreateMetadata> _pendingCreateMetadata =
             new List<PendingCreateMetadata>();
+        private PendingUpdateCommit _pendingUpdateCommit;
         private long _lastEditScanMs;
+        private bool _wasGameplaySyncReady;
 
         private struct RouteSnapshot
         {
@@ -67,6 +71,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             public int RouteNumber;
             public uint Rgba;
             public long DeadlineMs;
+            public RouteCreateCommand Source;
+            public int OriginPlayerId;
+            public bool GraphCommitted;
+        }
+
+        private sealed class PendingUpdateCommit
+        {
+            public Entity Route;
+            public RouteUpdateCommand Source;
+            public int OriginPlayerId;
+            public long DeadlineMs;
+            public RouteSnapshot Original;
+            public RouteSnapshot Desired;
         }
 
         private enum RealizeResult : byte
@@ -83,6 +100,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private EntityQuery _liveRoutes;
         private EntityQuery _transportStops;
         private CommandObserver _observer;
+        private NetSyncSystem _netSync;
 
         protected override void OnCreate()
         {
@@ -92,6 +110,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
             _prefabIndex = new PrefabIndex(_prefabSystem,
                 GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
+            _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
 
             _createdRoutes = GetEntityQuery(new EntityQueryDesc
             {
@@ -180,17 +199,39 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             MultiplayerSession session = service.Session;
             if (!service.GameplaySyncReady)
             {
+                _wasGameplaySyncReady = false;
                 if (_knownRoutes.Count > 0) _knownRoutes.Clear();
                 if (_nextRoutes.Count > 0) _nextRoutes.Clear();
                 if (_needsCreateCapture.Count > 0) _needsCreateCapture.Clear();
+                if (_baselinePendingRoutes.Count > 0) _baselinePendingRoutes.Clear();
                 return;
             }
 
             long now = service.NowMs;
             _guard.Prune(now);
+            if (!_wasGameplaySyncReady)
+            {
+                _wasGameplaySyncReady = true;
+                BaselineLiveRoutes();
+                return;
+            }
             CaptureCreated(session, now);
             CaptureDeleted(session, now);
             ScanForEdits(session, now);
+        }
+
+        /// <summary>
+        /// Finish identities for already committed route graphs even while a later network
+        /// transaction is backlogged. This never creates tool definitions.
+        /// </summary>
+        public void FinalizePending()
+        {
+            MultiplayerService service = Mod.Service;
+            if (service == null) return;
+            if (!service.GameplaySyncReady) return;
+
+            _mutatedRoutesThisFrame.Clear();
+            FinalizeCreatedRoutes(service.NowMs);
         }
 
         /// <summary>Called by <see cref="SyncRealizeSystem"/> during ToolUpdate.</summary>
@@ -203,8 +244,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (!service.GameplaySyncReady) return;
 
             long now = service.NowMs;
-            _mutatedRoutesThisFrame.Clear();
-            FinalizeCreatedRoutes(now);
+            if (_netSync == null || !_netSync.CanBuildDefinitions) return;
 
             int budget = MaxCommandsPerFrame;
             int retries = System.Math.Min(_pendingCommands.Count, MaxCommandsPerFrame / 2);
@@ -275,6 +315,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private RealizeResult TryRealize(PendingRouteCommand pending, long now)
         {
+            if (_netSync == null || !_netSync.CanBuildDefinitions)
+                return RealizeResult.Retry;
             if (pending.Create != null)
                 return RealizeCreate(pending.Create, pending.OriginPlayerId, now);
             if (pending.Update != null)
@@ -327,12 +369,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             SyncInbox.Clear(_incoming);
             _pendingCommands.Clear();
             _pendingCreateMetadata.Clear();
+            _pendingUpdateCommit = null;
             _needsCreateCapture.Clear();
+            _baselinePendingRoutes.Clear();
             _mutatedRoutesThisFrame.Clear();
             _knownRoutes.Clear();
             _nextRoutes.Clear();
             _guard.Clear();
             _lastEditScanMs = 0;
+            _wasGameplaySyncReady = false;
         }
 
         private static string RouteKey(string prefix, string prefabName, int routeNumber,

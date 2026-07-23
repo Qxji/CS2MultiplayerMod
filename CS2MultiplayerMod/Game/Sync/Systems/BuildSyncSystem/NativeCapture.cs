@@ -803,7 +803,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             // A remote net transaction owns this frame's ApplyTool pass. Its isolation deliberately
             // prevents the local preview from committing, so it must not be published as local work.
-            if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedNetCommit) return;
+            if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedToolCommit) return;
 
             string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
                                    _selectedAssetStampPrefabName;
