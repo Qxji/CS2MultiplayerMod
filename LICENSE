@@ -1,38 +1,42 @@
-CS2 MULTIPLAYER MOD NON-COMMERCIAL LICENSE v1.0
+# CS2 MULTIPLAYER MOD NON-COMMERCIAL LICENSE v1.1
 
 Copyright (c) 2026 CS2 Multiplayer Mod contributors
 
 This license applies to the CS2 Multiplayer Mod source code, binaries, documentation, and other project files in this repository, unless a file states a different license.
 
-1. Definitions
+## 1. Definitions
 
-"Software" means this project and any copy, modified version, fork, compiled binary, or derivative work based on it.
+**"Software"** means this project and any copy, modified version, compiled binary, or derivative work based on it.
 
-"Project" means the original CS2 Multiplayer Mod repository and releases maintained by the project maintainers.
+**"Project"** means the original CS2 Multiplayer Mod repository and releases maintained by the project maintainers.
 
-"Non-Commercial Use" means use that is not intended for commercial advantage, monetary compensation, paid access, advertising revenue, sponsorship revenue, or other direct or indirect financial gain.
+**"Non-Commercial Use"** means use that is not intended for commercial advantage, monetary compensation, paid access, advertising revenue, sponsorship revenue, or other direct or indirect financial gain.
 
-2. Permission
+## 2. Permission
 
-You may use, copy, inspect, build, run, test, and modify the Software for Non-Commercial Use.
+You may:
 
-You may create private forks and local modifications for learning, testing, backup, personal play, and preparing contributions to the Project.
+- use, inspect, build, run, and test the Software for Non-Commercial Use;
+- create private local copies and private forks for personal use, learning, testing, backup, or preparing contributions to the Project;
+- modify the Software for your own private use;
+- submit pull requests, patches, bug reports, documentation, translations, or other contributions to the Project.
 
-You may submit modifications, patches, pull requests, issues, documentation, translations, or other contributions to the Project.
+## 3. Redistribution
 
-3. Redistribution
+Public redistribution of the Software or any modified version is **not permitted** without prior written permission from the Project maintainers.
 
-You may share source code changes, patches, or pull requests for the purpose of contributing to the Project.
+Without prior written permission, you may **not**:
 
-You may share non-commercial forks only if all of the following are true:
+- publish the Software or any modified version;
+- create or maintain public forks;
+- upload the Software or modified versions to GitHub, GitLab, Codeberg, Bitbucket, or any other public code hosting service;
+- redistribute source code or compiled binaries;
+- mirror, archive, or re-host the Project;
+- distribute modified versions under another name.
 
-- the fork clearly identifies the original Project and links to the original repository;
-- the fork clearly states that it is unofficial and modified;
-- the fork keeps this license and copyright notice intact;
-- the fork is not sold, monetized, paywalled, bundled into a commercial product, or used to generate commercial advantage;
-- the fork is not presented as the original Project, an official continuation, or your own original work.
+Private local copies and private forks used only for personal development or preparing contributions remain permitted.
 
-4. Commercial Use Prohibited
+## 4. Commercial Use Prohibited
 
 Without prior written permission from the Project maintainers, you may not:
 
@@ -42,7 +46,7 @@ Without prior written permission from the Project maintainers, you may not:
 - bundle the Software with a commercial product or service;
 - use the Software or a modified version to promote, operate, or monetize a competing clone or rebranded version.
 
-5. Attribution and Identity
+## 5. Attribution and Identity
 
 You may not remove copyright notices, license notices, or attribution from the Software.
 
@@ -50,32 +54,32 @@ You may not use the Project name, logos, Discord, repository, release channels, 
 
 Modified versions must use a clearly different name unless the Project maintainers give written permission.
 
-6. Contributions
+## 6. Contributions
 
 By submitting a contribution to the Project, you represent that you have the right to submit it.
 
-You license your contribution to the Project maintainers and recipients under this same license.
+You license your contribution to the Project maintainers under this same license.
 
 Unless separately agreed in writing, contributions are provided without payment, warranty, or obligation for the Project to accept or maintain them.
 
-7. Third-Party Rights
+## 7. Third-Party Rights
 
-This license does not grant rights to Cities: Skylines II, Colossal Order, Paradox Interactive, Unity, trademarks, game assets, or third-party code and content that are owned by others.
+This license does not grant rights to Cities: Skylines II, Colossal Order, Paradox Interactive, Unity, trademarks, game assets, or third-party code and content owned by others.
 
-8. Termination
+## 8. Termination
 
 Your rights under this license terminate automatically if you violate it.
 
-After termination, you must stop using and distributing the Software and delete any copies you are not otherwise legally allowed to keep.
+After termination, you must immediately stop using and distributing the Software and delete any copies you are not otherwise legally allowed to keep.
 
 The Project maintainers may reinstate permissions in writing.
 
-9. No Warranty
+## 9. No Warranty
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, SECURITY, OR COMPATIBILITY.
 
 IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, MAINTAINERS, OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, LOST SAVES, LOST DATA, LOST PROFITS, OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
 
-10. Separate Permission
+## 10. Separate Permission
 
-For commercial use, official redistribution, rebranding, sublicensing, or any use not allowed by this license, contact the Project maintainers for separate written permission.
+For commercial use, public redistribution, public forks, rebranding, sublicensing, or any use not expressly permitted by this license, contact the Project maintainers for separate written permission.
