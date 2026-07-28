@@ -156,6 +156,10 @@ namespace CS2MultiplayerMod
         [SettingsUISection(HostTab, HostSetupGroup)]
         public bool LanOnly { get; set; } = false;
 
+        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
+        [SettingsUISection(HostTab, HostSetupGroup)]
+        public bool RequireJoinApproval { get; set; } = true;
+
         [SettingsUITextInput]
         [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostSetupGroup)]
@@ -253,6 +257,7 @@ namespace CS2MultiplayerMod
             HostPassword = "";
             JoinPassword = "";
             LanOnly = false;
+            RequireJoinApproval = true;
             MaxPlayers = "8";
             ResyncMinutes = "15";
         }

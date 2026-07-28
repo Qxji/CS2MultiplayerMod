@@ -62,5 +62,12 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// session (for example, an administrative kick) before closing the connection.
         /// </summary>
         DisconnectNotice = 13,
+
+        /// <summary>
+        /// Host -> client: the handshake passed every automatic check, but the host
+        /// requires manual approval. The client waits (showing an "awaiting approval"
+        /// screen) until a <see cref="HandshakeResponse"/> accepts or rejects it.
+        /// </summary>
+        HandshakePending = 14,
     }
 }

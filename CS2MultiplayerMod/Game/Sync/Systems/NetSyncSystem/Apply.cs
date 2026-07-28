@@ -94,6 +94,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 int isolatedCount = transactionQuery.CalculateEntityCount();
                 string invalidReason;
                 bool valid;
+                _validateStartTick = System.Environment.TickCount;
                 if (IsObjectGraphTransaction(_pendingTransactionKind))
                     valid = ValidateArmedObjectTransaction(out invalidReason);
                 else if (IsRouteTransaction(_pendingTransactionKind))
@@ -398,6 +399,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (_pendingTransactionKind == RemoteToolTransactionKind.Net)
                 RecordPlacementOriginals(currentService != null ? currentService.NowMs : 0);
 
+            int validateMs = System.Environment.TickCount - _validateStartTick;
+            int applyStartTick = System.Environment.TickCount;
             _committingRemoteNetTemps.Clear();
             NativeArray<Entity> remoteTemps = transactionQuery.ToEntityArray(Allocator.Temp);
             try
@@ -472,7 +475,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _clearLocalNetIsolationAfterBarrier = true;
             Diagnostics.FlightRecorder.Note("remote " +
                 _committingTransactionKind.ToString().ToLowerInvariant() +
-                " commit isolated (temps=" + count + ")");
+                " commit isolated (temps=" + count + ") validateMS=" + validateMs +
+                " applyMS=" + (System.Environment.TickCount - applyStartTick));
         }
 
         private bool CommittedRemoteTempsRemain()

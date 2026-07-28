@@ -18,6 +18,12 @@ namespace CS2MultiplayerMod.Core.Session
         private const int HeartbeatIntervalMs = 2000;
         private const int PeerTimeoutMs = 10000;
         private const int HandshakeTimeoutMs = 10000;
+
+        /// <summary>A join awaiting the host's manual approval is auto-declined after this
+        /// long, so an absent host never leaves the would-be player waiting forever and a
+        /// pre-handshake socket is never held open indefinitely.</summary>
+        private const int JoinApprovalTimeoutMs = 120000;
+
         private const int HostPlayerId = 1;
 
         /// <summary>Reassembling blobs allowed at once on a client.</summary>
@@ -51,6 +57,7 @@ namespace CS2MultiplayerMod.Core.Session
         private long _lastAuthSweepMs;
         private long _lastResyncAcceptedUnixMs;
         private bool _challengeAnswered;
+        private bool _awaitingHostApproval;
         private bool _worldSyncSuspended;
         private long _worldSyncEpoch;
 
@@ -104,6 +111,25 @@ namespace CS2MultiplayerMod.Core.Session
         public long OutgoingBlobSent => _outgoingBlobSent;
 
         public IReadOnlyCollection<Peer> Peers => _peers.Values;
+
+        /// <summary>
+        /// Client-only: the host acknowledged the join and it is waiting for the host to
+        /// approve it by hand. True between the host's HandshakePending and its accept/reject.
+        /// </summary>
+        public bool AwaitingHostApproval => _awaitingHostApproval;
+
+        /// <summary>
+        /// Host-only: joins that passed every automatic check and are waiting for the host
+        /// to approve or decline them. Enumerated on the game thread alongside the pump.
+        /// </summary>
+        public IEnumerable<Peer> PendingJoins
+        {
+            get
+            {
+                foreach (var pair in _peers)
+                    if (pair.Value.AwaitingApproval) yield return pair.Value;
+            }
+        }
 
         public void AddObserver(ISessionObserver observer)
         {

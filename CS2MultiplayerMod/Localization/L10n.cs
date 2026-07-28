@@ -57,6 +57,12 @@ namespace CS2MultiplayerMod.Localization
             public const string UiCancelKick = "CS2MP.UI.CancelKick";
             public const string UiSendingWorld = "CS2MP.UI.SendingWorld";
             public const string UiTryThis = "CS2MP.UI.TryThis";
+            public const string UiRequireApproval = "CS2MP.UI.RequireApproval";
+            public const string UiJoinRequestTitle = "CS2MP.UI.JoinRequestTitle";
+            // {0} = joining player's name.
+            public const string UiJoinRequestBody = "CS2MP.UI.JoinRequestBody";
+            public const string UiAccept = "CS2MP.UI.Accept";
+            public const string UiDecline = "CS2MP.UI.Decline";
 
             // -- One-time disclaimer gate (shown before first host/join) --
             public const string UiDisclaimerTitle = "CS2MP.UI.DisclaimerTitle";
@@ -105,6 +111,8 @@ namespace CS2MultiplayerMod.Localization
             public const string TitleModDisabled = "CS2MP.Status.ModDisabled";
             public const string TitleConnectionFailed = "CS2MP.Status.ConnectionFailed";
             public const string TitleHosting = "CS2MP.Status.Hosting";
+            public const string TitleAwaitingApproval = "CS2MP.Status.AwaitingApproval";
+            public const string DetailAwaitingApproval = "CS2MP.Status.DetailAwaitingApproval";
             public const string DetailEnableMod = "CS2MP.Status.DetailEnableMod";
             public const string DetailPlayersOne = "CS2MP.Status.DetailPlayersOne";
             public const string DetailPlayersMany = "CS2MP.Status.DetailPlayersMany";
@@ -144,6 +152,8 @@ namespace CS2MultiplayerMod.Localization
             public const string ErrorPortInUseHelp = "CS2MP.Error.PortInUse.Help";
             public const string ErrorRemoved = "CS2MP.Error.Removed";
             public const string ErrorRemovedHelp = "CS2MP.Error.Removed.Help";
+            public const string ErrorDeclined = "CS2MP.Error.Declined";
+            public const string ErrorDeclinedHelp = "CS2MP.Error.Declined.Help";
             public const string ErrorGeneric = "CS2MP.Error.Generic";
             public const string ErrorGenericHelp = "CS2MP.Error.Generic.Help";
 

@@ -215,6 +215,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // connect to the just-committed geometry cannot find it and lands on free ground.
         private bool _awaitingDrain;
         private int _armTick;
+        private int _validateStartTick;
         private int _drainArmTick;
         // Frames spent waiting for the isolated entities to leave their Temp state.
         private int _drainFrames;
@@ -542,6 +543,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _nativeOperationDeadlines.Clear();
             _operationBuildFailures.Clear();
             _completedNetOperations.Clear();
+            _armedNetOperations.Clear();
+            _batchSplitClaims.Clear();
             _recentRealizedSpans.Clear();
             _pendingApply = false;
             _pendingTransactionKind = RemoteToolTransactionKind.None;

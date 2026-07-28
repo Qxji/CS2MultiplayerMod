@@ -115,6 +115,11 @@ namespace CS2MultiplayerMod
             updateSystem.UpdateAt<Game.Sync.Systems.AreaSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.RouteSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.TilePurchaseSyncSystem>(SystemUpdatePhase.ModificationEnd);
+            // ModificationEnd, after the game's event initialization at Modification2: that pass is
+            // what turns a bare disaster event into a placed one (position, radius, duration), and
+            // the Created tag it keys on is gone by the next frame. Capturing here reads the
+            // resolved disaster, not an empty shell.
+            updateSystem.UpdateAt<Game.Sync.Systems.DisasterSyncSystem>(SystemUpdatePhase.ModificationEnd);
             // UIUpdate, NOT GameSimulation: dev-tree nodes can be purchased while the game
             // is paused (the progression panel works paused, and a node's Locked clears
             // outside the simulation loop), but GameSimulation freezes at selectedSpeed 0.
@@ -143,9 +148,9 @@ namespace CS2MultiplayerMod
             updateSystem.UpdateBefore<Game.Sync.Systems.TerrainReadbackBarrierSystem>(
                 SystemUpdatePhase.ToolUpdate);
             updateSystem.UpdateAt<Game.Sync.Systems.SyncRealizeSystem>(SystemUpdatePhase.ToolUpdate);
-            // Asset stamps have no persistent root object. Capture their one-frame Apply after the
-            // object tool made its decision but before ToolOutputSystem consumes the complete
-            // standing definition graph.
+            // Capture one-frame object lifecycle applies after the active object/upgrade tool made
+            // its decision but before ToolOutputSystem consumes the complete standing definition
+            // graph. Asset stamps use the same hand-off despite having no persistent root object.
             updateSystem.UpdateBefore<Game.Sync.Systems.ObjectToolApplyCaptureSystem,
                 global::Game.Tools.ToolOutputSystem>(SystemUpdatePhase.ToolUpdate);
             // After ToolOutputBarrier: tools record their definitions through that end-of-phase

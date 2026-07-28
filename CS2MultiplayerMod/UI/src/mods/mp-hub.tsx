@@ -36,6 +36,11 @@ const LOC = {
     banHint: "CS2MP.UI.BanHint",
     cancelKick: "CS2MP.UI.CancelKick",
     tryThis: "CS2MP.UI.TryThis",
+    requireApproval: "CS2MP.UI.RequireApproval",
+    joinRequestTitle: "CS2MP.UI.JoinRequestTitle",
+    joinRequestBody: "CS2MP.UI.JoinRequestBody",
+    accept: "CS2MP.UI.Accept",
+    decline: "CS2MP.UI.Decline",
     playerName: "CS2MP.UI.PlayerName",
     port: "CS2MP.UI.Port",
     password: "CS2MP.UI.Password",
@@ -72,8 +77,10 @@ const hostPort$ = bindValue<string>(GROUP, "hostPort", "25001");
 const hostPassword$ = bindValue<string>(GROUP, "hostPassword", "");
 const maxPlayers$ = bindValue<string>(GROUP, "maxPlayers", "8");
 const lanOnly$ = bindValue<boolean>(GROUP, "lanOnly", false);
+const requireApproval$ = bindValue<boolean>(GROUP, "requireApproval", true);
 const resyncMinutes$ = bindValue<string>(GROUP, "resyncMinutes", "15");
 const playerList$ = bindValue<string>(GROUP, "playerList", "[]");
+const pendingJoins$ = bindValue<string>(GROUP, "pendingJoins", "[]");
 
 interface ChatEntry {
     id: number;
@@ -88,6 +95,11 @@ interface PlayerEntry {
     isHost: boolean;
 }
 
+interface PendingJoin {
+    id: number;
+    name: string;
+}
+
 const parseChatLog = (json: string): ChatEntry[] => {
     try {
         const parsed = JSON.parse(json);
@@ -98,6 +110,15 @@ const parseChatLog = (json: string): ChatEntry[] => {
 };
 
 const parsePlayerList = (json: string): PlayerEntry[] => {
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
+const parsePendingJoins = (json: string): PendingJoin[] => {
     try {
         const parsed = JSON.parse(json);
         return Array.isArray(parsed) ? parsed : [];
@@ -510,6 +531,52 @@ const styles: Record<string, CSSProperties> = {
         fontSize: "11.5rem",
         color: "#ff9a8e",
     },
+    // Join-request prompt: floats at the top of the screen so the host notices it
+    // without being locked out of the game (only the cards capture input).
+    joinAnchor: {
+        position: "fixed",
+        top: "24rem",
+        left: 0,
+        right: 0,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        zIndex: 10002,
+        pointerEvents: "none",
+    },
+    joinCard: {
+        width: "440rem",
+        maxWidth: "90%",
+        backgroundColor: "rgba(24, 33, 51, 0.98)",
+        border: "1rem solid rgba(157, 193, 222, 0.3)",
+        borderLeft: "4rem solid #72c8f0",
+        borderRadius: "4rem",
+        padding: "16rem 18rem",
+        marginBottom: "10rem",
+        boxShadow: "0 12rem 36rem rgba(0, 0, 0, 0.5)",
+        pointerEvents: "auto",
+    },
+    joinCardTitle: {
+        fontSize: "12.5rem",
+        color: "#9dc1de",
+        textTransform: "uppercase",
+        letterSpacing: "1rem",
+        marginBottom: "8rem",
+    },
+    joinCardBody: {
+        fontSize: "15rem",
+        color: "#ffffff",
+        marginBottom: "14rem",
+        wordBreak: "break-word",
+    },
+    joinCardButtons: {
+        display: "flex",
+        justifyContent: "flex-end",
+    },
+    joinCardButton: {
+        marginLeft: "10rem",
+        padding: "7rem 18rem",
+    },
 };
 
 // ---- Form building blocks -----------------------------------------------------
@@ -633,6 +700,7 @@ const SettingsFields = () => {
     const hostPassword = useValue(hostPassword$);
     const maxPlayers = useValue(maxPlayers$);
     const lanOnly = useValue(lanOnly$);
+    const requireApproval = useValue(requireApproval$);
     const resyncMinutes = useValue(resyncMinutes$);
 
     return (
@@ -667,6 +735,12 @@ const SettingsFields = () => {
                 value={lanOnly}
                 disabled={inSession}
                 onChange={(v) => trigger(GROUP, "setLanOnly", v)}
+            />
+            <HubToggle
+                label={t(LOC.requireApproval, "Approve Players")}
+                value={requireApproval}
+                disabled={inSession}
+                onChange={(v) => trigger(GROUP, "setRequireApproval", v)}
             />
             <HubField
                 label={t(LOC.resyncMinutes, "World Re-sync (min)")}
@@ -1091,6 +1165,50 @@ const ToastList = ({ toasts }: { toasts: ChatEntry[] }) => (
     </div>
 );
 
+// Host-only prompt shown whenever one or more players are waiting to be let in.
+// It floats at the top of the screen (not a full-screen blocker) so the host can
+// keep playing and admit each join when ready. Always mounted with the right-menu
+// button, so it appears even when the hub panel is closed.
+const JoinRequestModal = () => {
+    const t = useT();
+    const isHost = useValue(isHost$);
+    const pendingJson = useValue(pendingJoins$);
+    const pending = useMemo(() => parsePendingJoins(pendingJson), [pendingJson]);
+
+    if (!isHost || pending.length === 0) return null;
+
+    return (
+        <Portal>
+            <div style={styles.joinAnchor}>
+                {pending.map((join) => (
+                    <InputActionBarrier key={join.id}>
+                        <div style={styles.joinCard} onMouseDown={(e) => e.stopPropagation()}>
+                            <div style={styles.joinCardTitle}>{t(LOC.joinRequestTitle, "Join Request")}</div>
+                            <div style={styles.joinCardBody}>
+                                {t(LOC.joinRequestBody, "{0} wants to join your session.").replace("{0}", join.name)}
+                            </div>
+                            <div style={styles.joinCardButtons}>
+                                <Button
+                                    variant="primary"
+                                    style={styles.joinCardButton}
+                                    onSelect={() => trigger(GROUP, "approveJoin", join.id)}>
+                                    {t(LOC.accept, "Accept")}
+                                </Button>
+                                <Button
+                                    variant="flat"
+                                    style={styles.joinCardButton}
+                                    onSelect={() => trigger(GROUP, "declineJoin", join.id)}>
+                                    {t(LOC.decline, "Decline")}
+                                </Button>
+                            </div>
+                        </div>
+                    </InputActionBarrier>
+                ))}
+            </div>
+        </Portal>
+    );
+};
+
 export const MultiplayerRightMenuButton = () => {
     const t = useT();
     const [open, setOpen] = useState(false);
@@ -1142,6 +1260,7 @@ export const MultiplayerRightMenuButton = () => {
 
     return (
         <>
+            <JoinRequestModal />
             <Tooltip tooltip={title} direction="left">
                 <div style={styles.buttonWrap} className={rmMenu ? rmMenu.item : undefined}>
                     <Button

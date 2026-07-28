@@ -3,10 +3,9 @@ using Game;
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
-    /// Observes the object tool after it has selected Apply and before ToolOutputSystem consumes the
-    /// standing preview. This is the exact hand-off point for rootless asset-stamp transactions.
-    /// Keep this system query-free: a preset made entirely from roads has no root object whose
-    /// presence could be used to decide whether the system should update.
+    /// Observes an object lifecycle tool after it has selected Apply and before ToolOutputSystem
+    /// consumes the standing preview. This is the exact hand-off point for one-shot upgrades,
+    /// relocations, rebuilds, and rootless asset-stamp transactions.
     /// </summary>
     public partial class ObjectToolApplyCaptureSystem : GameSystemBase
     {
@@ -28,7 +27,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // Rebind instead of silently losing the one-frame Apply pulse for every later stamp.
             if (_buildSync == null)
                 _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
-            _buildSync.CaptureAssetStampApplyBeforeToolOutput();
+            _buildSync.CaptureLocalObjectApplyBeforeToolOutput();
         }
     }
 }

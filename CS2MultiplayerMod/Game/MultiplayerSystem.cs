@@ -34,6 +34,30 @@ namespace CS2MultiplayerMod.Game
             _definitionEntities = GetEntityQuery(ComponentType.ReadOnly<global::Game.Tools.CreationDefinition>());
         }
 
+        /// <summary>
+        /// The game is about to replace the world - exiting to the main menu, loading
+        /// another city, starting a new one. This fires while the outgoing world (and its
+        /// sockets) are still alive, which is the moment a session has to be closed
+        /// properly. Failures are swallowed on purpose: the base class disables a system
+        /// that throws here, and losing the multiplayer pump is worse than a missed leave
+        /// notice (the per-frame watcher covers it).
+        /// </summary>
+        protected override void OnGamePreload(Colossal.Serialization.Entities.Purpose purpose,
+            global::Game.GameMode mode)
+        {
+            base.OnGamePreload(purpose, mode);
+            try
+            {
+                MultiplayerService service = Mod.Service;
+                if (service != null) service.HandleWorldTransition(purpose, mode);
+            }
+            catch (System.Exception ex)
+            {
+                Mod.log.Error("[MP] Session close on world transition failed: " + ex.Message);
+                FlightRecorder.NoteException("world-transition", ex);
+            }
+        }
+
         protected override void OnUpdate()
         {
             MultiplayerService service = Mod.Service;

@@ -175,7 +175,8 @@ namespace CS2MultiplayerMod.Core.Session
             // chat, blobs or resync requests while skipping the password entirely.
             bool handshakeTraffic = message.Type == MessageType.HandshakeRequest ||
                                     message.Type == MessageType.HandshakeResponse ||
-                                    message.Type == MessageType.HandshakeChallenge;
+                                    message.Type == MessageType.HandshakeChallenge ||
+                                    message.Type == MessageType.HandshakePending;
             if (!handshakeTraffic && (peer == null || !peer.Handshaked))
             {
                 Punt(connection, peer, "sent " + message.Type + " before authenticating", message.Type.ToString());
@@ -207,6 +208,9 @@ namespace CS2MultiplayerMod.Core.Session
                     break;
                 case MessageType.HandshakeResponse:
                     HandleHandshakeResponse(peer, (HandshakeResponse)message);
+                    break;
+                case MessageType.HandshakePending:
+                    HandleHandshakePending(connection, peer);
                     break;
                 case MessageType.Heartbeat:
                     HandleHeartbeat(connection, peer, (Heartbeat)message, nowUnixMs);

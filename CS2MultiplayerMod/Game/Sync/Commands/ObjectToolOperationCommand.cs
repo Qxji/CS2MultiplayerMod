@@ -22,6 +22,29 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         Area = 4,
     }
 
+    /// <summary>The owning buffer used for one stable step below a top-level object.</summary>
+    public enum PortableOwnerPathKind : byte
+    {
+        InstalledUpgrade = 1,
+        SubObject = 2,
+        SubNet = 3,
+        SubArea = 4,
+    }
+
+    /// <summary>
+    /// One owner-relative identity step. The sender's buffer index records the exact source slot;
+    /// prefab, entity kind, and same-prefab ordinal provide stable receiver-side lookup when
+    /// unrelated buffer entries differ.
+    /// </summary>
+    public struct PortableOwnerPathStep
+    {
+        public PortableOwnerPathKind BufferKind;
+        public PortableEntityKind EntityKind;
+        public string PrefabName;
+        public int BufferIndex;
+        public int PrefabOrdinal;
+    }
+
     /// <summary>
     /// Stable identity for an object, network element, or area. Entity indices never cross the
     /// wire; owned network elements additionally carry the top-level owner's identity and layer
@@ -39,6 +62,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public float OwnerRotX, OwnerRotY, OwnerRotZ, OwnerRotW;
         public uint RequiredLayers;
         public uint ConnectLayers;
+        public PortableOwnerPathStep[] OwnerPath;
     }
 
     public struct ObjectDefinitionIntent
@@ -134,7 +158,9 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public const short AssetStampRootIndex = -1;
         public const int MaxDefinitions = 1024;
         public const int MaxAreaNodesPerDefinition = 1024;
-        public const int MaxEncodedBytes = 120 * 1024;
+        public const int MaxOwnerPathDepth = 32;
+        public const int MaxOwnerBufferIndex = 32767;
+        public const int MaxEncodedBytes = 256 * 1024;
 
         private const uint KnownCreationFlags = 0xfffffu;
         private const uint KnownCoursePosFlags = 0x7fffu;
@@ -509,6 +535,23 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                 WriteQuaternion(writer, value.OwnerRotX, value.OwnerRotY,
                     value.OwnerRotZ, value.OwnerRotW);
             }
+            PortableOwnerPathStep[] ownerPath =
+                value.OwnerPath ?? new PortableOwnerPathStep[0];
+            if (ownerPath.Length > MaxOwnerPathDepth)
+                throw new ProtocolException("Portable owner path is too deep.");
+            if (ownerPath.Length != 0 && !hasOwner)
+                throw new ProtocolException("Portable owner path has no top-level owner.");
+            writer.WriteByte((byte)ownerPath.Length);
+            for (int i = 0; i < ownerPath.Length; i++)
+            {
+                PortableOwnerPathStep step = ownerPath[i];
+                ValidateOwnerPathStep(step);
+                writer.WriteByte((byte)step.BufferKind);
+                writer.WriteByte((byte)step.EntityKind);
+                writer.WriteString(step.PrefabName);
+                writer.WriteShort((short)step.BufferIndex);
+                writer.WriteShort((short)step.PrefabOrdinal);
+            }
             writer.WriteInt(unchecked((int)value.RequiredLayers));
             writer.WriteInt(unchecked((int)value.ConnectLayers));
         }
@@ -534,9 +577,48 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                 ReadQuaternion(reader, out value.OwnerRotX, out value.OwnerRotY,
                     out value.OwnerRotZ, out value.OwnerRotW, "portable owner rotation");
             }
+            int pathCount = reader.ReadByte();
+            if (pathCount > MaxOwnerPathDepth)
+                throw new ProtocolException("Portable owner path is too deep.");
+            if (pathCount != 0 && string.IsNullOrEmpty(value.OwnerPrefabName))
+                throw new ProtocolException("Portable owner path has no top-level owner.");
+            if (pathCount != 0)
+            {
+                value.OwnerPath = new PortableOwnerPathStep[pathCount];
+                for (int i = 0; i < pathCount; i++)
+                {
+                    var step = new PortableOwnerPathStep
+                    {
+                        BufferKind = (PortableOwnerPathKind)reader.ReadByte(),
+                        EntityKind = (PortableEntityKind)reader.ReadByte(),
+                        PrefabName = WireGuard.ReadName(reader),
+                        BufferIndex = reader.ReadShort(),
+                        PrefabOrdinal = reader.ReadShort(),
+                    };
+                    ValidateOwnerPathStep(step);
+                    value.OwnerPath[i] = step;
+                }
+            }
             value.RequiredLayers = unchecked((uint)reader.ReadInt());
             value.ConnectLayers = unchecked((uint)reader.ReadInt());
             return value;
+        }
+
+        private static void ValidateOwnerPathStep(PortableOwnerPathStep step)
+        {
+            if (step.BufferKind < PortableOwnerPathKind.InstalledUpgrade ||
+                step.BufferKind > PortableOwnerPathKind.SubArea)
+                throw new ProtocolException("Unknown portable owner buffer kind " +
+                                            (byte)step.BufferKind + ".");
+            if (step.EntityKind < PortableEntityKind.Object ||
+                step.EntityKind > PortableEntityKind.Area)
+                throw new ProtocolException("Unknown portable path entity kind " +
+                                            (byte)step.EntityKind + ".");
+            if (string.IsNullOrEmpty(step.PrefabName))
+                throw new ProtocolException("Portable owner path step has no prefab.");
+            if (step.BufferIndex < 0 || step.BufferIndex > MaxOwnerBufferIndex ||
+                step.PrefabOrdinal < 0 || step.PrefabOrdinal > MaxOwnerBufferIndex)
+                throw new ProtocolException("Portable owner path index is out of range.");
         }
 
         private static void WriteOptionalName(NetworkWriter writer, string value)

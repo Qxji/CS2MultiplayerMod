@@ -7,6 +7,10 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
     /// "A player attached an upgrade/extension to a service building." The upgrade and
     /// its owner both travel as prefab name + position so the receiver can find its own
     /// owner entity - see <see cref="UpgradeSyncSystem"/>.
+    ///
+    /// These fields are also the complete input set the game's own definition generator needs:
+    /// prefab, the building being upgraded, one placement transform, and the placing tool's seed.
+    /// The receiver re-runs that generator rather than rebuilding the transaction by hand.
     /// </summary>
     public sealed class UpgradePlacementCommand : ISimulationCommand
     {
@@ -18,6 +22,8 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public float PosX, PosY, PosZ;
         public float RotX, RotY, RotZ, RotW;
         public int RandomSeed;
+        /// <summary>The placing tool's own seed; every per-definition seed is derived from it.</summary>
+        public uint ToolRandomSeed;
 
         public ushort CommandId => Id;
 
@@ -29,6 +35,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             writer.WriteFloat(PosX); writer.WriteFloat(PosY); writer.WriteFloat(PosZ);
             writer.WriteFloat(RotX); writer.WriteFloat(RotY); writer.WriteFloat(RotZ); writer.WriteFloat(RotW);
             writer.WriteInt(RandomSeed);
+            writer.WriteInt(unchecked((int)ToolRandomSeed));
         }
 
         public void Read(NetworkReader reader)
@@ -44,6 +51,8 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             RandomSeed = reader.ReadInt();
             if (RandomSeed < 0 || RandomSeed > ushort.MaxValue)
                 throw new ProtocolException("Upgrade random seed is outside ushort range.");
+            // The tool seed is opaque: every 32-bit value is legal input to the game's generator.
+            ToolRandomSeed = unchecked((uint)reader.ReadInt());
             if (reader.Remaining != 0)
                 throw new ProtocolException("Trailing bytes in upgrade-placement command: " +
                                             reader.Remaining + ".");
@@ -51,7 +60,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
 
         public byte[] Encode()
         {
-            var writer = new NetworkWriter(96);
+            var writer = new NetworkWriter(112);
             Write(writer);
             return writer.ToArray();
         }

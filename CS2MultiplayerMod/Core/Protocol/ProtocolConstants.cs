@@ -4,9 +4,21 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v24 carries prefab-local placeholder-building attachments so a specialized
-        /// facility, its visible building, and its draggable extractor/storage area remain one
-        /// atomic object-tool operation. v23 carries owner-qualified extractor/storage area
+        /// Current v29 marks a disconnect notice as graceful, so a host that simply left the game
+        /// ends the session cleanly on every client instead of reporting a connection error.
+        /// v28 carries the placing tool's random seed and control-point elevation with
+        /// upgrade and relocation commands, so the receiver can re-run the game's own definition
+        /// generator against its own geometry instead of resolving the sender's finished batch.
+        /// v27 adds natural-disaster events: one command per disaster start, carrying the
+        /// place/size/duration/strength the game resolves at creation, with timings as frame counts
+        /// relative to the receiver's own clock. v26 adds a host-approval gate: after the automatic checks pass the host may
+        /// hold a join and send a HandshakePending marker, admitting the player only once the
+        /// host accepts by hand. v25 carries owner-buffer paths for building-owned objects, networks, and areas
+        /// so rebuild, relocation, and upgrade removal target the same structural child without
+        /// relying only on nearby geometry. v24 carries prefab-local placeholder-building
+        /// attachments so a specialized facility, its visible building, and its draggable
+        /// extractor/storage area remain one atomic object-tool operation. v23 carries
+        /// owner-qualified extractor/storage area
         /// snapshots so draggable facility borders can be updated or repaired independently of
         /// their building. v22 adds a host disconnect notice so kicked players receive a clear
         /// reason before their connection closes. v21 carries complete transport-route topology:
@@ -28,7 +40,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 24;
+        public const int ProtocolVersion = 29;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.
@@ -36,6 +48,12 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// cap enforced by <see cref="MessageCodec"/>.
         /// </summary>
         public const int MaxPayloadBytes = 16 * 1024 * 1024;
+
+        /// <summary>
+        /// Transport envelope cap for one simulation command. Large atomic building transactions
+        /// remain below this while individual command codecs enforce their own tighter limits.
+        /// </summary>
+        public const int MaxSimulationCommandPayloadBytes = 320 * 1024;
 
         /// <summary>One blob slice on the wire. Also the per-chunk cap on receive.</summary>
         public const int BlobChunkBytes = 256 * 1024;

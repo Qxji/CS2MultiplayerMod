@@ -40,25 +40,41 @@ namespace CS2MultiplayerMod.Core.Session
 
         private void ReapTimedOutPeers(long nowUnixMs)
         {
-            List<Peer> dead = null;
+            List<Peer> dead = null;         // dropped silently at the socket
+            List<Peer> unanswered = null;   // approvals the host never answered
             foreach (var pair in _peers)
             {
                 Peer peer = pair.Value;
-                bool expired = peer.Handshaked
-                    ? nowUnixMs - peer.LastSeenUnixMs > PeerTimeoutMs
-                    // Pending sockets must finish the handshake promptly or make room.
-                    : nowUnixMs - peer.ConnectedAtUnixMs > HandshakeTimeoutMs;
-                if (!expired) continue;
-                (dead ?? (dead = new List<Peer>())).Add(peer);
+                if (peer.Handshaked)
+                {
+                    if (nowUnixMs - peer.LastSeenUnixMs > PeerTimeoutMs)
+                        (dead ?? (dead = new List<Peer>())).Add(peer);
+                }
+                else if (peer.AwaitingApproval)
+                {
+                    // The host never accepted or declined in time — auto-decline so the
+                    // socket is freed and the waiting player is told why, instead of both
+                    // sides hanging on an absent host.
+                    if (nowUnixMs - peer.ConnectedAtUnixMs > JoinApprovalTimeoutMs)
+                        (unanswered ?? (unanswered = new List<Peer>())).Add(peer);
+                }
+                // Pending sockets must finish the handshake promptly or make room.
+                else if (nowUnixMs - peer.ConnectedAtUnixMs > HandshakeTimeoutMs)
+                    (dead ?? (dead = new List<Peer>())).Add(peer);
             }
 
-            if (dead == null) return;
-            foreach (Peer peer in dead)
-            {
-                _log.Warn((peer.Handshaked ? "Peer timed out: " : "Handshake timed out: ") + peer);
-                _transport.Disconnect(peer.Connection);
-                // The transport will also raise Disconnected; removal/notify happens there.
-            }
+            if (dead != null)
+                foreach (Peer peer in dead)
+                {
+                    _log.Warn((peer.Handshaked ? "Peer timed out: " : "Handshake timed out: ") + peer);
+                    _transport.Disconnect(peer.Connection);
+                    // The transport will also raise Disconnected; removal/notify happens there.
+                }
+
+            if (unanswered != null)
+                foreach (Peer peer in unanswered)
+                    // Reject logs, delivers the reason, flushes, and removes the peer.
+                    Reject(peer.Connection, "The host did not respond to your join request in time.");
         }
 
         /// <summary>

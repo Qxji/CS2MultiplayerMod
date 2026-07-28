@@ -9,13 +9,18 @@ namespace CS2MultiplayerMod.Core.Session
     {
         public readonly ConnectionId Connection;
 
-        /// <summary>Assigned by the host. 0 until the handshake completes.</summary>
+        /// <summary>Assigned by the host. 0 until the host assigns one - at the approval
+        /// prompt when approval is required, otherwise when the handshake completes.</summary>
         public int PlayerId;
 
         public string Name;
 
         /// <summary>True once the handshake has succeeded for this peer.</summary>
         public bool Handshaked;
+
+        /// <summary>Host-side: the join passed every automatic check and is waiting for the
+        /// host to approve or decline it by hand. Never overlaps <see cref="Handshaked"/>.</summary>
+        public bool AwaitingApproval;
 
         /// <summary>Local monotonic timestamp (Unix ms) of the last byte received from this peer.</summary>
         public long LastSeenUnixMs;

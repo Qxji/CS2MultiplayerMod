@@ -262,6 +262,25 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
             _log.Info("Client stopped.");
         }
 
+        public void ShutdownAfterFlush(int timeoutMs)
+        {
+            var connection = _connection;
+            if (connection == null) { Shutdown(); return; }
+
+            _active = false;
+            connection.CloseAfterFlush("client left the session");
+
+            // The connection's OnClosed runs once the send thread has drained and hung up.
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (connection.PendingSendBytes > 0 && deadline.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(5);
+
+            connection.Close("client shutting down");
+            _connection = null;
+
+            _log.Info("Client stopped.");
+        }
+
         public void Dispose() => Shutdown();
     }
 }

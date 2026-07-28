@@ -68,6 +68,17 @@ namespace CS2MultiplayerMod.Core.Session
             string reason = WireGuard.SanitizeText(notice != null ? notice.Reason : null, 512);
             if (string.IsNullOrEmpty(reason))
                 reason = "The host ended your multiplayer session.";
+
+            // A graceful notice means the session simply ended - the host quit the game or
+            // went back to the main menu. Nothing failed, so it must not surface as a
+            // connection error; the player is told what happened and the session closes.
+            if (notice != null && notice.Graceful)
+            {
+                NotifyChat(null, reason);
+                EndByRemote(reason);
+                return;
+            }
+
             Fault(reason);
         }
     }

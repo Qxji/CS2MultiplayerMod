@@ -73,12 +73,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                             out ownerPrefab, out ownerTransform)) continue;
 
                     float3[] ring = ReadRing(entity);
-                    if (ring.Length < 3) continue;
-
                     float3[] old;
                     bool had = _knownRings.TryGetValue(entity, out old);
+                    // Record even a lot that is not a polygon yet: a building placed without
+                    // drawing its area keeps the prefab's seed nodes, and without that baseline
+                    // the player's first real draw reads as a first sighting and is never sent.
                     _nextRings[entity] = ring;
-                    if (!had || RingsEqual(old, ring)) continue;
+                    if (ring.Length < 3 || !had || RingsEqual(old, ring)) continue;
 
                     string name = _prefabSystem.GetPrefabName(areaPrefab);
                     if (string.IsNullOrEmpty(name)) continue;

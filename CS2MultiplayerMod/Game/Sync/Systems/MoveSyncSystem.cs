@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Game;
+using Game.Buildings;
 using Game.Common;
 using Game.Objects;
 using Game.Prefabs;
@@ -15,10 +16,9 @@ using CS2MultiplayerMod.Game.Sync.Commands;
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
-    /// Replicates building relocation: detect Updated + <see cref="MovedLocation"/> and
-    /// broadcast <see cref="ObjectMoveCommand"/> (old position identifies entity). Realize
-    /// by spawning <see cref="CreationDefinition"/> with <c>m_Original</c> and
-    /// Permanent|Relocate flags, same as game's move tool.
+    /// Replicates relocations. A simple unowned object moves through one relocate definition;
+    /// anything with owned geometry (a building's lot, driveways, installed upgrades) is re-derived
+    /// on the receiver by the game's own definition generator from the same inputs the move tool had.
     /// </summary>
     public partial class MoveSyncSystem : GameSystemBase
     {
@@ -156,6 +156,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     if (math.distancesq(oldPos, transform.m_Position) < 0.01f) continue;
                     if (_guard.Consume(MoveKey(name, transform.m_Position), now)) continue;
 
+                    // A building's lot, driveways and installed upgrades move with it, and the move
+                    // tool carries them as explicit definitions rather than re-deriving them. The
+                    // receiver reproduces that by re-running the game's own generator over the same
+                    // inputs, so the whole owned graph follows from prefab + old position + new
+                    // transform - no need to ship the sender's several-hundred-definition batch.
+                    float elevation = EntityManager.HasComponent<Elevation>(entity)
+                        ? EntityManager.GetComponentData<Elevation>(entity).m_Elevation
+                        : 0f;
                     var command = new ObjectMoveCommand
                     {
                         PrefabName = name,
@@ -163,6 +171,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         NewX = transform.m_Position.x, NewY = transform.m_Position.y, NewZ = transform.m_Position.z,
                         RotX = transform.m_Rotation.value.x, RotY = transform.m_Rotation.value.y,
                         RotZ = transform.m_Rotation.value.z, RotW = transform.m_Rotation.value.w,
+                        Elevation = elevation,
+                        ToolRandomSeed = buildSync.AppliedLifecycleToolSeed,
                     };
                     session.SendCommand(0, ObjectMoveCommand.Id, command.Encode());
                     Mod.Verbose("[MP] MoveSync captured relocation of '" + name + "'.");
@@ -174,6 +184,41 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        /// <summary>
+        /// Publish a relocation observed in the applying tool's own definitions (see
+        /// <c>BuildSyncSystem.CaptureLocalRelocationForApply</c>). That is the reliable signal: the
+        /// apply pass records no "came from" marker on the moved entity itself.
+        /// </summary>
+        public void PublishLocalRelocation(Entity prefab, float3 oldPosition, float3 newPosition,
+            quaternion rotation, float elevation, uint toolSeed)
+        {
+            MultiplayerService service = Mod.Service;
+            if (service == null || !service.GameplaySyncReady) return;
+            if (math.distancesq(oldPosition, newPosition) < 0.01f) return;
+
+            string name = _prefabSystem.GetPrefabName(prefab);
+            if (string.IsNullOrEmpty(name)) return;
+
+            long now = service.NowMs;
+            // Also stops the MovedLocation sweep below from sending this same move again.
+            _guard.Mark(MoveKey(name, newPosition), now);
+
+            var command = new ObjectMoveCommand
+            {
+                PrefabName = name,
+                OldX = oldPosition.x, OldY = oldPosition.y, OldZ = oldPosition.z,
+                NewX = newPosition.x, NewY = newPosition.y, NewZ = newPosition.z,
+                RotX = rotation.value.x, RotY = rotation.value.y,
+                RotZ = rotation.value.z, RotW = rotation.value.w,
+                Elevation = elevation,
+                ToolRandomSeed = toolSeed,
+            };
+            service.Session.SendCommand(0, ObjectMoveCommand.Id, command.Encode());
+            Mod.Verbose("[MP] MoveSync captured relocation of '" + name + "' from the tool definition.");
+            Diagnostics.FlightRecorder.Note("relocation captured prefab=" + name +
+                " seed=" + toolSeed);
+        }
+
         private void RealizeIncoming(MultiplayerSession session, long now)
         {
             if (_hasBlockedMove)
@@ -181,9 +226,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 if (!TryRealizeMove(_blockedMove, now))
                 {
                     if (now < _blockedMoveDeadline) return;
-                    Mod.log.Warn("[MP] MoveSync: relocation target did not resolve within the retry window; " +
-                                 "requesting world recovery.");
-                    SyncInbox.RequestResync("building relocation target did not resolve");
+                    // The object to relocate never arrived here. Drop the relocation rather than
+                    // loop the whole world through recovery (which re-failed every reload).
+                    Mod.log.Warn("[MP] MoveSync: relocation target did not resolve within the retry " +
+                                 "window; dropping this move (use /sync if the city drifts).");
+                    Diagnostics.FlightRecorder.Note("legacy move dropped after retry window");
                     _hasBlockedMove = false;
                     _blockedMove = null;
                     return;
@@ -212,8 +259,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             try { command = ObjectMoveCommand.Decode(message.Body); }
             catch (System.Exception ex)
             {
+                // A malformed peer command is not local corruption; drop it, do not resync.
                 Mod.log.Warn("[MP] MoveSync: dropping malformed command: " + ex.Message);
-                SyncInbox.RequestResync("malformed building relocation command");
                 return true;
             }
 
@@ -228,6 +275,35 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // A reliable replay may arrive after this same move already committed.
                 if (FindAt(prefab, newPos) != Entity.Null) return true;
                 return false;
+            }
+            var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
+            if (RequiresCompleteLifecycle(original))
+            {
+                // Moving only the root would leave this object's owned lot, driveways and upgrades
+                // behind. Hand the same inputs the move tool had to the game's own generator: it
+                // emits the relocation of every owned element, re-commits the roads the object was
+                // and is attached to, and clears what the new footprint covers.
+                SimulationCommandMessage retained = message;
+                BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+                BuildSyncSystem.NativeDeriveResult derived = buildSync.TryDeriveObjectTransaction(
+                    prefab, Entity.Null, original, newPos, rotation, command.Elevation,
+                    command.ToolRandomSeed, "move " + command.PrefabName,
+                    () => _incoming.Enqueue(retained), null);
+                if (derived == BuildSyncSystem.NativeDeriveResult.Busy) return false;
+                if (derived == BuildSyncSystem.NativeDeriveResult.Armed)
+                {
+                    _guard.Mark(MoveKey(command.PrefabName, newPos), now);
+                    Mod.Verbose("[MP] MoveSync realize: derived relocation of '" +
+                                command.PrefabName + "' from player " + message.OriginPlayerId + ".");
+                    return true;
+                }
+                if (derived == BuildSyncSystem.NativeDeriveResult.Failed) return true;
+
+                // No generator on this build of the game: a root-only move is worse than none, since
+                // it would strand the owned graph at the old position.
+                Mod.log.Warn("[MP] MoveSync: relocation of '" + command.PrefabName +
+                             "' needs the game's definition generator; dropping this move.");
+                return true;
             }
 
             _guard.Mark(MoveKey(command.PrefabName, newPos), now);
@@ -247,7 +323,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     EntityManager.AddComponentData(definition, new ObjectDefinition
                     {
                         m_Position = newPos,
-                        m_Rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW),
+                        m_Rotation = rotation,
                         m_Scale = new float3(1f, 1f, 1f),
                         m_Probability = 100,
                     });
@@ -259,8 +335,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             catch (System.Exception ex)
             {
-                Mod.log.Error("[MP] MoveSync realize FAILED for '" + command.PrefabName + "': " + ex);
-                SyncInbox.RequestResync("legacy building relocation failed");
+                // The definition was rejected before commit; drop this move rather than freeze
+                // the world (the placer can /sync if the object looks out of place).
+                Mod.log.Error("[MP] MoveSync realize FAILED for '" + command.PrefabName +
+                              "'; dropping this move: " + ex);
+                Diagnostics.FlightRecorder.Note("legacy move realize failed; dropped");
             }
             return true;
         }
@@ -282,6 +361,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 candidates.Dispose();
             }
             return Entity.Null;
+        }
+
+        private bool RequiresCompleteLifecycle(Entity entity)
+        {
+            return EntityManager.HasComponent<Building>(entity) ||
+                   EntityManager.HasBuffer<global::Game.Buildings.InstalledUpgrade>(entity) ||
+                   EntityManager.HasBuffer<global::Game.Objects.SubObject>(entity) ||
+                   EntityManager.HasBuffer<global::Game.Net.SubNet>(entity) ||
+                   EntityManager.HasBuffer<global::Game.Areas.SubArea>(entity);
         }
 
         private static string MoveKey(string prefabName, float3 newPosition) =>

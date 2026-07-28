@@ -215,6 +215,40 @@ namespace CS2MultiplayerMod.Game
         /// <summary>/sync: ask the host for a fresh world stream (host: refresh everyone).</summary>
         public void RequestWorldSync() => _session.RequestWorldSync();
 
+        /// <summary>
+        /// One unresolved remote edit (a missed native capture, an owned sub-element that would not
+        /// resolve) must never loop the whole tens-of-MB world through recovery. A single automatic
+        /// recovery repairs a genuine divergence; a second inside this window is a storm — it freezes
+        /// both players for the length of a save+stream and does not fix the offending edit, which
+        /// simply re-triggers after every reload (the exact 52 MB epoch-loop seen in the field). EVERY
+        /// automatic caller funnels through here so none can bypass the cap; only manual /sync and the
+        /// settings button call <see cref="RequestWorldSync"/> directly.
+        /// </summary>
+        private const long AutoRecoveryCooldownMs = 90000;
+        private long _lastAutoRecoveryMs = long.MinValue;
+
+        public void RequestAutomaticWorldRecovery(string reason)
+        {
+            if (_session == null || _session.Status != SessionStatus.Connected) return;
+            long now = NowMs;
+            bool recovering = _worldSyncBarrierActive ||
+                              _phase == ClientWorldPhase.WaitingForMap ||
+                              _phase == ClientWorldPhase.LoadingMap ||
+                              _phase == ClientWorldPhase.WaitingForResume;
+            if (recovering || now - _lastAutoRecoveryMs < AutoRecoveryCooldownMs)
+            {
+                _log.Warn("[MP] Suppressed automatic world recovery (" + reason +
+                          "): a recovery is already in progress or within the cooldown. The offending " +
+                          "edit is left un-synced; use /sync if the city looks out of step.");
+                Diagnostics.FlightRecorder.Note("auto recovery suppressed (cooldown/in-progress): " + reason);
+                return;
+            }
+            _lastAutoRecoveryMs = now;
+            _log.Warn("[MP] Requesting world recovery: " + reason + ".");
+            Diagnostics.FlightRecorder.Note("resync requested: " + reason);
+            _session.RequestWorldSync();
+        }
+
         // ---- Chat log (in-game hub panel) --------------------------------------
 
         /// <summary>Bounded - old lines fall off so an all-night session cannot grow the UI payload.</summary>

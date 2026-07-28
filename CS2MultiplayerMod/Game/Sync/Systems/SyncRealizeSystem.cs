@@ -21,6 +21,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private AreaSyncSystem _areaSync;
         private RouteSyncSystem _routeSync;
         private TilePurchaseSyncSystem _tileSync;
+        private DisasterSyncSystem _disasterSync;
 
         protected override void OnCreate()
         {
@@ -37,6 +38,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _areaSync = World.GetOrCreateSystemManaged<AreaSyncSystem>();
             _routeSync = World.GetOrCreateSystemManaged<RouteSyncSystem>();
             _tileSync = World.GetOrCreateSystemManaged<TilePurchaseSyncSystem>();
+            _disasterSync = World.GetOrCreateSystemManaged<DisasterSyncSystem>();
         }
 
         private bool _wasDeferringTerrain;
@@ -96,6 +98,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _routeSync.FinalizePending();
             if (!deferNetworkDependents) _routeSync.RealizePending();
             _tileSync.RealizePending();
+            // Disaster events are plain simulation entities - no definitions, no terrain
+            // dependency - but they must still be created here: the game's event initialization
+            // runs later this frame and only ever looks at freshly Created events.
+            _disasterSync.RealizePending();
         }
     }
 }

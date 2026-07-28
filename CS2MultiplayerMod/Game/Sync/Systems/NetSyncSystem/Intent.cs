@@ -38,7 +38,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             bool pointOperation = netTool.actualMode == global::Game.Tools.NetToolSystem.Mode.Point;
 
             var next = new List<NetPlacementCommand>();
-            bool overflow = false;
+            // A course of this operation that cannot be expressed on the wire voids the whole native
+            // envelope. Publishing the rest would ship a self-consistent but INCOMPLETE operation
+            // (CourseCount counts only what survived) and would then suppress final-edge capture too,
+            // so the missing courses would never reach the other machines at all.
+            string rejection = null;
+            int rejected = 0;
             for (int i = 0; i < definitions.Length; i++)
             {
                 Entity entity = definitions[i];
@@ -47,34 +52,59 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
 
                 CreationDefinition definition = EntityManager.GetComponentData<CreationDefinition>(entity);
-                if (!IsPlainLocalNetDefinition(definition)) continue;
+                if (!IsPlainLocalNetDefinition(definition))
+                {
+                    rejected++;
+                    rejection = rejection ?? "reference an original/owner or use a non-placement mode";
+                    continue;
+                }
 
                 NetCourse course = EntityManager.GetComponentData<NetCourse>(entity);
                 // Point-mode network prefabs intentionally commit a zero-length course (for example
                 // a circular junction). Other modes' zero-length definitions are only cursor markers.
                 if (course.m_Length < 1f && !pointOperation) continue;
 
-                NetPlacementCommand command = CaptureDefinitionCommand(definition, course);
-                if (command == null) continue;
+                bool unrepresentable;
+                NetPlacementCommand command = CaptureDefinitionCommand(definition, course,
+                    out unrepresentable);
+                if (command == null)
+                {
+                    if (!unrepresentable) continue;
+                    rejected++;
+                    rejection = rejection ?? "target an owned sub-net whose owner cannot be named";
+                    continue;
+                }
                 if (next.Count >= NetPlacementCommand.MaxCoursesPerOperation)
                 {
-                    overflow = true;
+                    rejected++;
+                    rejection = "exceed the " + NetPlacementCommand.MaxCoursesPerOperation +
+                                "-course cap";
                     break;
                 }
                 next.Add(command);
             }
 
-            if (overflow)
+            if (next.Count == 0)
             {
-                _cachedLocalCourses.Clear();
-                Mod.log.Warn("[MP] NetSync: local operation exceeded the native-course cap; " +
-                             "using final-edge capture for this apply.");
+                // Nothing plain to publish. An apply made up entirely of upgrades, replaces or
+                // deletes belongs to another sync system and never had a native envelope to void,
+                // so leave the cache and stay quiet - the steady-state frame rule above applies.
+                return;
             }
-            else if (next.Count > 0)
+
+            _cachedLocalCourses.Clear();
+            if (rejection == null)
             {
-                _cachedLocalCourses.Clear();
                 _cachedLocalCourses.AddRange(next);
+                return;
             }
+
+            Mod.log.Warn("[MP] NetSync: local net operation cannot be replayed as one atomic apply (" +
+                         rejected + " of " + (rejected + next.Count) + " courses " + rejection +
+                         "); falling back to final-edge capture, which rebuilds it segment by segment " +
+                         "on the other machines.");
+            Diagnostics.FlightRecorder.Note("net native capture voided rejected=" + rejected + "/" +
+                                              (rejected + next.Count));
         }
 
         /// <summary>
@@ -175,8 +205,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                    definition.m_Attached == Entity.Null && (definition.m_Flags & incompatible) == 0;
         }
 
-        private NetPlacementCommand CaptureDefinitionCommand(CreationDefinition definition, NetCourse course)
+        /// <summary>
+        /// Build the wire command for one course definition. A null result with
+        /// <paramref name="unrepresentable"/> false is a deliberate skip (the game's own hidden
+        /// sub-nets); true means this course belongs to the operation but cannot be replayed, which
+        /// voids the native envelope.
+        /// </summary>
+        private NetPlacementCommand CaptureDefinitionCommand(CreationDefinition definition,
+            NetCourse course, out bool unrepresentable)
         {
+            unrepresentable = false;
             string prefabName = PrefabNameOf(definition.m_Prefab);
             if (string.IsNullOrEmpty(prefabName) || prefabName.StartsWith("Invisible")) return null;
 
@@ -211,10 +249,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             };
             if ((command.Start.Kind == NetEndpointTargetKind.OwnedNode ||
                  command.Start.Kind == NetEndpointTargetKind.OwnedEdge) &&
-                string.IsNullOrEmpty(command.Start.OwnerPrefabName)) return null;
+                string.IsNullOrEmpty(command.Start.OwnerPrefabName))
+            {
+                unrepresentable = true;
+                return null;
+            }
             if ((command.End.Kind == NetEndpointTargetKind.OwnedNode ||
                  command.End.Kind == NetEndpointTargetKind.OwnedEdge) &&
-                string.IsNullOrEmpty(command.End.OwnerPrefabName)) return null;
+                string.IsNullOrEmpty(command.End.OwnerPrefabName))
+            {
+                unrepresentable = true;
+                return null;
+            }
             return command;
         }
 

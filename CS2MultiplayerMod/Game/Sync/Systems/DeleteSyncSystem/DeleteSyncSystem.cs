@@ -54,6 +54,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private PrefabIndex _prefabIndex;
         private NetSyncSystem _netSync;
         private EntityQuery _deletedObjects;
+        private EntityQuery _deletedOwnedUpgrades;
+        private EntityQuery _liveOwnedUpgrades;
         private EntityQuery _deletedEdges;
         private EntityQuery _createdEdges;
         private EntityQuery _updatedEdges;
@@ -89,6 +91,54 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 {
                     ComponentType.ReadOnly<Temp>(),
                     ComponentType.ReadOnly<Owner>(),
+                    ComponentType.ReadOnly<Edge>(),
+                    ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
+                    ComponentType.ReadOnly<global::Game.Creatures.Creature>(),
+                },
+            });
+
+            // Owned service upgrades removed on their own (the building properties panel tags just
+            // that entity Deleted - no tool involved). See IsStandaloneUpgradeRemoval for why a host
+            // delete's children are not published here.
+            // Live owned service upgrades, so a removal aimed at one can find it (see Realize).
+            _liveOwnedUpgrades = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[]
+                {
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Transform>(),
+                    ComponentType.ReadOnly<Owner>(),
+                },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<global::Game.Buildings.ServiceUpgrade>(),
+                    ComponentType.ReadOnly<global::Game.Buildings.Extension>(),
+                },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Temp>(),
+                    ComponentType.ReadOnly<Deleted>(),
+                    ComponentType.ReadOnly<Edge>(),
+                },
+            });
+
+            _deletedOwnedUpgrades = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[]
+                {
+                    ComponentType.ReadOnly<Deleted>(),
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Transform>(),
+                    ComponentType.ReadOnly<Owner>(),
+                },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<global::Game.Buildings.ServiceUpgrade>(),
+                    ComponentType.ReadOnly<global::Game.Buildings.Extension>(),
+                },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Temp>(),
                     ComponentType.ReadOnly<Edge>(),
                     ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
                     ComponentType.ReadOnly<global::Game.Creatures.Creature>(),

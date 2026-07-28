@@ -22,6 +22,14 @@ namespace CS2MultiplayerMod.Core.Session
         /// <summary>Host only. Hard cap on simultaneous players, including the host.</summary>
         public readonly int MaxPlayers;
 
+        /// <summary>
+        /// Host only. When true, a join that passes every automatic check still waits for
+        /// the host to approve it by hand before the player is admitted. Defaults to false
+        /// so programmatic hosts (and the test harness) admit valid joins immediately; the
+        /// in-game host setting turns it on by default.
+        /// </summary>
+        public readonly bool RequireJoinApproval;
+
         /// <summary>Mod build identifier, compared strictly during the handshake.</summary>
         public readonly string ModVersion;
 
@@ -37,7 +45,8 @@ namespace CS2MultiplayerMod.Core.Session
 
         public MultiplayerConfig(string playerName, string hostAddress, int port, string password = "",
                                  bool lanOnly = true, bool useEncryption = true, int maxPlayers = 8,
-                                 string modVersion = "", string gameVersion = "", string[] dlcList = null)
+                                 string modVersion = "", string gameVersion = "", string[] dlcList = null,
+                                 bool requireJoinApproval = false)
         {
             PlayerName = string.IsNullOrEmpty(playerName) ? "Player" : playerName;
             HostAddress = string.IsNullOrEmpty(hostAddress) ? "127.0.0.1" : hostAddress;
@@ -49,6 +58,7 @@ namespace CS2MultiplayerMod.Core.Session
             ModVersion = modVersion ?? string.Empty;
             GameVersion = gameVersion ?? string.Empty;
             DlcList = dlcList ?? System.Array.Empty<string>();
+            RequireJoinApproval = requireJoinApproval;
         }
     }
 }

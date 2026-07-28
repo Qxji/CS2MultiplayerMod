@@ -157,6 +157,8 @@ namespace CS2MultiplayerMod.Game
                         : L10n.Key.TitleConnectionFailed);
                 if (_session.Status == SessionStatus.Faulted)
                     return L10n.T(L10n.Key.TitleConnectionFailed);
+                if (_session.Role == SessionRole.Client && _session.AwaitingHostApproval)
+                    return L10n.T(L10n.Key.TitleAwaitingApproval);
                 if (_session.Status == SessionStatus.Connecting)
                     return L10n.T(L10n.Key.StateConnecting);
                 if (_session.Role == SessionRole.Host && _worldSyncBarrierActive)
@@ -286,6 +288,8 @@ namespace CS2MultiplayerMod.Game
 
         private string ClientWorldSyncDetail()
         {
+            if (_session.AwaitingHostApproval)
+                return L10n.T(L10n.Key.DetailAwaitingApproval);
             if (_session.Status == SessionStatus.Connecting ||
                 _phase == ClientWorldPhase.Connecting)
                 return L10n.T(L10n.Key.DetailContactingHost);
@@ -312,6 +316,8 @@ namespace CS2MultiplayerMod.Game
         {
             if (FaultContains(fault, "removed you") || FaultContains(fault, "kicked"))
                 return L10n.T(L10n.Key.ErrorRemoved);
+            if (FaultContains(fault, "declined") || FaultContains(fault, "did not respond to your join"))
+                return L10n.T(L10n.Key.ErrorDeclined);
             if (FaultContains(fault, "Incorrect password") ||
                 FaultContains(fault, "requires a password"))
                 return L10n.T(L10n.Key.ErrorPassword);
@@ -345,6 +351,8 @@ namespace CS2MultiplayerMod.Game
         {
             if (FaultContains(fault, "removed you") || FaultContains(fault, "kicked"))
                 return L10n.T(L10n.Key.ErrorRemovedHelp);
+            if (FaultContains(fault, "declined") || FaultContains(fault, "did not respond to your join"))
+                return L10n.T(L10n.Key.ErrorDeclinedHelp);
             if (FaultContains(fault, "Incorrect password") ||
                 FaultContains(fault, "requires a password"))
                 return L10n.T(L10n.Key.ErrorPasswordHelp);

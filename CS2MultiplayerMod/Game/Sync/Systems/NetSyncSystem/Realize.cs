@@ -46,6 +46,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private readonly Dictionary<NetOperationKey, int> _operationBuildFailures =
             new Dictionary<NetOperationKey, int>();
 
+        // Operations whose Temp batch this machine has already armed at least once. Reconciling a
+        // partially present operation is how a lost commit recovers; the SAME state on an operation
+        // seen for the first time means the two worlds disagree about what is already built.
+        private readonly CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NetOperationKey>
+            _armedNetOperations =
+                new CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NetOperationKey>();
+        private const long ArmedOperationWindowMs = 60000;
+
+        // Existing edges this batch's courses will split, keyed by the local edge and remembering
+        // which source edge claimed it. See TryClaimSplitTarget.
+        private readonly Dictionary<Entity, Bezier4x3> _batchSplitClaims =
+            new Dictionary<Entity, Bezier4x3>();
+
         private struct PreparedNativeCourse
         {
             public NetPlacementCommand Command;
@@ -125,6 +138,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             var createdDefinitions = new List<Entity>(work.Count);
             var realizedCourses = new List<RealizedCourse>(work.Count);
             bool abortWholeOperation = false;
+            bool abortAliasedSplit = false;
             string abortReason = null;
             long constructionCost = 0;
             int chargedCourses = 0;
@@ -169,7 +183,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Operation = operationHeader.OperationId,
                     };
                     bool unresolvedOperationTarget = false;
+                    bool aliasedSplitTarget = false;
                     int alreadyBuiltCourses = 0;
+                    _batchSplitClaims.Clear();
 
                     for (int i = 0; i < work.Count; i++)
                     {
@@ -268,19 +284,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
                         NetPrefabInfo placedInfo = NetInfoOf(prefab);
                         bool resolved = true;
-                        Entity ignoredEntity;
-                        float ignoredT;
-                        int ignoredKind;
+                        Entity resolvedTarget;
+                        float resolvedT;
+                        int resolvedKind;
                         if (HasExternalNativeTarget(command.Start.Kind))
-                            resolved &= TryResolveNativeEndpoint(command.Start, placedInfo,
+                        {
+                            bool ok = TryResolveNativeEndpoint(command.Start, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out ignoredEntity, out ignoredT, out ignoredKind);
+                                out resolvedTarget, out resolvedT, out resolvedKind);
+                            resolved &= ok;
+                            if (ok && !TryClaimSplitTarget(command.Start, resolvedTarget, resolvedKind))
+                                aliasedSplitTarget = true;
+                        }
                         if (HasExternalNativeTarget(command.End.Kind))
-                            resolved &= TryResolveNativeEndpoint(command.End, placedInfo,
+                        {
+                            bool ok = TryResolveNativeEndpoint(command.End, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out ignoredEntity, out ignoredT, out ignoredKind);
+                                out resolvedTarget, out resolvedT, out resolvedKind);
+                            resolved &= ok;
+                            if (ok && !TryClaimSplitTarget(command.End, resolvedTarget, resolvedKind))
+                                aliasedSplitTarget = true;
+                        }
                         if (!resolved) unresolvedOperationTarget = true;
                     }
 
@@ -322,6 +348,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         return;
                     }
                     else _nativeOperationDeadlines.Remove(operationRetryKey);
+
+                    // Every target resolved, but two of them collapsed onto one local edge. There is
+                    // no safe way to commit that batch and no way to repair it from here: the missing
+                    // split belongs to work this machine never applied.
+                    if (aliasedSplitTarget)
+                    {
+                        _operationBuildFailures.Remove(operationRetryKey);
+                        Mod.log.Warn("[MP] NetSync: native operation " + operationHeader.OperationId +
+                                     " resolved two different source edges onto one local edge - this " +
+                                     "machine is missing an earlier split. Requesting world recovery " +
+                                     "rather than committing an aliased batch.");
+                        Diagnostics.FlightRecorder.Note("net native op aliased split target op=" +
+                                                          operationHeader.OperationId +
+                                                          " courses=" + work.Count);
+                        SyncInbox.RequestResync("net split target aliased by local divergence");
+                        return;
+                    }
+
+                    // A first-sight operation that is already partly present means the two worlds
+                    // disagree about what is built. Reconciling still commits atomically, so let it
+                    // through, but record it: the source applied a different course set than this
+                    // batch will, and CourseSplitSystem resolves intersections from what it is given.
+                    if (alreadyBuiltCourses > 0 && !_armedNetOperations.Contains(operationRetryKey, now))
+                        Diagnostics.FlightRecorder.Note("net native op partial on first sight op=" +
+                                                          operationHeader.OperationId + " present=" +
+                                                          alreadyBuiltCourses + "/" + work.Count);
+                    _armedNetOperations.Remember(operationRetryKey, now, ArmedOperationWindowMs);
                 }
 
                 for (int i = 0; i < work.Count; i++)
@@ -450,6 +503,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
                                 out endSnap, out endT, out endKind);
+
+                        // Endpoints the source left for local inference never went through the
+                        // operation preflight, so claim every native split target here too.
+                        if (nativeOperation &&
+                            (!TryClaimSplitTarget(command.Start, startSnap, startKind) ||
+                             !TryClaimSplitTarget(command.End, endSnap, endKind)))
+                        {
+                            abortWholeOperation = true;
+                            abortAliasedSplit = true;
+                            abortReason = "two courses resolved onto the same existing edge";
+                            break;
+                        }
 
                         NativeTargetRetryKey retryKey = NativeRetryKey(message, command);
                         if (!nativeTargetsResolved)
@@ -586,7 +651,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     int failures;
                     _operationBuildFailures.TryGetValue(failureKey, out failures);
                     failures++;
-                    bool retry = failures <= 3;
+                    // Aliasing is deterministic: retrying the same courses against the same local
+                    // geometry resolves them onto the same edge again. Recover the world instead.
+                    bool retry = failures <= 3 && !abortAliasedSplit;
+                    if (abortAliasedSplit) SyncInbox.RequestResync("net split target aliased by local divergence");
                     if (retry)
                     {
                         _operationBuildFailures[failureKey] = failures;
@@ -598,12 +666,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
                     ReleaseTrackedTemps(_isolatedLocalTemps);
                     ForceActiveToolUpdate();
+                    string outcome;
+                    if (retry) outcome = "; retrying the whole operation (" + failures + "/3).";
+                    else if (abortAliasedSplit) outcome = "; dropped and requested world recovery.";
+                    else outcome = "; dropped after 3 retries.";
                     Mod.log.Warn("[MP] NetSync: native operation rolled back before generation - " +
-                                 abortReason + (retry
-                                     ? "; retrying the whole operation (" + failures + "/3)."
-                                     : "; dropped after 3 retries."));
-                    Diagnostics.FlightRecorder.Note("net native op rollback before generation retry=" +
-                                                      (retry ? failures : 0));
+                                 abortReason + outcome);
+                    Diagnostics.FlightRecorder.Note(abortAliasedSplit
+                        ? "net native op aliased split target op=" + header.OperationId
+                        : "net native op rollback before generation retry=" + (retry ? failures : 0));
                     return;
                 }
 
@@ -708,6 +779,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private void PruneCompletedNetOperations(long now)
         {
             _completedNetOperations.Prune(now);
+            _armedNetOperations.Prune(now);
         }
 
         /// <summary>
@@ -722,6 +794,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private static bool HasExternalNativeTarget(NetEndpointTargetKind kind) =>
             kind == NetEndpointTargetKind.Node || kind == NetEndpointTargetKind.Edge ||
             kind == NetEndpointTargetKind.OwnedNode || kind == NetEndpointTargetKind.OwnedEdge;
+
+        /// <summary>
+        /// Record that a resolved endpoint will split <paramref name="target"/>, and report whether
+        /// that claim is consistent with the source operation.
+        ///
+        /// Several courses of one operation may legitimately tap the SAME source edge: CourseSplitSystem
+        /// receives them together and cuts that edge once into all of its pieces. Two courses that named
+        /// DIFFERENT source edges but land on the same local edge are a different matter - this machine
+        /// never received the split that separated them. Committing both would hand the apply pass two
+        /// Temps sharing one original, which it dereferences without a liveness check.
+        /// </summary>
+        private bool TryClaimSplitTarget(NetEndpointIntent intent, Entity target, int kind)
+        {
+            if (kind != KindSplit || target == Entity.Null) return true;
+            Bezier4x3 source = TargetCurveOf(intent);
+            Bezier4x3 claimed;
+            if (!_batchSplitClaims.TryGetValue(target, out claimed))
+            {
+                _batchSplitClaims[target] = source;
+                return true;
+            }
+            return SameCurveBits(claimed, source) || SameCurveBitsReversed(claimed, source);
+        }
 
         /// <summary>
         /// Pull one complete source operation from the ordered command streams. Messages belonging

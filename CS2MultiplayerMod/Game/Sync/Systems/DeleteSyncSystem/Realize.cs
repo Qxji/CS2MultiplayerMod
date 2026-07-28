@@ -33,13 +33,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             float radiusSq = ObjectMatchRadius * ObjectMatchRadius;
             int deleted = 0, deletedOwned = 0, waiting = 0, expired = 0;
 
-            NativeArray<Entity> entities = _liveObjects.ToEntityArray(Allocator.Temp);
-            int n = entities.Length;
+            // Candidates are top-level objects plus live owned service upgrades. A removal aimed at
+            // one upgrade has to find that owned entity; the cross-prefab growable fallback below
+            // cannot reach it, because an upgrade is not a spawnable building.
+            NativeArray<Entity> topLevel = _liveObjects.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> ownedUpgrades = _liveOwnedUpgrades.IsEmptyIgnoreFilter
+                ? default(NativeArray<Entity>)
+                : _liveOwnedUpgrades.ToEntityArray(Allocator.Temp);
+            int ownedCount = ownedUpgrades.IsCreated ? ownedUpgrades.Length : 0;
+            int n = topLevel.Length + ownedCount;
+            var entities = new NativeArray<Entity>(n, Allocator.Temp);
             var positions = new NativeArray<float3>(n, Allocator.Temp);
             var prefabs = new NativeArray<Entity>(n, Allocator.Temp);
             var taken = new HashSet<Entity>();
             try
             {
+                for (int i = 0; i < topLevel.Length; i++) entities[i] = topLevel[i];
+                for (int i = 0; i < ownedCount; i++) entities[topLevel.Length + i] = ownedUpgrades[i];
                 for (int i = 0; i < n; i++)
                 {
                     positions[i] = EntityManager.GetComponentData<Transform>(entities[i]).m_Position;
@@ -146,6 +156,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 positions.Dispose();
                 prefabs.Dispose();
                 entities.Dispose();
+                topLevel.Dispose();
+                if (ownedUpgrades.IsCreated) ownedUpgrades.Dispose();
             }
 
             if (deleted > 0 || waiting > 0 || expired > 0)

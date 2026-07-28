@@ -103,6 +103,9 @@ namespace CS2MultiplayerMod.Game
                 () => Mod.Service != null ? Mod.Service.PlayerCount : 0));
             AddUpdateBinding(new GetterValueBinding<string>(Group, "playerList",
                 () => Mod.Service != null ? Mod.Service.PlayerListJson : "[]"));
+            // Joins waiting for the host's approval (empty on a client / when approval is off).
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "pendingJoins",
+                () => Mod.Service != null ? Mod.Service.PendingJoinsJson : "[]"));
             // Hosting shares the loaded city, so it needs one — and no running session.
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "canHost",
                 () => Mod.Setting != null && !Mod.Setting.CannotStartHost() && MultiplayerService.ModEnabled));
@@ -115,6 +118,8 @@ namespace CS2MultiplayerMod.Game
                 () => Mod.Setting != null ? Mod.Setting.MaxPlayers : "8"));
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "lanOnly",
                 () => Mod.Setting != null && Mod.Setting.LanOnly));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "requireApproval",
+                () => Mod.Setting == null || Mod.Setting.RequireJoinApproval));
             AddUpdateBinding(new GetterValueBinding<string>(Group, "resyncMinutes",
                 () => Mod.Setting != null ? Mod.Setting.ResyncMinutes : "15"));
 
@@ -128,6 +133,8 @@ namespace CS2MultiplayerMod.Game
                 value => { if (Mod.Setting != null) Mod.Setting.MaxPlayers = value; }));
             AddBinding(new TriggerBinding<bool>(Group, "setLanOnly",
                 value => { if (Mod.Setting != null) Mod.Setting.LanOnly = value; }));
+            AddBinding(new TriggerBinding<bool>(Group, "setRequireApproval",
+                value => { if (Mod.Setting != null) Mod.Setting.RequireJoinApproval = value; }));
             AddBinding(new TriggerBinding<string>(Group, "setResyncMinutes",
                 value => { if (Mod.Setting != null) Mod.Setting.ResyncMinutes = value; }));
 
@@ -137,6 +144,10 @@ namespace CS2MultiplayerMod.Game
                 playerId => { if (Mod.Service != null) Mod.Service.KickPlayerFromUi(playerId); }));
             AddBinding(new TriggerBinding<int>(Group, "banPlayer",
                 playerId => { if (Mod.Service != null) Mod.Service.BanPlayerFromUi(playerId); }));
+            AddBinding(new TriggerBinding<int>(Group, "approveJoin",
+                playerId => { if (Mod.Service != null) Mod.Service.ApproveJoinFromUi(playerId); }));
+            AddBinding(new TriggerBinding<int>(Group, "declineJoin",
+                playerId => { if (Mod.Service != null) Mod.Service.DeclineJoinFromUi(playerId); }));
             AddBinding(new TriggerBinding(Group, "hostStart", () =>
             {
                 if (Mod.Service == null || Mod.Setting == null) return;

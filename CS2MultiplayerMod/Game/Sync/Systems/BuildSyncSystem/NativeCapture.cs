@@ -44,6 +44,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         public bool NativeLifecycleCapturedThisFrame => _nativeLifecycleCapturedThisFrame;
 
         /// <summary>
+        /// True while the object half of a specialized-industry placement is held for its area tool to
+        /// finish the polygon. The compact upgrade command cannot describe that polygon, so it must
+        /// not publish a stand-in while the complete transaction is still being assembled.
+        /// </summary>
+        internal bool HasPendingSpecializedAreaCapture =>
+            _pendingSpecializedObjectOperation != null ||
+            (_areaToolSystem != null && _areaToolSystem.recreate != Entity.Null);
+
+        /// <summary>
         /// Process object-tool output after the output barrier. A late Apply must publish the
         /// previously cached standing preview before this frame's replacement preview is cached.
         /// Keeping both actions here makes that ordering an invariant of the capture pipeline.
@@ -57,9 +66,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         /// <summary>
-        /// Cache the active object tool's complete definition batch after the output barrier. This
-        /// is the last point at which exact placement, ownership, relocation, area, and connector
-        /// intent is available together, before generation reduces it to final entities.
+        /// Cache the active object-lifecycle tool's complete definition batch after the output
+        /// barrier. This is the last point at which exact placement, ownership, relocation, area,
+        /// and connector intent is available together, before generation reduces it to final
+        /// entities.
         /// </summary>
         private void ObserveLocalObjectDefinitions(NativeArray<Entity> definitions)
         {
@@ -88,7 +98,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         !SpecializedAreaOwnerStillMatches(recreate,
                             _pendingSpecializedObjectOperation))
                     {
-                        ClearSpecializedAreaCapture();
+                        FinishSpecializedAreaCaptureWithoutPolygon();
                     }
                     else
                     {
@@ -110,9 +120,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
             }
 
+            // The area tool is gone without a completed polygon: the placement stands with the
+            // lot it was born with, so the held object graph is the whole local change.
             if (_pendingSpecializedObjectOperation != null)
-                ClearSpecializedAreaCapture();
-            if (!(active is ObjectToolSystem))
+                FinishSpecializedAreaCaptureWithoutPolygon();
+            if (!IsObjectLifecycleTool(active))
             {
                 // ToolSystem keeps the tool that actually ran this ToolUpdate as its last tool even
                 // when a one-shot placement switches activeTool before the output barrier. Its Apply
@@ -133,6 +145,111 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             CaptureObjectToolOperation(definitions);
         }
 
+        private static bool IsObjectLifecycleTool(global::Game.Tools.ToolBaseSystem tool) =>
+            tool is ObjectToolSystem || tool is UpgradeToolSystem;
+
+        /// <summary>
+        /// Cheap flag-only scan: true when this output batch relocates an existing object (the move
+        /// tool). Reads one component per definition and returns on the first Relocate, so it stays
+        /// far below the cost of the full owner-path capture it lets us skip.
+        /// </summary>
+        private bool BatchIsRelocate(NativeArray<Entity> definitions)
+        {
+            for (int i = 0; i < definitions.Length; i++)
+            {
+                Entity entity = definitions[i];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
+                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
+                if ((creation.m_Flags & CreationFlags.Relocate) != 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Cheap component-only scan: true when this batch adds a service upgrade / extension to a
+        /// pre-existing (live) building — the deliberate "add a tower" action UpgradeSyncSystem
+        /// replicates atomically.
+        ///
+        /// Two shapes must both be present, and together they separate this action from every
+        /// neighbouring one without touching the world:
+        /// <list type="bullet">
+        /// <item>a new upgrade/extension object: its prefab carries <see cref="ServiceUpgradeData"/>
+        /// or <see cref="BuildingExtensionData"/>, it has an <see cref="OwnerDefinition"/> (the way
+        /// the tools name the host building — <c>CreationDefinition.m_Owner</c> stays null for the
+        /// object being placed, so testing that field never matched), and it has no original;</item>
+        /// <item>the host building's own modify definition: no prefab, <see cref="CreationFlags.Upgrade"/>,
+        /// and an original that is already a live object. A brand-new building emits no such
+        /// definition (there is nothing live to modify), so a placement is never diverted.</item>
+        /// </list>
+        /// Upgrades whose lot is drawn by the player (extractor/storage areas) are excluded: only the
+        /// native two-tool transaction can carry that polygon.
+        /// </summary>
+        private bool BatchIsServiceUpgradeOnLiveBuilding(NativeArray<Entity> definitions)
+        {
+            bool hasNewUpgradeObject = false;
+            bool hasLiveHostModification = false;
+            for (int i = 0; i < definitions.Length; i++)
+            {
+                Entity entity = definitions[i];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
+                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
+
+                if (!hasLiveHostModification && creation.m_Prefab == Entity.Null &&
+                    (creation.m_Flags & CreationFlags.Upgrade) != 0 &&
+                    IsLiveUpgradeHost(creation.m_Original))
+                    hasLiveHostModification = true;
+
+                if (!hasNewUpgradeObject && creation.m_Prefab != Entity.Null &&
+                    creation.m_Original == Entity.Null &&
+                    EntityManager.HasComponent<ObjectDefinition>(entity) &&
+                    EntityManager.HasComponent<OwnerDefinition>(entity) &&
+                    (EntityManager.HasComponent<ServiceUpgradeData>(creation.m_Prefab) ||
+                     EntityManager.HasComponent<BuildingExtensionData>(creation.m_Prefab)) &&
+                    UpgradeOwnedGraphIsPrefabDeterministic(creation.m_Prefab))
+                    hasNewUpgradeObject = true;
+
+                if (hasNewUpgradeObject && hasLiveHostModification) return true;
+            }
+            return false;
+        }
+
+        /// <summary>An already-committed object the tools can modify (not a preview, not this frame's).</summary>
+        private bool IsLiveUpgradeHost(Entity entity)
+        {
+            return entity != Entity.Null && EntityManager.Exists(entity) &&
+                   EntityManager.HasComponent<global::Game.Objects.Object>(entity) &&
+                   EntityManager.HasComponent<global::Game.Objects.Transform>(entity) &&
+                   !EntityManager.HasComponent<Temp>(entity) &&
+                   !EntityManager.HasComponent<Deleted>(entity) &&
+                   !EntityManager.HasComponent<Created>(entity);
+        }
+
+        /// <summary>
+        /// True when an upgrade's owned elements can be rebuilt on the peer from its prefab alone.
+        /// An extractor/storage sub-area is drawn by the player through a second tool, so its polygon
+        /// exists nowhere in the prefab and only the native transaction can carry it.
+        /// </summary>
+        internal bool UpgradeOwnedGraphIsPrefabDeterministic(Entity prefab)
+        {
+            if (!EntityManager.HasBuffer<SubArea>(prefab)) return true;
+            DynamicBuffer<SubArea> subAreas =
+                EntityManager.GetBuffer<SubArea>(prefab, isReadOnly: true);
+            for (int i = 0; i < subAreas.Length; i++)
+            {
+                Entity declared = subAreas[i].m_Prefab;
+                if (declared == Entity.Null || !EntityManager.Exists(declared)) continue;
+                if (IsSpecializedAreaPrefab(declared)) return false;
+                if (!EntityManager.HasBuffer<PlaceholderObjectElement>(declared)) continue;
+                DynamicBuffer<PlaceholderObjectElement> candidates =
+                    EntityManager.GetBuffer<PlaceholderObjectElement>(declared, isReadOnly: true);
+                for (int j = 0; j < candidates.Length; j++)
+                    if (IsSpecializedAreaPrefab(candidates[j].m_Object)) return false;
+            }
+            return true;
+        }
+
         private bool ContainsObjectOrAssetStampDefinition(NativeArray<Entity> definitions)
         {
             for (int i = 0; i < definitions.Length; i++)
@@ -150,39 +267,77 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureObjectToolOperation(NativeArray<Entity> definitions)
         {
+            // A relocation or an upgrade of a live building is not shipped as definitions at all.
+            // Capturing one walks that building's full owned-element buffers once for every one of
+            // its (often 100+) sub-elements and scores every object definition against the whole
+            // city's object set - every frame the preview stands, which is the FPS collapse while
+            // moving and while positioning an extension. Replaying one then required resolving all
+            // those references on the receiver, which cannot succeed when the two machines have a
+            // road subdivided differently.
+            //
+            // Both instead travel as the compact inputs their tool had (MoveSyncSystem,
+            // UpgradeSyncSystem) and the receiver re-runs the game's own generator over them.
+            // Upgrades whose lot the player draws are the exception: no compact form can carry that
+            // polygon, so BatchIsServiceUpgradeOnLiveBuilding deliberately does not claim them.
+            if (BatchIsRelocate(definitions) || BatchIsServiceUpgradeOnLiveBuilding(definitions))
+            {
+                _cachedLocalObjectOperation = null;
+                return;
+            }
+
             var captured = new List<ObjectToolDefinitionIntent>();
             int root = -1;
+            int rootScore = -1;
             bool hasStampingNet = false;
-            for (int i = 0; i < definitions.Length; i++)
+            // Root scoring asks whether a definition's owner names a live building, which searches the
+            // object domain. Capture is read-only, so one snapshot serves the whole batch: without it
+            // a 116-definition building preview walked the city's ~270k objects once per definition,
+            // every frame the preview stood.
+            BeginPortableResolve();
+            try
             {
-                Entity entity = definitions[i];
-                if (!EntityManager.Exists(entity) ||
-                    !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
-
-                ObjectToolDefinitionIntent definition;
-                if (!TryCaptureObjectToolDefinition(entity, out definition))
+                for (int i = 0; i < definitions.Length; i++)
                 {
-                    // Never publish a partial native action. The final-entity legacy path remains
-                    // available for unsupported tool output, but this cache is all-or-nothing.
-                    _cachedLocalObjectOperation = null;
-                    return;
-                }
+                    Entity entity = definitions[i];
+                    if (!EntityManager.Exists(entity) ||
+                        !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
 
-                // Owned subobjects carry OwnerDefinition, while the top-level object does not.
-                // Prefer that structural distinction first, then a newly-created object over an
-                // update definition for an existing owner (the usual attached-upgrade ordering).
-                if (definition.Kind == ObjectToolDefinitionKind.Object &&
-                    (root < 0 || IsBetterObjectOperationRoot(definition, captured[root])))
-                    root = captured.Count;
-                if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
-                    (((CreationFlags)definition.CreationFlags & CreationFlags.Stamping) != 0))
-                    hasStampingNet = true;
-                captured.Add(definition);
-                if (captured.Count > ObjectToolOperationCommand.MaxDefinitions)
-                {
-                    _cachedLocalObjectOperation = null;
-                    return;
+                    ObjectToolDefinitionIntent definition;
+                    if (!TryCaptureObjectToolDefinition(entity, out definition))
+                    {
+                        // Never publish a partial native action. The final-entity legacy path remains
+                        // available for unsupported tool output, but this cache is all-or-nothing.
+                        _cachedLocalObjectOperation = null;
+                        return;
+                    }
+
+                    // Owned subobjects carry OwnerDefinition, while the top-level object does not.
+                    // Prefer that structural distinction first, then a newly-created object over an
+                    // update definition for an existing owner (the usual attached-upgrade ordering).
+                    // Scored once per definition, never re-scoring the incumbent.
+                    if (definition.Kind == ObjectToolDefinitionKind.Object)
+                    {
+                        int score = ObjectOperationRootScore(definition);
+                        if (score > rootScore)
+                        {
+                            root = captured.Count;
+                            rootScore = score;
+                        }
+                    }
+                    if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
+                        (((CreationFlags)definition.CreationFlags & CreationFlags.Stamping) != 0))
+                        hasStampingNet = true;
+                    captured.Add(definition);
+                    if (captured.Count > ObjectToolOperationCommand.MaxDefinitions)
+                    {
+                        _cachedLocalObjectOperation = null;
+                        return;
+                    }
                 }
+            }
+            finally
+            {
+                EndPortableResolve();
             }
 
             if (captured.Count == 0)
@@ -235,12 +390,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                   " seed=" + unchecked((ushort)captured[root].RandomSeed));
         }
 
-        private bool IsBetterObjectOperationRoot(ObjectToolDefinitionIntent candidate,
-            ObjectToolDefinitionIntent current)
-        {
-            return ObjectOperationRootScore(candidate) > ObjectOperationRootScore(current);
-        }
-
         private int ObjectOperationRootScore(ObjectToolDefinitionIntent definition)
         {
             int score = 0;
@@ -263,14 +412,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 !definition.HasOwnerDefinition) return false;
 
             CreationFlags flags = (CreationFlags)definition.CreationFlags;
-            if ((flags & CreationFlags.Upgrade) == 0 ||
-                (flags & (CreationFlags.Delete | CreationFlags.Relocate |
+            if ((flags & (CreationFlags.Delete | CreationFlags.Relocate |
                           CreationFlags.Recreate | CreationFlags.Permanent)) != 0) return false;
 
             Entity prefab;
-            return _prefabIndex.TryResolve(definition.PrefabName, out prefab) &&
-                   (EntityManager.HasComponent<ServiceUpgradeData>(prefab) ||
-                    EntityManager.HasComponent<BuildingExtensionData>(prefab));
+            if (!_prefabIndex.TryResolve(definition.PrefabName, out prefab) ||
+                (!EntityManager.HasComponent<ServiceUpgradeData>(prefab) &&
+                 !EntityManager.HasComponent<BuildingExtensionData>(prefab)))
+                return false;
+
+            // Service-upgrade definitions identify their existing building through
+            // OwnerDefinition. They do not necessarily carry CreationFlags.Upgrade. Requiring the
+            // owner to be live distinguishes this action from integral owned objects emitted while
+            // a brand-new building is still only a preview.
+            Entity ownerPrefab;
+            if (!_prefabIndex.TryResolve(definition.OwnerDefinitionPrefabName, out ownerPrefab))
+                return false;
+            return FindPortableObject(ownerPrefab,
+                       new float3(definition.OwnerDefinitionX, definition.OwnerDefinitionY,
+                           definition.OwnerDefinitionZ),
+                       default(PortableEntityRef)) != Entity.Null;
         }
 
         private void RememberSelectedAssetStampPrefab(global::Game.Tools.ToolBaseSystem active)
@@ -697,6 +858,78 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        /// <summary>
+        /// Publish the held object half when the area tool hands a specialized-industry building
+        /// back without a drawn polygon. Cancelling the polygon, or leaving the tool, keeps the
+        /// committed building and the lot it was placed with - a complete local change that
+        /// used to be discarded with the pending capture, leaving the building on one machine.
+        /// The graph is sent exactly as the object tool emitted it, since the abandoned edit
+        /// changed nothing the receiver has to reproduce.
+        /// </summary>
+        private void FinishSpecializedAreaCaptureWithoutPolygon()
+        {
+            ObjectToolOperationCommand operation = _pendingSpecializedObjectOperation;
+            if (operation == null)
+            {
+                ClearSpecializedAreaCapture();
+                return;
+            }
+
+            if (!SpecializedPlacementStillCommitted(operation))
+            {
+                Diagnostics.FlightRecorder.Note(
+                    "specialized object/area handoff ended with no committed building");
+                ClearSpecializedAreaCapture();
+                return;
+            }
+
+            try
+            {
+                if (TryPublishLocalObjectOperation(operation))
+                    Diagnostics.FlightRecorder.Note("specialized object without area captured op=" +
+                        operation.OperationId + " defs=" + operation.Definitions.Length);
+            }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] BuildSync: specialized object without area was not sent: " +
+                             ex.Message);
+                Diagnostics.FlightRecorder.Note("specialized object without area rejected=" +
+                                                  ex.GetType().Name);
+            }
+            finally
+            {
+                ClearSpecializedAreaCapture();
+                _cachedLocalObjectOperation = null;
+            }
+        }
+
+        /// <summary>
+        /// True when the building this held graph describes is standing. The held lot is the
+        /// cheapest proof; if the abandoned edit took the lot with it, the committed root object
+        /// itself still decides. Either way a placement that never committed is not published.
+        /// </summary>
+        private bool SpecializedPlacementStillCommitted(ObjectToolOperationCommand operation)
+        {
+            if (SpecializedAreaOwnerStillMatches(_pendingSpecializedArea, operation)) return true;
+
+            ObjectToolDefinitionIntent root;
+            Entity rootPrefab;
+            if (!TryGetNewCommittedObjectRoot(operation, out root) ||
+                !_prefabIndex.TryResolve(root.PrefabName, out rootPrefab)) return false;
+
+            BeginPortableResolve();
+            try
+            {
+                return FindPortableObject(rootPrefab,
+                    new float3(root.Object.PosX, root.Object.PosY, root.Object.PosZ),
+                    default(PortableEntityRef)) != Entity.Null;
+            }
+            finally
+            {
+                EndPortableResolve();
+            }
+        }
+
         private void ClearSpecializedAreaCapture()
         {
             _pendingSpecializedObjectOperation = null;
@@ -718,7 +951,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (!TryCaptureCompletedSpecializedArea(out completed))
             {
                 Diagnostics.FlightRecorder.Note("specialized object/area apply not observed");
-                ClearSpecializedAreaCapture();
+                FinishSpecializedAreaCaptureWithoutPolygon();
                 return;
             }
             _pendingSpecializedAreaDefinition = completed;
@@ -804,36 +1037,105 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         /// <summary>
-        /// Capture a rootless asset stamp in the narrow phase between ObjectToolSystem selecting
-        /// Apply and ToolOutputSystem consuming its standing preview. The cached command is that
-        /// complete preview graph; the definitions generated later in the frame are the next ghost.
+        /// Publish a relocation from the definition graph the tool is applying.
+        ///
+        /// A tool records definitions through <c>ToolOutputBarrier</c>, which plays back at the end of
+        /// ToolUpdate, and drops their one-frame <see cref="Updated"/> tag at Cleanup. So in the window
+        /// before <see cref="ToolOutputSystem"/> the un-tagged definitions still standing are exactly
+        /// the ones the Temps now committing were generated from - the tools' own definition query.
+        /// The root <see cref="CreationFlags.Relocate"/> definition names the moved entity in
+        /// <c>m_Original</c> and its destination in <see cref="ObjectDefinition"/>, which together are
+        /// the whole compact command; the receiver re-derives the owned graph from them.
         /// </summary>
-        public void CaptureAssetStampApplyBeforeToolOutput()
+        private void CaptureLocalRelocationForApply()
         {
-            ObjectToolOperationCommand operation = _cachedLocalObjectOperation;
-            if (_nativeLifecycleCapturedThisFrame || operation == null || !operation.IsAssetStamp ||
-                operation.Definitions == null || _toolSystem == null ||
+            if (_standingDefinitions.IsEmptyIgnoreFilter) return;
+            MoveSyncSystem moveSync = World.GetExistingSystemManaged<MoveSyncSystem>();
+            if (moveSync == null) return;
+
+            NativeArray<Entity> definitions = _standingDefinitions.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < definitions.Length; i++)
+                {
+                    Entity entity = definitions[i];
+                    if (!EntityManager.Exists(entity) ||
+                        !EntityManager.HasComponent<CreationDefinition>(entity) ||
+                        !EntityManager.HasComponent<ObjectDefinition>(entity)) continue;
+
+                    CreationDefinition creation =
+                        EntityManager.GetComponentData<CreationDefinition>(entity);
+                    if ((creation.m_Flags & CreationFlags.Relocate) == 0) continue;
+                    // Owned elements of the moved building carry their own Relocate definitions; the
+                    // root is the one the tool was given, which has no owner above it.
+                    if (creation.m_Owner != Entity.Null ||
+                        EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
+
+                    Entity original = creation.m_Original;
+                    if (original == Entity.Null || !EntityManager.Exists(original) ||
+                        !EntityManager.HasComponent<global::Game.Objects.Transform>(original) ||
+                        !EntityManager.HasComponent<PrefabRef>(original)) continue;
+
+                    ObjectDefinition placement =
+                        EntityManager.GetComponentData<ObjectDefinition>(entity);
+                    moveSync.PublishLocalRelocation(
+                        EntityManager.GetComponentData<PrefabRef>(original).m_Prefab,
+                        EntityManager.GetComponentData<global::Game.Objects.Transform>(original)
+                            .m_Position,
+                        placement.m_Position, placement.m_Rotation, placement.m_Elevation,
+                        AppliedLifecycleToolSeed);
+                    return;
+                }
+            }
+            finally
+            {
+                definitions.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Capture an object lifecycle action in the narrow phase between its tool selecting Apply
+        /// and ToolOutputSystem consuming the standing preview. The cached command is that complete
+        /// graph; definitions generated later in the frame belong to the next preview.
+        /// </summary>
+        public void CaptureLocalObjectApplyBeforeToolOutput()
+        {
+            if (_nativeLifecycleCapturedThisFrame || _toolSystem == null ||
+                !_localObjectToolRanThisFrame ||
                 _toolSystem.applyMode != ApplyMode.Apply) return;
+
+            // Read the relocation the tool is about to apply straight from its definitions. The
+            // committed entity is not a reliable signal: the apply pass does not record where an
+            // object came from, so a detector keyed on that never fires for a building.
+            CaptureLocalRelocationForApply();
 
             // A remote net transaction owns this frame's ApplyTool pass. Its isolation deliberately
             // prevents the local preview from committing, so it must not be published as local work.
             if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedToolCommit) return;
 
-            string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
-                                   _selectedAssetStampPrefabName;
-            if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
-                    System.StringComparison.Ordinal)) return;
+            ObjectToolOperationCommand operation = _cachedLocalObjectOperation;
+            if (operation == null || operation.Definitions == null) return;
+
+            if (operation.IsAssetStamp)
+            {
+                string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
+                                       _selectedAssetStampPrefabName;
+                if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
+                        System.StringComparison.Ordinal)) return;
+            }
 
             _localObjectApplyThisFrame = true;
-            Diagnostics.FlightRecorder.Note("asset stamp apply captured before tool output defs=" +
-                                              operation.Definitions.Length + " prefab=" +
-                                              operation.AssetStampPrefabName);
+            Diagnostics.FlightRecorder.Note((operation.IsAssetStamp
+                ? "asset stamp"
+                : "object lifecycle") + " apply captured before tool output defs=" +
+                                              operation.Definitions.Length);
             PublishCachedLocalObjectOperation();
         }
 
         /// <summary>
-        /// Process the cached batch when the object tool enters Apply. New top-level placements
-        /// remain cached until their generated root proves which preview graph committed.
+        /// Process the cached batch when an object lifecycle tool enters Apply. New top-level
+        /// placements and upgrades remain cached until their generated root proves which preview
+        /// graph committed.
         /// </summary>
         public void CaptureLocalObjectApply()
         {
@@ -1099,20 +1401,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private bool TryCaptureCourseTarget(Entity entity, out PortableEntityRef value)
         {
-            value = new PortableEntityRef { Kind = PortableEntityKind.None };
-            // Course endpoints in a standing object preview can point at the previous preview's
-            // Temp nodes. Those entity handles only exist on this machine. Follow their live
-            // original when there is one; a preview-only endpoint must be regenerated from the
-            // transmitted course position, just as it is for a fresh native sub-network.
+            return TryCapturePortableRef(entity, out value);
+        }
+
+        private bool TryGetStablePortableEntity(Entity entity, out Entity stable)
+        {
+            stable = entity;
+            // Standing definitions can reference the previous preview's Temp graph. Follow its
+            // live original; a preview-only target is represented as None and regenerated from the
+            // transmitted definition on the receiver.
             const int maxTempDepth = 16;
-            Entity stable = entity;
             for (int depth = 0; stable != Entity.Null && depth < maxTempDepth; depth++)
             {
                 if (!EntityManager.Exists(stable)) return false;
                 if (!EntityManager.HasComponent<Temp>(stable))
                 {
-                    if (EntityManager.HasComponent<Deleted>(stable)) return false;
-                    return TryCapturePortableRef(stable, out value);
+                    return !EntityManager.HasComponent<Deleted>(stable);
                 }
 
                 Entity original = EntityManager.GetComponentData<Temp>(stable).m_Original;
@@ -1126,6 +1430,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool TryCapturePortableRef(Entity entity, out PortableEntityRef value)
         {
             value = new PortableEntityRef { Kind = PortableEntityKind.None };
+            if (!TryGetStablePortableEntity(entity, out entity)) return false;
             if (entity == Entity.Null) return true;
             if (!EntityManager.Exists(entity) || !EntityManager.HasComponent<PrefabRef>(entity))
                 return false;
@@ -1197,7 +1502,184 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             value.OwnerRotY = ownerTransform.m_Rotation.value.y;
             value.OwnerRotZ = ownerTransform.m_Rotation.value.z;
             value.OwnerRotW = ownerTransform.m_Rotation.value.w;
+            PortableOwnerPathStep[] ownerPath;
+            if (TryCaptureOwnerPath(entity, topOwner, out ownerPath))
+                value.OwnerPath = ownerPath;
             return true;
+        }
+
+        private bool TryCaptureOwnerPath(Entity entity, Entity topOwner,
+            out PortableOwnerPathStep[] result)
+        {
+            result = null;
+            if (entity == Entity.Null || topOwner == Entity.Null || entity == topOwner)
+                return false;
+
+            var reversed = new List<PortableOwnerPathStep>();
+            Entity cursor = entity;
+            while (cursor != topOwner)
+            {
+                if (reversed.Count >= ObjectToolOperationCommand.MaxOwnerPathDepth ||
+                    !EntityManager.HasComponent<Owner>(cursor)) return false;
+                Entity owner = EntityManager.GetComponentData<Owner>(cursor).m_Owner;
+                if (owner == Entity.Null || owner == cursor || !EntityManager.Exists(owner))
+                    return false;
+                PortableOwnerPathStep step;
+                if (!TryCaptureOwnerPathStep(owner, cursor, out step)) return false;
+                reversed.Add(step);
+                cursor = owner;
+            }
+
+            reversed.Reverse();
+            result = reversed.ToArray();
+            return result.Length != 0;
+        }
+
+        private bool TryCaptureOwnerPathStep(Entity owner, Entity child,
+            out PortableOwnerPathStep step)
+        {
+            step = default(PortableOwnerPathStep);
+            if (!EntityManager.HasComponent<PrefabRef>(child)) return false;
+            Entity childPrefab = EntityManager.GetComponentData<PrefabRef>(child).m_Prefab;
+            string childPrefabName;
+            PortableEntityKind childKind;
+            if (!TryPrefabName(childPrefab, out childPrefabName) ||
+                !TryGetPortableEntityKind(child, out childKind)) return false;
+
+            if (EntityManager.HasBuffer<global::Game.Buildings.InstalledUpgrade>(owner))
+            {
+                DynamicBuffer<global::Game.Buildings.InstalledUpgrade> buffer =
+                    EntityManager.GetBuffer<global::Game.Buildings.InstalledUpgrade>(
+                        owner, isReadOnly: true);
+                int ordinal = 0;
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    Entity candidate = buffer[i].m_Upgrade;
+                    bool same = MatchesOwnerPathSibling(owner, candidate, childPrefab, childKind);
+                    if (candidate == child)
+                    {
+                        step = CreateOwnerPathStep(PortableOwnerPathKind.InstalledUpgrade,
+                            childKind, childPrefabName, i, ordinal);
+                        return true;
+                    }
+                    if (same) ordinal++;
+                }
+            }
+            if (EntityManager.HasBuffer<global::Game.Objects.SubObject>(owner))
+            {
+                DynamicBuffer<global::Game.Objects.SubObject> buffer =
+                    EntityManager.GetBuffer<global::Game.Objects.SubObject>(
+                        owner, isReadOnly: true);
+                int ordinal = 0;
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    Entity candidate = buffer[i].m_SubObject;
+                    bool same = MatchesOwnerPathSibling(owner, candidate, childPrefab, childKind);
+                    if (candidate == child)
+                    {
+                        step = CreateOwnerPathStep(PortableOwnerPathKind.SubObject,
+                            childKind, childPrefabName, i, ordinal);
+                        return true;
+                    }
+                    if (same) ordinal++;
+                }
+            }
+            if (EntityManager.HasBuffer<global::Game.Net.SubNet>(owner))
+            {
+                DynamicBuffer<global::Game.Net.SubNet> buffer =
+                    EntityManager.GetBuffer<global::Game.Net.SubNet>(
+                        owner, isReadOnly: true);
+                int ordinal = 0;
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    Entity candidate = buffer[i].m_SubNet;
+                    bool same = MatchesOwnerPathSibling(owner, candidate, childPrefab, childKind);
+                    if (candidate == child)
+                    {
+                        step = CreateOwnerPathStep(PortableOwnerPathKind.SubNet,
+                            childKind, childPrefabName, i, ordinal);
+                        return true;
+                    }
+                    if (same) ordinal++;
+                }
+            }
+            if (EntityManager.HasBuffer<global::Game.Areas.SubArea>(owner))
+            {
+                DynamicBuffer<global::Game.Areas.SubArea> buffer =
+                    EntityManager.GetBuffer<global::Game.Areas.SubArea>(
+                        owner, isReadOnly: true);
+                int ordinal = 0;
+                for (int i = 0; i < buffer.Length; i++)
+                {
+                    Entity candidate = buffer[i].m_Area;
+                    bool same = MatchesOwnerPathSibling(owner, candidate, childPrefab, childKind);
+                    if (candidate == child)
+                    {
+                        step = CreateOwnerPathStep(PortableOwnerPathKind.SubArea,
+                            childKind, childPrefabName, i, ordinal);
+                        return true;
+                    }
+                    if (same) ordinal++;
+                }
+            }
+            return false;
+        }
+
+        private static PortableOwnerPathStep CreateOwnerPathStep(
+            PortableOwnerPathKind bufferKind, PortableEntityKind entityKind, string prefabName,
+            int bufferIndex, int prefabOrdinal)
+        {
+            return new PortableOwnerPathStep
+            {
+                BufferKind = bufferKind,
+                EntityKind = entityKind,
+                PrefabName = prefabName,
+                BufferIndex = bufferIndex,
+                PrefabOrdinal = prefabOrdinal,
+            };
+        }
+
+        private bool MatchesOwnerPathSibling(Entity owner, Entity candidate, Entity prefab,
+            PortableEntityKind kind)
+        {
+            if (candidate == Entity.Null || !EntityManager.Exists(candidate) ||
+                EntityManager.HasComponent<Temp>(candidate) ||
+                EntityManager.HasComponent<Deleted>(candidate) ||
+                !EntityManager.HasComponent<PrefabRef>(candidate) ||
+                EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
+                !EntityManager.HasComponent<Owner>(candidate) ||
+                EntityManager.GetComponentData<Owner>(candidate).m_Owner != owner)
+                return false;
+            PortableEntityKind candidateKind;
+            return TryGetPortableEntityKind(candidate, out candidateKind) &&
+                   candidateKind == kind;
+        }
+
+        private bool TryGetPortableEntityKind(Entity entity, out PortableEntityKind kind)
+        {
+            if (EntityManager.HasComponent<global::Game.Net.Edge>(entity) &&
+                EntityManager.HasComponent<global::Game.Net.Curve>(entity))
+            {
+                kind = PortableEntityKind.NetEdge;
+                return true;
+            }
+            if (EntityManager.HasComponent<global::Game.Net.Node>(entity))
+            {
+                kind = PortableEntityKind.NetNode;
+                return true;
+            }
+            if (EntityManager.HasComponent<global::Game.Areas.Area>(entity))
+            {
+                kind = PortableEntityKind.Area;
+                return true;
+            }
+            if (EntityManager.HasComponent<global::Game.Objects.Object>(entity))
+            {
+                kind = PortableEntityKind.Object;
+                return true;
+            }
+            kind = PortableEntityKind.None;
+            return false;
         }
 
         private bool TryFindTopOwner(Entity entity, out Entity topOwner)

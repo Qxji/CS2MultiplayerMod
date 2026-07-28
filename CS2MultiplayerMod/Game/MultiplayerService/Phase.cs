@@ -34,17 +34,15 @@ namespace CS2MultiplayerMod.Game
         {
             _currentWorld = world;
             _session.Update(_clock.ElapsedMilliseconds);
+            RefreshPendingJoinsJson();
             string recoveryReason;
             if (_session.Status == SessionStatus.Connected &&
                 SyncInbox.TryTakeResyncRequest(out recoveryReason))
-            {
-                _log.Warn("[MP] Requesting world recovery: " + recoveryReason + ".");
-                Diagnostics.FlightRecorder.Note("resync requested: " + recoveryReason);
-                _session.RequestWorldSync();
-            }
+                RequestAutomaticWorldRecovery(recoveryReason);
             PumpWorldPhase();
             MaintainWorldSyncBarrier();
             PumpClientWorldSyncQuiescence();
+            PumpGameExit();
         }
 
         /// <summary>
@@ -169,15 +167,17 @@ namespace CS2MultiplayerMod.Game
         public void Disconnect()
         {
             ResetWorldSyncState(restoreSpeed: true);
-            _session.Stop();
+            // A host that stops hosting owes its clients a reason: without the notice they
+            // only ever see the socket drop, which reads as a network failure.
+            _session.StopWithNotice("The host ended this multiplayer session.");
             SetPhase(ClientWorldPhase.None);
             JoinMapLoader.DeleteTransient(_log); // a joining client keeps no copy of the host world
         }
 
         public void Shutdown()
         {
-            ResetWorldSyncState(restoreSpeed: true);
-            _session.Stop();
+            ResetWorldSyncState(restoreSpeed: false); // the world is going away with the process
+            _session.StopWithNotice("The host closed the game, so this session has ended.");
             SetPhase(ClientWorldPhase.None);
             RestoreAutosave(); // even if the phase was already None
             JoinMapLoader.DeleteTransient(_log);
@@ -222,7 +222,8 @@ namespace CS2MultiplayerMod.Game
                 hosting ? settings.HostPassword : settings.JoinPassword,
                 settings.LanOnly, useEncryption: false, maxPlayers: maxPlayers,
                 modVersion: modVersion, gameVersion: gameVersion,
-                dlcList: dlcs);
+                dlcList: dlcs,
+                requireJoinApproval: hosting && settings.RequireJoinApproval);
         }
 
     }

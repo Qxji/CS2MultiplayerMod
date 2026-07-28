@@ -46,15 +46,105 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             public Entity EndEntity;
         }
 
+        /// <summary>
+        /// Spacing between attempts on a blocked operation. Resolution is cheap now but not free, and
+        /// the geometry it waits for arrives on its own schedule - retrying every frame only burned
+        /// the retry window at frame rate.
+        /// </summary>
+        private const long NativeObjectRetryIntervalMs = 200;
+
         private bool _hasBlockedNativeObject;
         private SimulationCommandMessage _blockedNativeObject;
         private long _blockedNativeObjectDeadline;
+        private long _blockedNativeObjectNextAttemptMs;
+        private string _lastUnresolvedObjectReason;
         private readonly CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NativeObjectOperationKey>
             _recentNativeObjectOperations =
                 new CS2MultiplayerMod.Core.Sync.OperationReplayWindow<NativeObjectOperationKey>();
         private EntityQuery _portableObjects;
         private EntityQuery _portableAreas;
         private Net.NetSyncSystem _nativeNetCoordinator;
+
+        /// <summary>
+        /// Candidates for one resolution pass, bucketed by prefab.
+        ///
+        /// A relocation names every element of a building's owned graph plus a stretch of road - 280+
+        /// references for a large plant. Walking the whole city's objects/nodes/edges/areas once per
+        /// reference took seconds of main-thread time per attempt, and a blocked operation repeated
+        /// that every frame for its whole retry window. Snapshotting each domain once and grouping by
+        /// prefab turns those thousands of city walks into four.
+        /// </summary>
+        private sealed class PortableCandidateIndex
+        {
+            private readonly Dictionary<Entity, List<Entity>> _byPrefab =
+                new Dictionary<Entity, List<Entity>>();
+            private static readonly List<Entity> Empty = new List<Entity>();
+
+            public void Fill(EntityManager entityManager, EntityQuery query)
+            {
+                _byPrefab.Clear();
+                if (query.IsEmptyIgnoreFilter) return;
+                NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
+                try
+                {
+                    for (int i = 0; i < entities.Length; i++)
+                    {
+                        Entity candidate = entities[i];
+                        if (!entityManager.HasComponent<PrefabRef>(candidate)) continue;
+                        Entity prefab = entityManager.GetComponentData<PrefabRef>(candidate).m_Prefab;
+                        List<Entity> bucket;
+                        if (!_byPrefab.TryGetValue(prefab, out bucket))
+                        {
+                            bucket = new List<Entity>();
+                            _byPrefab[prefab] = bucket;
+                        }
+                        bucket.Add(candidate);
+                    }
+                }
+                finally { entities.Dispose(); }
+            }
+
+            public List<Entity> Of(Entity prefab)
+            {
+                List<Entity> bucket;
+                return _byPrefab.TryGetValue(prefab, out bucket) ? bucket : Empty;
+            }
+        }
+
+        private readonly PortableCandidateIndex _objectCandidates = new PortableCandidateIndex();
+        private readonly PortableCandidateIndex _nodeCandidates = new PortableCandidateIndex();
+        private readonly PortableCandidateIndex _edgeCandidates = new PortableCandidateIndex();
+        private readonly PortableCandidateIndex _areaCandidates = new PortableCandidateIndex();
+        private int _portableIndexDepth;
+
+        /// <summary>
+        /// Snapshot the candidate domains for the duration of one resolution pass. Nothing inside a
+        /// pass creates or destroys world entities, so one snapshot stays correct throughout it.
+        /// </summary>
+        private void BeginPortableResolve()
+        {
+            if (_portableIndexDepth++ != 0) return;
+            _objectCandidates.Fill(EntityManager, _portableObjects);
+            _nodeCandidates.Fill(EntityManager, _liveNodes);
+            _edgeCandidates.Fill(EntityManager, _liveEdges);
+            _areaCandidates.Fill(EntityManager, _portableAreas);
+        }
+
+        private void EndPortableResolve()
+        {
+            if (_portableIndexDepth > 0) _portableIndexDepth--;
+        }
+
+        /// <summary>
+        /// Same-prefab candidates for <paramref name="prefab"/>. Outside a resolution pass the domain
+        /// is snapshotted for this one lookup, so callers that resolve a single reference behave
+        /// exactly as before.
+        /// </summary>
+        private List<Entity> Candidates(PortableCandidateIndex index, EntityQuery query, Entity prefab)
+        {
+            if (_portableIndexDepth == 0) index.Fill(EntityManager, query);
+            return index.Of(prefab);
+        }
 
         private void InitializeNativeObjectOperations()
         {
@@ -97,6 +187,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _hasBlockedNativeObject = false;
             _blockedNativeObject = null;
             _blockedNativeObjectDeadline = 0;
+            _blockedNativeObjectNextAttemptMs = 0;
+            _lastUnresolvedObjectReason = null;
             _recentNativeObjectOperations.Clear();
         }
 
@@ -109,15 +201,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (!_hasBlockedNativeObject) return true;
             if (_nativeNetCoordinator.IsCommitBusy) return false;
+            if (now < _blockedNativeObjectNextAttemptMs) return false;
+            _blockedNativeObjectNextAttemptMs = now + NativeObjectRetryIntervalMs;
 
             NativeObjectResult result = TryRealizeNativeObject(_blockedNativeObject, now);
             if (result == NativeObjectResult.Retry)
             {
                 if (now < _blockedNativeObjectDeadline) return false;
-                Mod.log.Warn("[MP] BuildSync: native object operation target did not resolve; " +
-                             "requesting world recovery instead of applying a partial graph.");
-                Diagnostics.FlightRecorder.Note("object operation rejected after bounded retry");
-                SyncInbox.RequestResync("object operation target did not resolve");
+                // The road/building/area this edit references never arrived on this machine.
+                // Dropping the one edit leaves a visible local gap; looping the whole world through
+                // recovery for it froze both players and simply re-failed after each reload. Drop it.
+                Mod.log.Warn("[MP] BuildSync: native object operation target did not resolve within " +
+                             "the retry window; dropping this edit (use /sync if the city drifts).");
+                Diagnostics.FlightRecorder.Note("object operation dropped after bounded retry");
                 _hasBlockedNativeObject = false;
                 _blockedNativeObject = null;
                 _blockedNativeObjectDeadline = 0;
@@ -134,6 +230,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             _blockedNativeObject = message;
             _blockedNativeObjectDeadline = now + NativeObjectTargetRetryMs;
+            _blockedNativeObjectNextAttemptMs = now + NativeObjectRetryIntervalMs;
             _hasBlockedNativeObject = true;
             Diagnostics.FlightRecorder.Note("object operation target retrying");
         }
@@ -144,9 +241,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             try { command = ObjectToolOperationCommand.Decode(message.Body); }
             catch (System.Exception ex)
             {
-                Mod.log.Warn("[MP] BuildSync: rejecting malformed native object operation: " + ex.Message);
-                Diagnostics.FlightRecorder.Note("object operation rejected malformed");
-                SyncInbox.RequestResync("malformed object operation");
+                // A malformed command from a peer is a protocol/peer problem, not local world
+                // corruption. The decode guard already protected us; drop it, do not resync.
+                Mod.log.Warn("[MP] BuildSync: dropping malformed native object operation: " + ex.Message);
+                Diagnostics.FlightRecorder.Note("object operation dropped malformed");
                 return NativeObjectResult.Rejected;
             }
 
@@ -154,8 +252,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (TryFindUnsafeSimulationReference(command, out unsafePrefab))
             {
                 RecordRefused(unsafePrefab);
-                Diagnostics.FlightRecorder.Note("object operation rejected simulation-only prefab");
-                SyncInbox.RequestResync("simulation-only object operation rejected");
+                Diagnostics.FlightRecorder.Note("object operation dropped (simulation-only prefab)");
                 return NativeObjectResult.Rejected;
             }
 
@@ -173,14 +270,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             ResolvedObjectDefinition[] resolved;
             string reason;
-            if (!TryResolveObjectOperation(command, out resolved, out reason))
+            bool equivalentExists;
+            int resolveStartTick = System.Environment.TickCount;
+            BeginPortableResolve();
+            try
             {
-                Diagnostics.FlightRecorder.Note("object operation unresolved op=" + command.OperationId +
-                                                  " (" + reason + ")");
-                return NativeObjectResult.Retry;
+                if (!TryResolveObjectOperation(command, out resolved, out reason))
+                {
+                    // One line per attempt would be hundreds while an operation waits out its retry
+                    // window; the reason only changes when the world does.
+                    if (reason != _lastUnresolvedObjectReason)
+                    {
+                        _lastUnresolvedObjectReason = reason;
+                        Diagnostics.FlightRecorder.Note("object operation unresolved op=" +
+                                                          command.OperationId + " (" + reason + ")");
+                    }
+                    return NativeObjectResult.Retry;
+                }
+                _lastUnresolvedObjectReason = null;
+                equivalentExists = EquivalentObjectOperationAlreadyExists(command, resolved);
             }
+            finally { EndPortableResolve(); }
 
-            if (EquivalentObjectOperationAlreadyExists(command, resolved))
+            if (equivalentExists)
             {
                 _recentNativeObjectOperations.Remember(key, now, NativeObjectReplayRememberMs);
                 Diagnostics.FlightRecorder.Note("object equivalent placement suppressed op=" +
@@ -189,7 +301,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             if (!_nativeNetCoordinator.CanBuildDefinitions) return NativeObjectResult.Retry;
+            int isolateStartTick = System.Environment.TickCount;
             _nativeNetCoordinator.PrepareDefinitionFrame();
+            int generateStartTick = System.Environment.TickCount;
 
             var created = new List<Entity>(command.Definitions.Length);
             try
@@ -199,10 +313,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             catch (System.Exception ex)
             {
+                // The partial definitions are torn down here, so nothing inconsistent was committed.
+                // Drop the edit rather than freeze the world; the placer can /sync if it matters.
                 DestroyDefinitions(created);
-                Mod.log.Warn("[MP] BuildSync: native object definitions were rejected: " + ex.Message);
-                Diagnostics.FlightRecorder.Note("object definitions rejected=" + ex.GetType().Name);
-                SyncInbox.RequestResync("object definitions could not be generated");
+                Mod.log.Warn("[MP] BuildSync: native object definitions could not be generated; " +
+                             "dropping this edit: " + ex.Message);
+                Diagnostics.FlightRecorder.Note("object definitions dropped=" + ex.GetType().Name);
                 return NativeObjectResult.Rejected;
             }
 
@@ -218,8 +334,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return NativeObjectResult.Retry;
             }
 
+            // Per-phase cost of one native operation. A big relocation is inherently a large
+            // transaction; these numbers say which phase is actually spiking rather than leaving it
+            // to guesswork.
             Diagnostics.FlightRecorder.Note("object definitions generated op=" + command.OperationId +
-                                              " defs=" + created.Count);
+                " defs=" + created.Count +
+                " resolveMS=" + (isolateStartTick - resolveStartTick) +
+                " isolateMS=" + (generateStartTick - isolateStartTick) +
+                " generateMS=" + (System.Environment.TickCount - generateStartTick));
             return NativeObjectResult.Armed;
         }
 
@@ -276,7 +398,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         /// <summary>
         /// A specialized-industry placement is distinguishable from arbitrary growable creation:
-        /// its new root owns a closed extractor/storage area declared by that root prefab. Some
+        /// its new root owns an extractor/storage area declared by that root prefab. Some
         /// facilities use a placeholder root plus one level-one spawnable building attached to the
         /// placeholder prefab; older/direct variants use a spawnable root. Require the complete
         /// graph before exempting either exact form from the generic growable rejection.
@@ -325,37 +447,47 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             for (int i = 0; i < command.Definitions.Length; i++)
-            {
-                ObjectToolDefinitionIntent area = command.Definitions[i];
-                if (area == null || area.Kind != ObjectToolDefinitionKind.Area ||
-                    area.PrefabIsNull || !area.HasOwnerDefinition ||
-                    area.OwnerDefinitionPrefabName != root.PrefabName ||
-                    area.Original.Kind != PortableEntityKind.None ||
-                    area.Owner.Kind != PortableEntityKind.None ||
-                    area.Attached.Kind != PortableEntityKind.None ||
-                    !string.IsNullOrEmpty(area.AttachedPrefabName) ||
-                    area.CreationFlags != 0 || area.AreaNodes == null ||
-                    !IsClosedAreaNodeRing(area.AreaNodes)) continue;
-
-                float3 rootPosition = new float3(root.Object.PosX, root.Object.PosY,
-                    root.Object.PosZ);
-                float3 ownerPosition = new float3(area.OwnerDefinitionX,
-                    area.OwnerDefinitionY, area.OwnerDefinitionZ);
-                if (math.distancesq(rootPosition, ownerPosition) > 0.01f) continue;
-                float4 rootRotation = new float4(root.Object.RotX, root.Object.RotY,
-                    root.Object.RotZ, root.Object.RotW);
-                float4 ownerRotation = new float4(area.OwnerDefinitionRotX,
-                    area.OwnerDefinitionRotY, area.OwnerDefinitionRotZ,
-                    area.OwnerDefinitionRotW);
-                if (math.abs(math.dot(rootRotation, ownerRotation)) < 0.999f) continue;
-
-                Entity areaPrefab;
-                if (!_prefabIndex.TryResolve(area.PrefabName, out areaPrefab) ||
-                    !IsSpecializedAreaPrefab(areaPrefab) ||
-                    !PrefabDeclaresOwnedArea(rootPrefab, areaPrefab)) continue;
-                return true;
-            }
+                if (IsOwnedSpecializedAreaDefinition(command.Definitions[i], root, rootPrefab))
+                    return true;
             return false;
+        }
+
+        /// <summary>
+        /// One extractor/storage lot belonging to this placement's root. The polygon is not
+        /// required to be a drawn ring: the game lets a player leave the area tool without
+        /// drawing one, and the building then commits with the lot its prefab declares.
+        /// </summary>
+        private bool IsOwnedSpecializedAreaDefinition(ObjectToolDefinitionIntent area,
+            ObjectToolDefinitionIntent root, Entity rootPrefab)
+        {
+            if (area == null || area.Kind != ObjectToolDefinitionKind.Area ||
+                area.PrefabIsNull || !area.HasOwnerDefinition ||
+                area.OwnerDefinitionPrefabName != root.PrefabName ||
+                area.Original.Kind != PortableEntityKind.None ||
+                area.Owner.Kind != PortableEntityKind.None ||
+                area.Attached.Kind != PortableEntityKind.None ||
+                !string.IsNullOrEmpty(area.AttachedPrefabName) ||
+                area.CreationFlags != 0 || area.AreaNodes == null ||
+                area.AreaNodes.Length == 0 ||
+                area.AreaNodes.Length > ObjectToolOperationCommand.MaxAreaNodesPerDefinition)
+                return false;
+
+            float3 rootPosition = new float3(root.Object.PosX, root.Object.PosY,
+                root.Object.PosZ);
+            float3 ownerPosition = new float3(area.OwnerDefinitionX,
+                area.OwnerDefinitionY, area.OwnerDefinitionZ);
+            if (math.distancesq(rootPosition, ownerPosition) > 0.01f) return false;
+            float4 rootRotation = new float4(root.Object.RotX, root.Object.RotY,
+                root.Object.RotZ, root.Object.RotW);
+            float4 ownerRotation = new float4(area.OwnerDefinitionRotX,
+                area.OwnerDefinitionRotY, area.OwnerDefinitionRotZ,
+                area.OwnerDefinitionRotW);
+            if (math.abs(math.dot(rootRotation, ownerRotation)) < 0.999f) return false;
+
+            Entity areaPrefab;
+            return _prefabIndex.TryResolve(area.PrefabName, out areaPrefab) &&
+                   IsSpecializedAreaPrefab(areaPrefab) &&
+                   PrefabDeclaresOwnedArea(rootPrefab, areaPrefab);
         }
 
         private bool IsAllowedSpecializedSpawnable(ObjectToolOperationCommand command,
@@ -507,7 +639,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (_hasBlockedNativeObject)
             {
-                SyncInbox.RequestResync("object replay collided with an ordered operation");
+                // Another operation is already waiting its turn. Dropping this rejected replay is
+                // safer than looping the world through recovery; the ordered op still resolves or
+                // drops on its own deadline.
+                Diagnostics.FlightRecorder.Note("object replay dropped (collided with ordered op)");
                 return;
             }
             _blockedNativeObject = message;
@@ -538,8 +673,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     CreationFlags flags = (CreationFlags)root.CreationFlags;
                     if ((flags & CreationFlags.Relocate) == 0 && rootPrefab != Entity.Null)
                     {
+                        bool isServiceUpgrade =
+                            root.HasOwnerDefinition &&
+                            (EntityManager.HasComponent<ServiceUpgradeData>(rootPrefab) ||
+                             EntityManager.HasComponent<BuildingExtensionData>(rootPrefab));
                         if (root.Owner.Kind != PortableEntityKind.None ||
-                            (flags & CreationFlags.Upgrade) != 0)
+                            (flags & CreationFlags.Upgrade) != 0 ||
+                            isServiceUpgrade)
                             ConstructionCharger.ChargeUpgrade(EntityManager, rootPrefab,
                                 root.PrefabName ?? "object upgrade");
                         else
@@ -557,10 +697,57 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 : "object transaction committed/drained op=") + command.OperationId);
         }
 
+        /// <summary>
+        /// True when two <see cref="PortableEntityRef"/> values name the same source entity. Used to
+        /// tell "the batch referenced one entity twice" apart from "two different source entities
+        /// collapsed onto one local entity" - the latter is the aliasing hazard below.
+        /// </summary>
+        private static bool SamePortableSource(PortableEntityRef left, PortableEntityRef right)
+        {
+            if (left.Kind != right.Kind ||
+                !string.Equals(left.PrefabName, right.PrefabName, System.StringComparison.Ordinal) ||
+                !string.Equals(left.OwnerPrefabName, right.OwnerPrefabName,
+                    System.StringComparison.Ordinal)) return false;
+
+            float3 leftPosition = new float3(left.PosX, left.PosY, left.PosZ);
+            float3 rightPosition = new float3(right.PosX, right.PosY, right.PosZ);
+            if (!leftPosition.Equals(rightPosition)) return false;
+
+            if (left.Kind != PortableEntityKind.NetEdge) return true;
+            return left.Ax == right.Ax && left.Ay == right.Ay && left.Az == right.Az &&
+                   left.Dx == right.Dx && left.Dy == right.Dy && left.Dz == right.Dz &&
+                   left.Bx == right.Bx && left.By == right.By && left.Bz == right.Bz &&
+                   left.Cx == right.Cx && left.Cy == right.Cy && left.Cz == right.Cz;
+        }
+
+        /// <summary>
+        /// Claim one live entity as the original of exactly one definition in this batch.
+        ///
+        /// A tool's own output names every original at most once (its attachment set is de-duplicated
+        /// and each owned element is visited once), so two definitions landing on the SAME local
+        /// entity means this machine's geometry is subdivided differently from the sender's - it never
+        /// received the split that separated them. Committing both would hand the apply passes two
+        /// Temps sharing one original, which they dereference without a liveness check: the confirmed
+        /// native crash. Refuse the batch instead; the caller retries and then requests recovery.
+        /// </summary>
+        private bool TryClaimObjectOriginal(
+            Dictionary<Entity, PortableEntityRef> claims, PortableEntityRef source, Entity target)
+        {
+            if (target == Entity.Null) return true;
+            PortableEntityRef claimed;
+            if (!claims.TryGetValue(target, out claimed))
+            {
+                claims[target] = source;
+                return true;
+            }
+            return SamePortableSource(claimed, source);
+        }
+
         private bool TryResolveObjectOperation(ObjectToolOperationCommand command,
             out ResolvedObjectDefinition[] resolved, out string reason)
         {
             resolved = new ResolvedObjectDefinition[command.Definitions.Length];
+            var originalClaims = new Dictionary<Entity, PortableEntityRef>();
             if (command.IsAssetStamp)
             {
                 Entity stampPrefab;
@@ -595,11 +782,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     reason = "definition sub-prefab is unavailable";
                     return false;
                 }
-                if (!TryResolvePortableRef(definition.Original, out target.Original) ||
-                    !TryResolvePortableRef(definition.Owner, out target.Owner) ||
-                    !TryResolvePortableRef(definition.Attached, out target.Attached))
+                if (!TryResolvePortableRef(definition.Original, out target.Original))
                 {
-                    reason = "original, owner, or attachment is not present";
+                    reason = "definition " + i + " original target is not present";
+                    return false;
+                }
+                if (!TryClaimObjectOriginal(originalClaims, definition.Original, target.Original))
+                {
+                    reason = "definition " + i + " resolved onto an original already claimed by " +
+                             "another definition (local geometry is subdivided differently)";
+                    return false;
+                }
+                if (!TryResolvePortableRef(definition.Owner, out target.Owner))
+                {
+                    reason = "definition " + i + " owner target is not present";
+                    return false;
+                }
+                if (!TryResolvePortableRef(definition.Attached, out target.Attached))
+                {
+                    reason = "definition " + i + " attachment target is not present";
                     return false;
                 }
                 if (!string.IsNullOrEmpty(definition.AttachedPrefabName))
@@ -630,10 +831,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     return false;
                 }
                 if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
-                    (!TryResolvePortableRef(definition.NetCourse.Start.Entity, out target.StartEntity) ||
-                     !TryResolvePortableRef(definition.NetCourse.End.Entity, out target.EndEntity)))
+                    !TryResolvePortableRef(definition.NetCourse.Start.Entity,
+                        out target.StartEntity))
                 {
-                    reason = "network endpoint target is not present";
+                    reason = "definition " + i + " network start target is not present";
+                    return false;
+                }
+                if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
+                    !TryResolvePortableRef(definition.NetCourse.End.Entity,
+                        out target.EndEntity))
+                {
+                    reason = "definition " + i + " network end target is not present";
                     return false;
                 }
                 if (definition.Kind == ObjectToolDefinitionKind.Object &&
@@ -825,6 +1033,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (source.Kind == PortableEntityKind.None) return true;
             Entity prefab;
             if (!_prefabIndex.TryResolve(source.PrefabName, out prefab)) return false;
+
+            // Owned lifecycle references first use the same owner buffers that the simulation
+            // maintains. Geometry remains a compatibility fallback for references captured before
+            // a structural path was available or for a benign buffer-layout difference.
+            if (source.OwnerPath != null && source.OwnerPath.Length != 0 &&
+                TryResolveOwnerPath(source, prefab, out result))
+                return true;
+
             float3 position = new float3(source.PosX, source.PosY, source.PosZ);
             switch (source.Kind)
             {
@@ -845,53 +1061,187 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        private bool TryResolveOwnerPath(PortableEntityRef source, Entity targetPrefab,
+            out Entity result)
+        {
+            result = Entity.Null;
+            if (string.IsNullOrEmpty(source.OwnerPrefabName) ||
+                source.OwnerPath == null || source.OwnerPath.Length == 0 ||
+                source.OwnerPath.Length > ObjectToolOperationCommand.MaxOwnerPathDepth)
+                return false;
+
+            Entity ownerPrefab;
+            if (!_prefabIndex.TryResolve(source.OwnerPrefabName, out ownerPrefab))
+                return false;
+            Entity cursor = FindPortableObject(ownerPrefab,
+                new float3(source.OwnerX, source.OwnerY, source.OwnerZ),
+                default(PortableEntityRef));
+            if (cursor == Entity.Null) return false;
+
+            for (int i = 0; i < source.OwnerPath.Length; i++)
+            {
+                Entity child;
+                if (!TryResolveOwnerPathStep(cursor, source.OwnerPath[i], out child))
+                    return false;
+                cursor = child;
+            }
+
+            PortableEntityKind resolvedKind;
+            if (!EntityManager.Exists(cursor) ||
+                EntityManager.HasComponent<Temp>(cursor) ||
+                EntityManager.HasComponent<Deleted>(cursor) ||
+                !EntityManager.HasComponent<PrefabRef>(cursor) ||
+                EntityManager.GetComponentData<PrefabRef>(cursor).m_Prefab != targetPrefab ||
+                !TryGetPortableEntityKind(cursor, out resolvedKind) ||
+                resolvedKind != source.Kind)
+                return false;
+            if ((source.Kind == PortableEntityKind.NetNode ||
+                 source.Kind == PortableEntityKind.NetEdge) &&
+                !MatchesNetContract(targetPrefab, source))
+                return false;
+
+            result = cursor;
+            return true;
+        }
+
+        private bool TryResolveOwnerPathStep(Entity owner, PortableOwnerPathStep step,
+            out Entity result)
+        {
+            result = Entity.Null;
+            Entity prefab;
+            if (!_prefabIndex.TryResolve(step.PrefabName, out prefab)) return false;
+
+            switch (step.BufferKind)
+            {
+                case PortableOwnerPathKind.InstalledUpgrade:
+                    if (!EntityManager.HasBuffer<global::Game.Buildings.InstalledUpgrade>(owner))
+                        return false;
+                    DynamicBuffer<global::Game.Buildings.InstalledUpgrade> upgrades =
+                        EntityManager.GetBuffer<global::Game.Buildings.InstalledUpgrade>(
+                            owner, isReadOnly: true);
+                    int upgradeOrdinal = 0;
+                    for (int i = 0; i < upgrades.Length; i++)
+                    {
+                        Entity candidate = upgrades[i].m_Upgrade;
+                        if (!MatchesOwnerPathCandidate(owner, candidate, prefab,
+                                step.EntityKind)) continue;
+                        if (upgradeOrdinal++ != step.PrefabOrdinal) continue;
+                        result = candidate;
+                        return true;
+                    }
+                    return false;
+
+                case PortableOwnerPathKind.SubObject:
+                    if (!EntityManager.HasBuffer<global::Game.Objects.SubObject>(owner))
+                        return false;
+                    DynamicBuffer<global::Game.Objects.SubObject> objects =
+                        EntityManager.GetBuffer<global::Game.Objects.SubObject>(
+                            owner, isReadOnly: true);
+                    int objectOrdinal = 0;
+                    for (int i = 0; i < objects.Length; i++)
+                    {
+                        Entity candidate = objects[i].m_SubObject;
+                        if (!MatchesOwnerPathCandidate(owner, candidate, prefab,
+                                step.EntityKind)) continue;
+                        if (objectOrdinal++ != step.PrefabOrdinal) continue;
+                        result = candidate;
+                        return true;
+                    }
+                    return false;
+
+                case PortableOwnerPathKind.SubNet:
+                    if (!EntityManager.HasBuffer<global::Game.Net.SubNet>(owner))
+                        return false;
+                    DynamicBuffer<global::Game.Net.SubNet> nets =
+                        EntityManager.GetBuffer<global::Game.Net.SubNet>(
+                            owner, isReadOnly: true);
+                    int netOrdinal = 0;
+                    for (int i = 0; i < nets.Length; i++)
+                    {
+                        Entity candidate = nets[i].m_SubNet;
+                        if (!MatchesOwnerPathCandidate(owner, candidate, prefab,
+                                step.EntityKind)) continue;
+                        if (netOrdinal++ != step.PrefabOrdinal) continue;
+                        result = candidate;
+                        return true;
+                    }
+                    return false;
+
+                case PortableOwnerPathKind.SubArea:
+                    if (!EntityManager.HasBuffer<global::Game.Areas.SubArea>(owner))
+                        return false;
+                    DynamicBuffer<global::Game.Areas.SubArea> areas =
+                        EntityManager.GetBuffer<global::Game.Areas.SubArea>(
+                            owner, isReadOnly: true);
+                    int areaOrdinal = 0;
+                    for (int i = 0; i < areas.Length; i++)
+                    {
+                        Entity candidate = areas[i].m_Area;
+                        if (!MatchesOwnerPathCandidate(owner, candidate, prefab,
+                                step.EntityKind)) continue;
+                        if (areaOrdinal++ != step.PrefabOrdinal) continue;
+                        result = candidate;
+                        return true;
+                    }
+                    return false;
+
+                default:
+                    return false;
+            }
+        }
+
+        private bool MatchesOwnerPathCandidate(Entity owner, Entity candidate, Entity prefab,
+            PortableEntityKind kind)
+        {
+            if (candidate == Entity.Null || !EntityManager.Exists(candidate) ||
+                EntityManager.HasComponent<Temp>(candidate) ||
+                EntityManager.HasComponent<Deleted>(candidate) ||
+                !EntityManager.HasComponent<PrefabRef>(candidate) ||
+                EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
+                !EntityManager.HasComponent<Owner>(candidate) ||
+                EntityManager.GetComponentData<Owner>(candidate).m_Owner != owner)
+                return false;
+            PortableEntityKind candidateKind;
+            return TryGetPortableEntityKind(candidate, out candidateKind) &&
+                   candidateKind == kind;
+        }
+
         private Entity FindPortableObject(Entity prefab, float3 position, PortableEntityRef identity)
         {
-            NativeArray<Entity> entities = _portableObjects.ToEntityArray(Allocator.Temp);
-            try
+            List<Entity> candidates = Candidates(_objectCandidates, _portableObjects, prefab);
+            Entity best = Entity.Null;
+            float bestDistance = 4f;
+            for (int i = 0; i < candidates.Count; i++)
             {
-                Entity best = Entity.Null;
-                float bestDistance = 4f;
-                for (int i = 0; i < entities.Length; i++)
-                {
-                    Entity candidate = entities[i];
-                    if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
-                        !MatchesPortableOwner(candidate, identity)) continue;
-                    float distance = math.distancesq(EntityManager
-                        .GetComponentData<global::Game.Objects.Transform>(candidate).m_Position, position);
-                    if (distance >= bestDistance) continue;
-                    best = candidate;
-                    bestDistance = distance;
-                }
-                return best;
+                Entity candidate = candidates[i];
+                if (!MatchesPortableOwner(candidate, identity)) continue;
+                float distance = math.distancesq(EntityManager
+                    .GetComponentData<global::Game.Objects.Transform>(candidate).m_Position, position);
+                if (distance >= bestDistance) continue;
+                best = candidate;
+                bestDistance = distance;
             }
-            finally { entities.Dispose(); }
+            return best;
         }
 
         private Entity FindPortableNode(Entity prefab, float3 position, PortableEntityRef identity)
         {
-            NativeArray<Entity> entities = _liveNodes.ToEntityArray(Allocator.Temp);
-            try
+            if (!MatchesNetContract(prefab, identity)) return Entity.Null;
+            List<Entity> candidates = Candidates(_nodeCandidates, _liveNodes, prefab);
+            Entity best = Entity.Null;
+            float bestDistance = 4f;
+            for (int i = 0; i < candidates.Count; i++)
             {
-                Entity best = Entity.Null;
-                float bestDistance = 4f;
-                for (int i = 0; i < entities.Length; i++)
-                {
-                    Entity candidate = entities[i];
-                    if (!EntityManager.HasComponent<PrefabRef>(candidate) ||
-                        EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
-                        !MatchesNetContract(prefab, identity) ||
-                        !MatchesPortableOwner(candidate, identity)) continue;
-                    float3 candidatePosition = EntityManager.GetComponentData<Node>(candidate).m_Position;
-                    if (math.abs(candidatePosition.y - position.y) > 3f) continue;
-                    float distance = math.distancesq(candidatePosition.xz, position.xz);
-                    if (distance >= bestDistance) continue;
-                    best = candidate;
-                    bestDistance = distance;
-                }
-                return best;
+                Entity candidate = candidates[i];
+                if (!MatchesPortableOwner(candidate, identity)) continue;
+                float3 candidatePosition = EntityManager.GetComponentData<Node>(candidate).m_Position;
+                if (math.abs(candidatePosition.y - position.y) > 3f) continue;
+                float distance = math.distancesq(candidatePosition.xz, position.xz);
+                if (distance >= bestDistance) continue;
+                best = candidate;
+                bestDistance = distance;
             }
-            finally { entities.Dispose(); }
+            return best;
         }
 
         private Entity FindPortableEdge(Entity prefab, PortableEntityRef identity)
@@ -904,49 +1254,38 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 d = new float3(identity.Dx, identity.Dy, identity.Dz),
             };
             float3 anchor = new float3(identity.PosX, identity.PosY, identity.PosZ);
-            NativeArray<Entity> entities = _liveEdges.ToEntityArray(Allocator.Temp);
-            try
+            if (!MatchesNetContract(prefab, identity)) return Entity.Null;
+            List<Entity> candidates = Candidates(_edgeCandidates, _liveEdges, prefab);
+            Entity best = Entity.Null;
+            float bestDistance = 2f;
+            for (int i = 0; i < candidates.Count; i++)
             {
-                Entity best = Entity.Null;
-                float bestDistance = 2f;
-                for (int i = 0; i < entities.Length; i++)
-                {
-                    Entity candidate = entities[i];
-                    if (!EntityManager.HasComponent<PrefabRef>(candidate) ||
-                        EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
-                        !MatchesNetContract(prefab, identity) ||
-                        !MatchesPortableOwner(candidate, identity)) continue;
-                    Bezier4x3 curve = EntityManager.GetComponentData<global::Game.Net.Curve>(candidate).m_Bezier;
-                    if (!SplitMatch.IsSubCurve3D(curve, sourceCurve) &&
-                        !SplitMatch.IsSubCurve3D(sourceCurve, curve)) continue;
-                    float t;
-                    float distance = MathUtils.Distance(curve, anchor, out t);
-                    if (distance >= bestDistance) continue;
-                    best = candidate;
-                    bestDistance = distance;
-                }
-                return best;
+                Entity candidate = candidates[i];
+                if (!MatchesPortableOwner(candidate, identity)) continue;
+                Bezier4x3 curve = EntityManager.GetComponentData<global::Game.Net.Curve>(candidate).m_Bezier;
+                if (!SplitMatch.IsSubCurve3D(curve, sourceCurve) &&
+                    !SplitMatch.IsSubCurve3D(sourceCurve, curve)) continue;
+                float t;
+                float distance = MathUtils.Distance(curve, anchor, out t);
+                if (distance >= bestDistance) continue;
+                best = candidate;
+                bestDistance = distance;
             }
-            finally { entities.Dispose(); }
+            return best;
         }
 
         private Entity FindPortableArea(Entity prefab, float3 anchor, PortableEntityRef identity)
         {
-            NativeArray<Entity> entities = _portableAreas.ToEntityArray(Allocator.Temp);
-            try
+            List<Entity> candidates = Candidates(_areaCandidates, _portableAreas, prefab);
+            for (int i = 0; i < candidates.Count; i++)
             {
-                for (int i = 0; i < entities.Length; i++)
-                {
-                    Entity candidate = entities[i];
-                    if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab ||
-                        !MatchesPortableOwner(candidate, identity)) continue;
-                    DynamicBuffer<global::Game.Areas.Node> nodes =
-                        EntityManager.GetBuffer<global::Game.Areas.Node>(candidate, isReadOnly: true);
-                    if (nodes.Length > 0 && math.distancesq(nodes[0].m_Position, anchor) <= 4f)
-                        return candidate;
-                }
+                Entity candidate = candidates[i];
+                if (!MatchesPortableOwner(candidate, identity)) continue;
+                DynamicBuffer<global::Game.Areas.Node> nodes =
+                    EntityManager.GetBuffer<global::Game.Areas.Node>(candidate, isReadOnly: true);
+                if (nodes.Length > 0 && math.distancesq(nodes[0].m_Position, anchor) <= 4f)
+                    return candidate;
             }
-            finally { entities.Dispose(); }
             return Entity.Null;
         }
 

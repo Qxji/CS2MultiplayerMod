@@ -153,6 +153,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     delPartial[dI] = !SplitMatch.CoverWholeSpan(pieces, delCurves[dI].m_Bezier);
             }
 
+            // Per-edge commands emitted because no native operation covered this apply. Each one is
+            // replayed as its own serialized batch with both endpoints re-derived geometrically, so
+            // the receiver rebuilds the shape segment by segment instead of in one pass. Counted so a
+            // degraded replay is visible in the flight log rather than being inferred from symptoms.
+            int stubs = 0;
             try
             {
                 for (int i = 0; i < entities.Length; i++)
@@ -206,10 +211,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     {
                         _deferredSpanPieces.Add(command);
                         RecordDiagnostic(name);
+                        stubs++;
                         continue;
                     }
                     session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
                     RecordDiagnostic(name);
+                    stubs++;
                 }
             }
             finally
@@ -221,6 +228,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 delCurves.Dispose();
                 delPrefabs.Dispose();
             }
+
+            if (stubs > 0)
+                Diagnostics.FlightRecorder.Note("net per-edge fallback sent=" + stubs +
+                                                  " (no native operation covered this apply)");
         }
     }
 }

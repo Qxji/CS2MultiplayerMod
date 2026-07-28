@@ -30,10 +30,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     public partial class VisualCustomizationSyncSystem : GameSystemBase
     {
         private const long RetryWindowMs = 10000;
+        private const long RetryIntervalMs = 250;
         private const long SuppressWindowMs = 5000;
         private const long PruneIntervalMs = 30000;
         private const int MaxRetryTargets = 4096;
         private const float MatchToleranceSq = 4f;
+
+        // The color picker rewrites CustomMeshColor on every UI frame it is dragged, so the
+        // resulting-state detector sees one change per frame. Only the value a drag settles on
+        // is worth replicating; a drag that never pauses still reports once per max hold.
+        private const long ColorSettleMs = 1000;
+        private const long ColorMaxHoldMs = 3000;
+        private const int MaxPendingColorTargets = 8192;
 
         private struct VisualState
         {
@@ -48,6 +56,89 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             public VisualCustomizationCommand Command;
             public long DeadlineMs;
+        }
+
+        private struct PendingColorEdit
+        {
+            public VisualState State;
+            public long FirstChangeMs;
+            public long LastChangeMs;
+        }
+
+        /// <summary>
+        /// Per-frame snapshot of the match candidates, bucketed by prefab. Without it the
+        /// spatial fallback walks - and re-reads components from - every colorable object in
+        /// the city once per target, for every command and every queued retry.
+        /// </summary>
+        private sealed class CandidateCache
+        {
+            public sealed class Bucket
+            {
+                public Entity[] Entities;
+                public float3[] Positions;
+                public int[] Seeds;
+                public int Count;
+            }
+
+            private readonly Dictionary<Entity, Bucket> _byPrefab = new Dictionary<Entity, Bucket>();
+            private NativeArray<Entity> _entities;
+            private NativeArray<PrefabRef> _prefabs;
+            private NativeArray<Transform> _transforms;
+            private bool _loaded;
+
+            public Bucket For(Entity prefab, EntityQuery query, EntityManager entityManager)
+            {
+                Bucket bucket;
+                if (_byPrefab.TryGetValue(prefab, out bucket)) return bucket;
+
+                if (!_loaded)
+                {
+                    _entities = query.ToEntityArray(Allocator.Temp);
+                    _prefabs = query.ToComponentDataArray<PrefabRef>(Allocator.Temp);
+                    _transforms = query.ToComponentDataArray<Transform>(Allocator.Temp);
+                    _loaded = true;
+                }
+
+                int count = 0;
+                for (int i = 0; i < _prefabs.Length; i++)
+                    if (_prefabs[i].m_Prefab == prefab) count++;
+
+                bucket = new Bucket
+                {
+                    Entities = new Entity[count],
+                    Positions = new float3[count],
+                    Seeds = new int[count],
+                    Count = count,
+                };
+
+                int next = 0;
+                for (int i = 0; i < _prefabs.Length && next < count; i++)
+                {
+                    if (_prefabs[i].m_Prefab != prefab) continue;
+                    Entity entity = _entities[i];
+                    bucket.Entities[next] = entity;
+                    bucket.Positions[next] = _transforms[i].m_Position;
+                    bucket.Seeds[next] = entityManager.HasComponent<PseudoRandomSeed>(entity)
+                        ? entityManager.GetComponentData<PseudoRandomSeed>(entity).m_Seed
+                        : -1;
+                    next++;
+                }
+
+                _byPrefab[prefab] = bucket;
+                return bucket;
+            }
+
+            public void Release()
+            {
+                if (_loaded)
+                {
+                    _entities.Dispose();
+                    _prefabs.Dispose();
+                    _transforms.Dispose();
+                    _loaded = false;
+                }
+                _byPrefab.Clear();
+            }
         }
 
         private sealed class CommandBuilder
@@ -90,6 +181,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly Dictionary<Entity, long> _suppressColorBatch =
             new Dictionary<Entity, long>();
         private readonly List<PendingVisual> _retry = new List<PendingVisual>();
+        private readonly Dictionary<Entity, PendingColorEdit> _pendingColor =
+            new Dictionary<Entity, PendingColorEdit>();
+        private readonly List<CommandBuilder> _outgoing = new List<CommandBuilder>();
+        private readonly CandidateCache _candidates = new CandidateCache();
 
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
@@ -108,6 +203,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool _initialized;
         private int _retryTargetCount;
         private long _lastPruneMs;
+        private long _lastRetryMs;
+        private Entity _pendingAnchor;
+        private bool _pendingAnchorValid;
+        private ColorPaletteCommand _pendingPalette;
+        private long _pendingPaletteFirstMs;
+        private long _pendingPaletteLastMs;
+        private EntityCommandBuffer _frameCommands;
+        private bool _frameCommandsValid;
+        private bool _selectedInfoDirty;
 
         protected override void OnCreate()
         {
@@ -198,6 +302,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             long now = service.NowMs;
+            _frameCommandsValid = false;
+            _selectedInfoDirty = false;
             Prune(now);
 
             bool seededNow = false;
@@ -208,44 +314,71 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 seededNow = true;
             }
 
-            List<VisualCustomizationCommand> localVisual = null;
-            ColorPaletteCommand localPalette = null;
             if (!seededNow)
             {
-                localVisual = CaptureLocalVisualChanges(now);
-                localPalette = CaptureLocalPaletteChange();
+                CaptureLocalVisualChanges(now);
+                CaptureLocalPaletteChange(now);
             }
 
-            ApplyRetries(now);
-            ApplyIncoming(session, now);
-
-            // A UI edit and an incoming edit can land in the same UI frame. The host
-            // relays the incoming command first and the local command second, so preserve
-            // that same final order locally.
-            if (localVisual != null)
+            try
             {
-                for (int i = 0; i < localVisual.Count; i++)
-                    EnsureLocalState(localVisual[i], now);
-            }
-            if (localPalette != null) EnsureLocalPalette(localPalette);
+                ApplyRetries(now);
+                ApplyIncoming(session, now);
 
-            if (localVisual != null)
-            {
-                for (int i = 0; i < localVisual.Count; i++)
-                    session.SendCommand(0, VisualCustomizationCommand.Id, localVisual[i].Encode());
+                List<VisualCustomizationCommand> localVisual = TakeSettledVisualChanges(now);
+                ColorPaletteCommand localPalette = TakeSettledPaletteChange(now);
+
+                // A UI edit and an incoming edit can land in the same UI frame. The host
+                // relays the incoming command first and the local command second, so preserve
+                // that same final order locally.
+                if (localVisual != null)
+                {
+                    for (int i = 0; i < localVisual.Count; i++)
+                        EnsureLocalState(localVisual[i], now);
+                }
+                if (localPalette != null) EnsureLocalPalette(localPalette);
+
+                if (localVisual != null)
+                {
+                    for (int i = 0; i < localVisual.Count; i++)
+                        session.SendCommand(0, VisualCustomizationCommand.Id, localVisual[i].Encode());
+                }
+                if (localPalette != null)
+                    session.SendCommand(0, ColorPaletteCommand.Id, localPalette.Encode());
             }
-            if (localPalette != null)
-                session.SendCommand(0, ColorPaletteCommand.Id, localPalette.Encode());
+            finally
+            {
+                _candidates.Release();
+            }
+
+            if (_selectedInfoDirty) _selectedInfo.RequestUpdate();
+        }
+
+        private EntityCommandBuffer FrameCommands()
+        {
+            if (!_frameCommandsValid)
+            {
+                _frameCommands = _endFrameBarrier.CreateCommandBuffer();
+                _frameCommandsValid = true;
+            }
+            return _frameCommands;
         }
 
         private void ResetTracking()
         {
-            if (!_initialized && _known.Count == 0 && _retry.Count == 0) return;
+            if (!_initialized && _known.Count == 0 && _retry.Count == 0 &&
+                _pendingColor.Count == 0 && _outgoing.Count == 0 && _pendingPalette == null)
+                return;
             _initialized = false;
             _known.Clear();
             _suppressColorBatch.Clear();
             _retry.Clear();
             _retryTargetCount = 0;
+            _pendingColor.Clear();
+            _outgoing.Clear();
+            _pendingAnchor = Entity.Null;
+            _pendingAnchorValid = false;
+            _pendingPalette = null;
             _lastSelected = Entity.Null;
             _lastSelectedValid = false;
             _knownPalette = null;
@@ -263,19 +396,56 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         // ---- local capture ---------------------------------------------------
 
-        private List<VisualCustomizationCommand> CaptureLocalVisualChanges(long now)
+        private void CaptureLocalVisualChanges(long now)
         {
-            var builders = new List<CommandBuilder>();
-            CaptureSelectedChange(builders);
-            CaptureBatchColorChanges(builders, now);
+            CaptureSelectedChange(now);
+            CaptureBatchColorChanges(now);
+        }
 
-            if (builders.Count == 0) return null;
-            var commands = new List<VisualCustomizationCommand>(builders.Count);
-            for (int i = 0; i < builders.Count; i++) commands.Add(builders[i].Build());
+        /// <summary>
+        /// Emits the field changes that are ready to leave: the Historical flag immediately
+        /// (a single click), plus every color edit whose value has settled.
+        /// </summary>
+        private List<VisualCustomizationCommand> TakeSettledVisualChanges(long now)
+        {
+            CollectSettledColorEdits(now);
+            if (_outgoing.Count == 0) return null;
+
+            var commands = new List<VisualCustomizationCommand>(_outgoing.Count);
+            for (int i = 0; i < _outgoing.Count; i++) commands.Add(_outgoing[i].Build());
+            _outgoing.Clear();
             return commands;
         }
 
-        private void CaptureSelectedChange(List<CommandBuilder> builders)
+        private void CollectSettledColorEdits(long now)
+        {
+            if (_pendingColor.Count == 0) return;
+
+            // Selecting something else ends the gesture, so there is nothing left to wait for.
+            bool flushAll = _pendingColor.Count >= MaxPendingColorTargets ||
+                            (_pendingAnchorValid && _selectedInfo.selectedEntity != _pendingAnchor);
+
+            List<Entity> settled = null;
+            foreach (KeyValuePair<Entity, PendingColorEdit> pair in _pendingColor)
+            {
+                if (!flushAll &&
+                    now - pair.Value.LastChangeMs < ColorSettleMs &&
+                    now - pair.Value.FirstChangeMs < ColorMaxHoldMs)
+                    continue;
+                (settled ?? (settled = new List<Entity>())).Add(pair.Key);
+            }
+            if (settled == null) return;
+
+            for (int i = 0; i < settled.Count; i++)
+            {
+                PendingColorEdit entry = _pendingColor[settled[i]];
+                _pendingColor.Remove(settled[i]);
+                AddTarget(_outgoing, settled[i], VisualCustomizationFields.MeshColor, in entry.State);
+            }
+            if (_pendingColor.Count == 0) _pendingAnchorValid = false;
+        }
+
+        private void CaptureSelectedChange(long now)
         {
             Entity selected = _selectedInfo.selectedEntity;
             VisualState current;
@@ -306,10 +476,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _lastSelectedState = current;
             _known[selected] = current;
             if (fields != VisualCustomizationFields.None)
-                AddChange(builders, selected, fields, in current);
+                AddChange(selected, fields, in current, now);
         }
 
-        private void CaptureBatchColorChanges(List<CommandBuilder> builders, long now)
+        private void CaptureBatchColorChanges(long now)
         {
             if (_batchColorQuery.IsEmptyIgnoreFilter) return;
 
@@ -359,7 +529,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     // when its value was already equal, so the selected entity's effective
                     // color is the reliable signature for those otherwise-invisible writes.
                     if (setToAllTarget || changed)
-                        AddChange(builders, entity, VisualCustomizationFields.MeshColor, in current);
+                        AddChange(entity, VisualCustomizationFields.MeshColor, in current, now);
                 }
             }
             finally
@@ -368,22 +538,61 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
-        private ColorPaletteCommand CaptureLocalPaletteChange()
+        // A palette swatch has the same per-frame color picker behind it as an entity color.
+        private void CaptureLocalPaletteChange(long now)
         {
             VisualColorSet[] current = ReadPalette();
             if (!_paletteKnown)
             {
                 _knownPalette = current;
                 _paletteKnown = true;
-                return null;
+                return;
             }
-            if (SamePalette(current, _knownPalette)) return null;
+            if (SamePalette(current, _knownPalette)) return;
 
             _knownPalette = ClonePalette(current);
-            return new ColorPaletteCommand { Colors = current };
+            if (_pendingPalette == null) _pendingPaletteFirstMs = now;
+            _pendingPalette = new ColorPaletteCommand { Colors = current };
+            _pendingPaletteLastMs = now;
         }
 
-        private void AddChange(List<CommandBuilder> builders, Entity entity,
+        private ColorPaletteCommand TakeSettledPaletteChange(long now)
+        {
+            if (_pendingPalette == null) return null;
+            if (now - _pendingPaletteLastMs < ColorSettleMs &&
+                now - _pendingPaletteFirstMs < ColorMaxHoldMs)
+                return null;
+
+            ColorPaletteCommand command = _pendingPalette;
+            _pendingPalette = null;
+            return command;
+        }
+
+        private void AddChange(Entity entity, VisualCustomizationFields fields,
+            in VisualState state, long now)
+        {
+            if ((fields & VisualCustomizationFields.MeshColor) != 0)
+                RecordColorEdit(entity, in state, now);
+            if ((fields & VisualCustomizationFields.Historical) != 0)
+                AddTarget(_outgoing, entity, VisualCustomizationFields.Historical, in state);
+        }
+
+        private void RecordColorEdit(Entity entity, in VisualState state, long now)
+        {
+            if (_pendingColor.Count == 0)
+            {
+                _pendingAnchor = _selectedInfo.selectedEntity;
+                _pendingAnchorValid = true;
+            }
+
+            PendingColorEdit entry;
+            if (!_pendingColor.TryGetValue(entity, out entry)) entry.FirstChangeMs = now;
+            entry.State = state;
+            entry.LastChangeMs = now;
+            _pendingColor[entity] = entry;
+        }
+
+        private void AddTarget(List<CommandBuilder> builders, Entity entity,
             VisualCustomizationFields fields, in VisualState state)
         {
             Entity prefab;
@@ -464,9 +673,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        // Re-resolving every pending command on every frame is what turns a burst of targets
+        // into a stall; the retry window is measured in seconds, so this granularity is ample.
         private void ApplyRetries(long now)
         {
             if (_retry.Count == 0) return;
+            if (now - _lastRetryMs < RetryIntervalMs) return;
+            _lastRetryMs = now;
 
             PendingVisual[] pending = _retry.ToArray();
             _retry.Clear();
@@ -530,37 +743,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             var used = new HashSet<Entity>();
             var unresolved = allowRetry ? new List<VisualCustomizationTarget>() : null;
-            NativeArray<Entity> candidates = default(NativeArray<Entity>);
-            EntityCommandBuffer ecb = _endFrameBarrier.CreateCommandBuffer();
-            bool anyChanged = false;
-            try
+            for (int i = 0; i < command.Targets.Length; i++)
             {
-                for (int i = 0; i < command.Targets.Length; i++)
+                VisualCustomizationTarget target = command.Targets[i];
+                Entity entity = ResolveTarget(prefab, in target, used);
+                if (entity == Entity.Null)
                 {
-                    VisualCustomizationTarget target = command.Targets[i];
-                    Entity entity = ResolveTarget(prefab, in target, used, ref candidates);
-                    if (entity == Entity.Null)
-                    {
-                        if (unresolved != null) unresolved.Add(target);
-                        continue;
-                    }
-
-                    used.Add(entity);
-                    if (ApplyTarget(entity, command, now, ecb)) anyChanged = true;
+                    if (unresolved != null) unresolved.Add(target);
+                    continue;
                 }
-            }
-            finally
-            {
-                if (candidates.IsCreated) candidates.Dispose();
+
+                used.Add(entity);
+                if (ApplyTarget(entity, command, now)) _selectedInfoDirty = true;
             }
 
             if (unresolved != null && unresolved.Count > 0)
                 QueueRetry(command, unresolved, retryDeadline);
-            if (anyChanged) _selectedInfo.RequestUpdate();
         }
 
-        private bool ApplyTarget(Entity entity, VisualCustomizationCommand command,
-            long now, EntityCommandBuffer ecb)
+        private bool ApplyTarget(Entity entity, VisualCustomizationCommand command, long now)
         {
             VisualState state;
             if (!TryReadState(entity, out state))
@@ -597,16 +798,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     };
                     if (buffer.Length == 0) buffer.Add(value);
                     else buffer[0] = value;
-                    ecb.SetComponentEnabled<CustomMeshColor>(entity, true);
+                    FrameCommands().SetComponentEnabled<CustomMeshColor>(entity, true);
                 }
                 else
                 {
                     EntityManager.SetComponentEnabled<CustomMeshColor>(entity, false);
                     buffer.Clear();
                     // Override a same-frame queued enable from an earlier command.
-                    ecb.SetComponentEnabled<CustomMeshColor>(entity, false);
+                    FrameCommands().SetComponentEnabled<CustomMeshColor>(entity, false);
                 }
-                ecb.AddComponent<BatchesUpdated>(entity);
+                FrameCommands().AddComponent<BatchesUpdated>(entity);
                 _suppressColorBatch[entity] = now + SuppressWindowMs;
                 state.HasCustomColor = command.HasCustomColor;
                 state.Color = command.Color;
@@ -642,29 +843,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (!_prefabIndex.TryResolve(command.PrefabName, out prefab)) return;
 
             var used = new HashSet<Entity>();
-            NativeArray<Entity> candidates = default(NativeArray<Entity>);
             bool needsApply = false;
-            try
+            for (int i = 0; i < command.Targets.Length; i++)
             {
-                for (int i = 0; i < command.Targets.Length; i++)
-                {
-                    Entity entity = ResolveTarget(prefab, in command.Targets[i], used, ref candidates);
-                    if (entity == Entity.Null) continue;
-                    used.Add(entity);
+                Entity entity = ResolveTarget(prefab, in command.Targets[i], used);
+                if (entity == Entity.Null) continue;
+                used.Add(entity);
 
-                    VisualState state;
-                    if (!_known.TryGetValue(entity, out state) && !TryReadState(entity, out state))
-                        continue;
-                    if (!MatchesCommand(in state, command))
-                    {
-                        needsApply = true;
-                        break;
-                    }
+                VisualState state;
+                if (!_known.TryGetValue(entity, out state) && !TryReadState(entity, out state))
+                    continue;
+                if (!MatchesCommand(in state, command))
+                {
+                    needsApply = true;
+                    break;
                 }
-            }
-            finally
-            {
-                if (candidates.IsCreated) candidates.Dispose();
             }
 
             if (needsApply) ApplyVisual(command, now, 0, allowRetry: false);
@@ -676,7 +869,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             WritePalette(command.Colors);
             _knownPalette = ClonePalette(command.Colors);
             _paletteKnown = true;
-            _selectedInfo.RequestUpdate();
+            _selectedInfoDirty = true;
         }
 
         private void EnsureLocalPalette(ColorPaletteCommand command)
@@ -688,7 +881,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         // ---- target resolution ----------------------------------------------
 
         private Entity ResolveTarget(Entity prefab, in VisualCustomizationTarget target,
-            HashSet<Entity> used, ref NativeArray<Entity> candidates)
+            HashSet<Entity> used)
         {
             Entity hinted = new Entity
             {
@@ -709,49 +902,47 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     return hinted;
             }
 
-            if (!candidates.IsCreated)
-                candidates = _targetQuery.ToEntityArray(Allocator.Temp);
-
-            Entity bestSeed = Entity.Null;
-            Entity bestNear = Entity.Null;
+            // The bucket already satisfies every IsBaseCandidate condition except an in-frame
+            // delete, so only the winner needs re-validating against live state.
+            CandidateCache.Bucket bucket = _candidates.For(prefab, _targetQuery, EntityManager);
+            int bestSeed = -1;
+            int bestNear = -1;
             float bestSeedDistance = float.MaxValue;
             float bestNearDistance = float.MaxValue;
             int seedMatchesCount = 0;
             float3 position = new float3(target.X, target.Y, target.Z);
+            bool skipUsed = used.Count != 0;
 
-            for (int i = 0; i < candidates.Length; i++)
+            for (int i = 0; i < bucket.Count; i++)
             {
-                Entity candidate = candidates[i];
-                if (used.Contains(candidate) || !IsBaseCandidate(candidate, prefab)) continue;
+                if (skipUsed && used.Contains(bucket.Entities[i])) continue;
 
-                float distanceSq = math.distancesq(
-                    EntityManager.GetComponentData<Transform>(candidate).m_Position, position);
+                float distanceSq = math.distancesq(bucket.Positions[i], position);
                 if (distanceSq < bestNearDistance)
                 {
                     bestNearDistance = distanceSq;
-                    bestNear = candidate;
+                    bestNear = i;
                 }
 
-                if (target.RandomSeed >= 0 &&
-                    EntityManager.HasComponent<PseudoRandomSeed>(candidate) &&
-                    EntityManager.GetComponentData<PseudoRandomSeed>(candidate).m_Seed ==
-                    target.RandomSeed)
+                if (target.RandomSeed >= 0 && bucket.Seeds[i] == target.RandomSeed)
                 {
                     seedMatchesCount++;
                     if (distanceSq < bestSeedDistance)
                     {
                         bestSeedDistance = distanceSq;
-                        bestSeed = candidate;
+                        bestSeed = i;
                     }
                 }
             }
 
-            if (bestSeed != Entity.Null &&
+            if (bestSeed >= 0 &&
                 (seedMatchesCount == 1 || bestSeedDistance <= MatchToleranceSq ||
-                 EntityManager.HasComponent<Vehicle>(bestSeed)))
-                return bestSeed;
-            return bestNear != Entity.Null && bestNearDistance <= MatchToleranceSq
-                ? bestNear
+                 EntityManager.HasComponent<Vehicle>(bucket.Entities[bestSeed])) &&
+                IsBaseCandidate(bucket.Entities[bestSeed], prefab))
+                return bucket.Entities[bestSeed];
+            return bestNear >= 0 && bestNearDistance <= MatchToleranceSq &&
+                   IsBaseCandidate(bucket.Entities[bestNear], prefab)
+                ? bucket.Entities[bestNear]
                 : Entity.Null;
         }
 

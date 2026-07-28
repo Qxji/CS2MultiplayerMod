@@ -1,12 +1,23 @@
 using System;
 using System.Net.Sockets;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Networking.Tcp;
 using CS2MultiplayerMod.Core.Protocol;
+using CS2MultiplayerMod.Core.Protocol.Messages;
 
 namespace CS2MultiplayerMod.Core.Session
 {
     public sealed partial class MultiplayerSession
     {
+        /// <summary>
+        /// How long <see cref="StopWithNotice"/> may block the game thread waiting for the
+        /// farewell to reach the peers. Long enough for a small message on a live socket,
+        /// short enough that a wedged connection cannot noticeably delay the shutdown the
+        /// player asked for.
+        /// </summary>
+        private const int GracefulCloseTimeoutMs = 750;
+
+
         public void StartHost(MultiplayerConfig config)
         {
             if (Role != SessionRole.None) throw new InvalidOperationException("A session is already active.");
@@ -95,6 +106,7 @@ namespace CS2MultiplayerMod.Core.Session
                 LocalPlayerName = WireGuard.SanitizePlayerName(config.PlayerName);
                 Role = SessionRole.Client;
                 _challengeAnswered = false;
+                _awaitingHostApproval = false;
                 EncryptionActive = config.UseEncryption;
 
                 var client = new TcpClientTransport(_log);
@@ -114,6 +126,31 @@ namespace CS2MultiplayerMod.Core.Session
             var socket = ex as SocketException;
             return prefix + (socket != null ? " [" + socket.SocketErrorCode + "]" : "") +
                    ": " + ex.Message;
+        }
+
+        /// <summary>
+        /// End the session because this machine is leaving the shared city (the player quit
+        /// the game, returned to the main menu, or loaded another world).
+        ///
+        /// A plain <see cref="Stop"/> drops the sockets, which peers only ever see as an
+        /// anonymous "remote closed". A host owes its clients better than that: the notice
+        /// says the session ended normally, and the flush is what actually gets it onto the
+        /// wire before the process (or the world) goes away.
+        /// </summary>
+        public void StopWithNotice(string reason)
+        {
+            if (Role == SessionRole.None) { Stop(); return; }
+
+            if (Role == SessionRole.Host && Status == SessionStatus.Connected)
+                BroadcastToAll(new DisconnectNoticeMessage(reason, graceful: true), ConnectionId.None);
+
+            if (_transport != null)
+            {
+                try { _transport.ShutdownAfterFlush(GracefulCloseTimeoutMs); }
+                catch (Exception ex) { _log.Warn("Graceful close failed (" + ex.Message + "); closing now."); }
+            }
+
+            Stop();
         }
 
         public void Stop()
@@ -143,6 +180,7 @@ namespace CS2MultiplayerMod.Core.Session
             Role = SessionRole.None;
             LocalPlayerId = 0;
             _nextPlayerId = HostPlayerId + 1;
+            _awaitingHostApproval = false;
             EncryptionActive = false;
             _worldSyncSuspended = false;
             _worldSyncEpoch = 0;

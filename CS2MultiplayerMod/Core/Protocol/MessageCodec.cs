@@ -32,9 +32,11 @@ namespace CS2MultiplayerMod.Core.Protocol
             codec.Register(MessageType.HandshakeRequest, () => new HandshakeRequest(), 32 * 1024);
             codec.Register(MessageType.HandshakeResponse, () => new HandshakeResponse(), 1024);
             codec.Register(MessageType.HandshakeChallenge, () => new HandshakeChallenge(), 256);
+            codec.Register(MessageType.HandshakePending, () => new HandshakePendingMessage(), 64);
             codec.Register(MessageType.Heartbeat, () => new Heartbeat(), 64);
             codec.Register(MessageType.Chat, () => new ChatMessage(), 4 * 1024);
-            codec.Register(MessageType.SimulationCommand, () => new SimulationCommandMessage(), 128 * 1024);
+            codec.Register(MessageType.SimulationCommand, () => new SimulationCommandMessage(),
+                ProtocolConstants.MaxSimulationCommandPayloadBytes);
             codec.Register(MessageType.StateSnapshot, () => new StateSnapshotMessage(), 256 * 1024);
             codec.Register(MessageType.PlayerState, () => new PlayerStateMessage(), 64);
             codec.Register(MessageType.BlobChunk, () => new BlobChunkMessage(),
