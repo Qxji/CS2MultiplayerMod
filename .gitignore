@@ -18,3 +18,5 @@ tools/
 .idea
 CLAUDE.md
 Log/
+
+.mcp.json
