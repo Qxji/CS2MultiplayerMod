@@ -1,22 +1,27 @@
 import { bindValue, trigger, useValue } from "cs2/api";
-import { AutoNavigationScope, BackConsumer, InputActionBarrier, NavigationDirection } from "cs2/input";
+import { AutoNavigationScope, BackConsumer, NavigationDirection } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
-import { Button, DialogContext, DialogStack, MenuButton, Portal } from "cs2/ui";
-import { CSSProperties, useContext, useEffect, useRef, useState } from "react";
+import { Button, DialogContext, DialogStack, MenuButton } from "cs2/ui";
+import { CSSProperties, ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
 import { VersionWarningBanner } from "mods/version-banner";
 
 // Binding group shared with MultiplayerUISystem on the C# side. The field values
-// live in the mod's Setting object, so this dialog and the options screen share
-// the same player/join data.
+// live in the mod's Setting object, so this screen, the in-game hub and Options
+// all share the same multiplayer data.
 const GROUP = "cs2mp";
 
 // Locale keys served by the mod's LocaleEN/LocaleDE dictionary sources (constants
 // in L10n.Key on the C# side). The game resolves them against its active language;
 // the inline fallbacks only cover a dictionary that has not loaded yet.
 const LOC = {
+    multiplayer: "CS2MP.UI.Multiplayer",
     joinGame: "CS2MP.UI.JoinGame",
+    hostGame: "CS2MP.UI.HostGame",
+    hostWorldTitle: "CS2MP.UI.HostWorldTitle",
+    loadWorld: "CS2MP.UI.LoadWorld",
+    createWorld: "CS2MP.UI.CreateWorld",
     dialogTitle: "CS2MP.UI.DialogTitle",
     playerName: "CS2MP.UI.PlayerName",
     hostAddress: "CS2MP.UI.HostAddress",
@@ -41,6 +46,12 @@ const password$ = bindValue<string>(GROUP, "joinPassword", "");
 const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const inSession$ = bindValue<boolean>(GROUP, "inSession", false);
+// The same native save-list binding that enables/disables the game's Load Game
+// menu item. Using it keeps our Load World choice in exact lockstep with vanilla.
+const savedGames$ = bindValue<unknown[]>("menu", "saves", []);
+const multiplayerMenuActive$ = bindValue<boolean>(GROUP, "multiplayerMenuActive", false);
+
+const openMultiplayerScreen = () => trigger(GROUP, "openMultiplayerScreen");
 
 // ---- Vanilla menu-screen chrome ------------------------------------------------
 // The Load Game / New Game screens are built from shared modules in the game's UI
@@ -57,8 +68,24 @@ const tryModule = (path: string, exportName: string): any => {
     }
 };
 const VanillaSubScreen = tryModule("game-ui/menu/components/shared/sub-screen/sub-screen.tsx", "SubScreen");
-const menuClasses: Record<string, string> | null =
-    tryModule("game-ui/menu/components/menu-ui.module.scss", "classes");
+const VanillaTransitionGroup = tryModule(
+    "game-ui/common/animations/transition-group-coordinator.tsx",
+    "TransitionGroupCoordinator",
+);
+const VanillaClassNameTransition = tryModule(
+    "game-ui/common/animations/class-name-transition.tsx",
+    "ClassNameTransition",
+);
+const VanillaFocusScope = tryModule("game-ui/common/focus/focus-scope.tsx", "FocusScope");
+const shrinkFadeStyles: Record<string, string> | null =
+    tryModule("game-ui/menu/transitions/shrink-fade.module.scss", "classes");
+const playUISound = tryModule("game-ui/common/data-binding/audio-bindings.ts", "playUISound");
+const UISound = tryModule("game-ui/common/data-binding/audio-bindings.ts", "UISound");
+const subScreenClasses: Record<string, string> | null =
+    tryModule("game-ui/menu/components/shared/sub-screen/sub-screen.module.scss", "classes");
+const childOpacityTransitionClass = subScreenClasses?.header
+    ?.split(/\s+/)
+    .find((className) => className.startsWith("child-opacity-transition"));
 const backdropClasses: Record<string, string> | null =
     tryModule("game-ui/menu/components/menu-ui-backdrops/menu-ui-backdrops.module.scss", "classes");
 
@@ -66,10 +93,8 @@ const backdropClasses: Record<string, string> | null =
 // the game's own file naming). Only used if the live backdrop cannot be read.
 const FALLBACK_BACKDROPS = [1, 2, 3, 4, 5, 6, 7].map((n) => `Media/Menu/Backdrops/Backgound0${n}.png`);
 
-// The menu's backdrop layer keeps running behind this screen. Reusing the image
-// it is showing right now means opening the screen changes nothing visually
-// behind the content — exactly how the vanilla sub-screens behave. Resolved at
-// open time (not module load) so the menu has rendered its backdrop already.
+// The join loading overlay also needs to preserve the menu's current artwork.
+// Resolve it on demand so the menu has rendered its live backdrop already.
 export const currentMenuBackdropImage = (): string => {
     try {
         if (backdropClasses && backdropClasses.backdropImage) {
@@ -92,54 +117,21 @@ export const currentMenuBackdropImage = (): string => {
 // The game scales its UI by adjusting the root font size, so rem behaves like
 // resolution-independent pixels; all sizes below follow that convention.
 const styles: Record<string, CSSProperties> = {
-    // Full-screen wrapper. The vanilla menu swaps its screens in place (the button
-    // column unmounts while a sub-screen shows); this overlay achieves the same
-    // look by covering the main menu with the vanilla backdrop artwork.
-    screen: {
-        position: "fixed",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        zIndex: 10000,
-        backgroundColor: "rgb(11, 16, 27)",
-        pointerEvents: "auto",
-    },
-    backdrop: {
-        position: "absolute",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        backgroundPosition: "center",
-        backgroundSize: "cover",
-        backgroundRepeat: "no-repeat",
-    },
-    // Fallback geometry matching the vanilla menu screen container (used only if
-    // the vanilla classes are unavailable after a game update).
-    menuUiFallback: {
-        position: "absolute",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        pointerEvents: "auto",
-    },
-    containerFallback: {
-        width: "1760rem",
-        height: "980rem",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "stretch",
-    },
-    contentFallback: {
-        flexGrow: 1,
-        flexShrink: 1,
-        flexBasis: "0%",
+    pageHost: {
+        width: "100%",
+        height: "100%",
         position: "relative",
+    },
+    page: {
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+    },
+    pageContent: {
+        width: "100%",
+        height: "100%",
     },
     // Fallback sub-screen chrome (back arrow + large title), same metrics as the
     // vanilla sub-screen header.
@@ -185,7 +177,72 @@ const styles: Record<string, CSSProperties> = {
         minHeight: 0,
         position: "relative",
     },
-    // The form panel inside the screen's content area.
+    // Large native-button choices used by both the multiplayer landing page and
+    // the host-world picker. The game's flat button supplies hover, focus, press,
+    // disabled and controller states; only the card geometry is ours.
+    choiceArea: {
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        paddingBottom: "48rem",
+    },
+    choiceWarning: {
+        width: "920rem",
+        maxWidth: "88%",
+        marginBottom: "20rem",
+    },
+    choiceRow: {
+        width: "980rem",
+        maxWidth: "90%",
+        height: "350rem",
+        display: "flex",
+        alignItems: "stretch",
+        justifyContent: "center",
+    },
+    choiceButton: {
+        flex: "1 1 0%",
+        minWidth: 0,
+        height: "100%",
+        margin: "0 16rem",
+        padding: "34rem",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        boxShadow: "0 14rem 38rem rgba(0, 0, 0, 0.38)",
+        pointerEvents: "auto",
+    },
+    choiceIconFrame: {
+        width: "184rem",
+        height: "184rem",
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        marginBottom: "28rem",
+        borderRadius: "92rem",
+        backgroundColor: "rgba(0, 0, 0, 0.22)",
+        border: "2rem solid rgba(157, 193, 222, 0.22)",
+    },
+    choiceIcon: {
+        width: "112rem",
+        height: "112rem",
+        objectFit: "contain",
+        // The glyph set mixes explicit white fills with default black fills.
+        // Normalize both to the menu's white icon color, as native tinted icons do.
+        filter: "brightness(0) invert(1) drop-shadow(0 4rem 8rem rgba(0, 0, 0, 0.35))",
+    },
+    choiceLabel: {
+        color: "#ffffff",
+        fontSize: "28rem",
+        lineHeight: "1.2",
+        fontWeight: "bold",
+        textAlign: "center",
+        textTransform: "uppercase",
+    },
+    // The join form panel inside the screen's content area.
     contentArea: {
         height: "100%",
         display: "flex",
@@ -308,12 +365,66 @@ const Field = ({ label, value, secret, disabled, onChange }: FieldProps) => {
                     if (draft !== value) onChange(draft);
                 }}
                 onMouseDown={(e) => e.stopPropagation()}
-                onKeyDown={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                    // Let Escape reach the native BackConsumer even while a text
+                    // field is active; keep gameplay/menu shortcuts out otherwise.
+                    if (e.key !== "Escape") e.stopPropagation();
+                }}
                 onChange={(e) => updateValue((e.target as HTMLInputElement).value)}
             />
         </div>
     );
 };
+
+interface ChoiceTileProps {
+    focusKey: string;
+    icon: string;
+    label: string;
+    disabled?: boolean;
+    onSelect: () => void;
+}
+
+const ChoiceTile = ({ focusKey, icon, label, disabled, onSelect }: ChoiceTileProps) => (
+    <Button
+        variant="flat"
+        focusKey={focusKey}
+        disabled={disabled}
+        style={styles.choiceButton}
+        onSelect={onSelect}>
+        <div style={disabled ? { ...styles.choiceIconFrame, opacity: 0.42 } : styles.choiceIconFrame}>
+            <img src={icon} style={styles.choiceIcon} />
+        </div>
+        <div style={disabled
+            ? { ...styles.choiceLabel, color: "rgba(255, 255, 255, 0.42)" }
+            : styles.choiceLabel}>
+            {label}
+        </div>
+    </Button>
+);
+
+const ChoiceScreen = ({
+    focusKey,
+    debugName,
+    initialFocused,
+    children,
+}: {
+    focusKey: string | number;
+    debugName: string;
+    initialFocused: string;
+    children: ReactNode;
+}) => (
+    <div style={styles.choiceArea}>
+        <VersionWarningBanner style={styles.choiceWarning} />
+        <AutoNavigationScope
+            focusKey={focusKey}
+            debugName={debugName}
+            direction={NavigationDirection.Horizontal}
+            initialFocused={initialFocused}
+            allowLooping>
+            <div style={styles.choiceRow}>{children}</div>
+        </AutoNavigationScope>
+    </div>
+);
 
 const ProgressSweep = () => {
     const [position, setPosition] = useState(-30);
@@ -360,8 +471,31 @@ export const TransferProgress = ({
     );
 };
 
-export const JoinGameDialog = () => {
-    const { onClose } = useContext(DialogContext);
+type MultiplayerView = "choice" | "join" | "host";
+
+const PAGE_INDEX: Record<MultiplayerView, number> = {
+    choice: 0,
+    join: 1,
+    host: 2,
+};
+
+interface NativeMenuScreenProps {
+    focusKey: string | number;
+    className?: string;
+    onClose: () => void;
+}
+
+const playOpenMenuSound = () => {
+    try {
+        if (typeof playUISound === "function" && UISound?.openMenu !== undefined) {
+            playUISound(UISound.openMenu);
+        }
+    } catch {
+        // The navigation itself remains available if the audio module changes.
+    }
+};
+
+export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: NativeMenuScreenProps) => {
     const t = useT();
     const playerName = useValue(playerName$);
     const address = useValue(address$);
@@ -370,11 +504,18 @@ export const JoinGameDialog = () => {
     const statusKind = useValue(statusKind$);
     const mapTransferPercent = useValue(mapTransferPercent$);
     const inSession = useValue(inSession$);
-    const accepted = useValue(disclaimerAccepted$);
+    const hasSavedGame = useValue(savedGames$).length > 0;
+    const [view, setView] = useState<MultiplayerView>("choice");
 
-    // Snapshot of the backdrop the menu is showing at open time (lazy initializer
-    // runs once). Kept static while open, so nothing swaps behind the form.
-    const [backdropImage] = useState(currentMenuBackdropImage);
+    // Keep the multiplayer marker alive through the native exit animation. Once
+    // this screen is actually removed, the Credits slot can behave normally again.
+    useEffect(() => () => {
+        try {
+            trigger(GROUP, "multiplayerScreenExited");
+        } catch {
+            // The UI is already shutting down.
+        }
+    }, []);
 
     // Auto-close once a join we started here actually completes (the world has loaded
     // and gameplay is live → statusKind flips "connecting" → "connected"). Guarded by
@@ -390,18 +531,31 @@ export const JoinGameDialog = () => {
         }
     }, [statusKind, onClose]);
 
-    // First use: show the one-time disclaimer instead of the form. Accepting flips
-    // the binding and this re-renders into the real dialog; Cancel closes it.
-    if (!accepted) {
-        return <DisclaimerModal onAccept={() => {}} onDecline={onClose} />;
-    }
+    const title = view === "choice"
+        ? t(LOC.multiplayer, "Multiplayer")
+        : view === "host"
+            ? t(LOC.hostWorldTitle, "Choose a World")
+            : t(LOC.dialogTitle, "Join Multiplayer Game");
 
-    const title = t(LOC.dialogTitle, "Join Multiplayer Game");
+    const openView = (nextView: MultiplayerView) => {
+        setView(nextView);
+        playOpenMenuSound();
+    };
 
-    const form = (
+    const backAction = view === "choice"
+        ? onClose
+        : () => openView("choice");
+
+    const openHostWorld = (action: "hostLoadWorld" | "hostCreateWorld") => {
+        // The C# trigger both arms automatic hosting and selects the real Load/New
+        // Game screen. From here the native menu coordinator owns the transition.
+        trigger(GROUP, action);
+    };
+
+    const joinForm = (
         <div style={styles.contentArea}>
             <AutoNavigationScope
-                focusKey="cs2mp-join-dialog"
+                focusKey={PAGE_INDEX.join}
                 debugName="CS2MP Join Game Screen"
                 direction={NavigationDirection.Both}
                 initialFocused={inSession ? "disconnect" : "join"}
@@ -455,64 +609,145 @@ export const JoinGameDialog = () => {
         </div>
     );
 
-    return (
-        <Portal>
-            <InputActionBarrier>
-                <div style={styles.screen}>
-                    <div style={{ ...styles.backdrop, backgroundImage: backdropImage }} />
-                    <div
-                        className={menuClasses ? menuClasses.menuUi : undefined}
-                        style={menuClasses ? undefined : styles.menuUiFallback}>
-                        <div
-                            className={menuClasses ? menuClasses.contentContainer : undefined}
-                            style={menuClasses ? undefined : styles.containerFallback}>
-                            <div
-                                className={menuClasses ? menuClasses.content : undefined}
-                                style={menuClasses ? undefined : styles.contentFallback}>
-                                {VanillaSubScreen ? (
-                                    // The vanilla sub-screen brings its own back button,
-                                    // title bar and back-action handling.
-                                    <VanillaSubScreen
-                                        focusKey="cs2mp-join-screen"
-                                        title={title}
-                                        onClose={onClose}>
-                                        {form}
-                                    </VanillaSubScreen>
-                                ) : (
-                                    <BackConsumer onAction={onClose}>
-                                        <div style={styles.fallbackScreenRoot}>
-                                            <div style={styles.fallbackHeader}>
-                                                <Button
-                                                    variant="icon"
-                                                    style={styles.fallbackBackButton}
-                                                    onSelect={onClose}>
-                                                    <img
-                                                        src="Media/Glyphs/TriangleArrowLeft.svg"
-                                                        style={styles.fallbackBackIcon}
-                                                    />
-                                                </Button>
-                                                <div style={styles.fallbackTitle}>{title}</div>
-                                            </div>
-                                            <div style={styles.fallbackContent}>{form}</div>
-                                        </div>
-                                    </BackConsumer>
-                                )}
-                            </div>
-                        </div>
+    const content = view === "choice" ? (
+        <ChoiceScreen
+            focusKey={PAGE_INDEX.choice}
+            debugName="CS2MP Multiplayer Choice"
+            initialFocused="join-game">
+            <ChoiceTile
+                focusKey="join-game"
+                icon="Media/Glyphs/Passenger.svg"
+                label={t(LOC.joinGame, "Join Game")}
+                onSelect={() => openView("join")}
+            />
+            <ChoiceTile
+                focusKey="host-game"
+                icon="Media/Glyphs/Residence.svg"
+                label={t(LOC.hostGame, "Host Game")}
+                disabled={inSession}
+                onSelect={() => openView("host")}
+            />
+        </ChoiceScreen>
+    ) : view === "host" ? (
+        <ChoiceScreen
+            focusKey={PAGE_INDEX.host}
+            debugName="CS2MP Host World Choice"
+            initialFocused={hasSavedGame ? "load-world" : "create-world"}>
+            <ChoiceTile
+                focusKey="load-world"
+                icon="Media/Glyphs/Progress.svg"
+                label={t(LOC.loadWorld, "Load World")}
+                disabled={!hasSavedGame || inSession}
+                onSelect={() => openHostWorld("hostLoadWorld")}
+            />
+            <ChoiceTile
+                focusKey="create-world"
+                icon="Media/Glyphs/Plus.svg"
+                label={t(LOC.createWorld, "Create World")}
+                disabled={inSession}
+                onSelect={() => openHostWorld("hostCreateWorld")}
+            />
+        </ChoiceScreen>
+    ) : joinForm;
+
+    const pageIndex = PAGE_INDEX[view];
+    const animatedPage = (
+        <div key={pageIndex} style={styles.page}>
+            {VanillaClassNameTransition && shrinkFadeStyles ? (
+                <VanillaClassNameTransition styles={shrinkFadeStyles}>
+                    <div className={childOpacityTransitionClass} style={styles.pageContent}>
+                        {content}
                     </div>
+                </VanillaClassNameTransition>
+            ) : (
+                <div className={childOpacityTransitionClass} style={styles.pageContent}>
+                    {content}
                 </div>
-            </InputActionBarrier>
-        </Portal>
+            )}
+        </div>
+    );
+
+    const transitioningPage = VanillaTransitionGroup ? (
+        <VanillaTransitionGroup>{animatedPage}</VanillaTransitionGroup>
+    ) : animatedPage;
+
+    const focusedPage = VanillaFocusScope ? (
+        <VanillaFocusScope focused={pageIndex} activation="always">
+            {transitioningPage}
+        </VanillaFocusScope>
+    ) : transitioningPage;
+
+    const screenContent = <div style={styles.pageHost}>{focusedPage}</div>;
+
+    if (VanillaSubScreen) {
+        return (
+            <VanillaSubScreen
+                focusKey={focusKey}
+                className={className}
+                title={title}
+                onClose={backAction}>
+                {screenContent}
+            </VanillaSubScreen>
+        );
+    }
+
+    return (
+        <BackConsumer onAction={backAction}>
+            <div className={className} style={styles.fallbackScreenRoot}>
+                <div style={styles.fallbackHeader}>
+                    <Button
+                        variant="icon"
+                        style={styles.fallbackBackButton}
+                        onSelect={backAction}>
+                        <img
+                            src="Media/Glyphs/TriangleArrowLeft.svg"
+                            style={styles.fallbackBackIcon}
+                        />
+                    </Button>
+                    <div style={styles.fallbackTitle}>{title}</div>
+                </div>
+                <div style={styles.fallbackContent}>{screenContent}</div>
+            </div>
+        </BackConsumer>
     );
 };
 
-export const JoinGameMenuButton = () => {
+export const extendCreditsScreen = (CreditsScreen: any) => {
+    const ExtendedCreditsScreen = (props: NativeMenuScreenProps) => {
+        const multiplayerActive = useValue(multiplayerMenuActive$);
+        return multiplayerActive
+            ? <MultiplayerScreenRenderer {...props} />
+            : <CreditsScreen {...props} />;
+    };
+
+    return ExtendedCreditsScreen;
+};
+
+const MultiplayerDisclaimer = () => {
+    const { onClose } = useContext(DialogContext);
+
+    return (
+        <DisclaimerModal
+            onAccept={() => {
+                onClose();
+                openMultiplayerScreen();
+            }}
+            onDecline={onClose}
+        />
+    );
+};
+
+export const MultiplayerMenuButton = () => {
     const { showDialog } = useContext(DialogStack);
     const t = useT();
+    const accepted = useValue(disclaimerAccepted$);
+
     return (
         <MenuButton tinted src="Media/Glyphs/Passenger.svg"
-                    onSelect={() => showDialog(<JoinGameDialog />)}>
-            {t(LOC.joinGame, "Join Game")}
+                    onSelect={() => accepted
+                        ? openMultiplayerScreen()
+                        : showDialog(<MultiplayerDisclaimer />)}>
+            {t(LOC.multiplayer, "Multiplayer")}
         </MenuButton>
     );
 };

@@ -14,9 +14,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     public partial class RouteSyncSystem
     {
-        private const float StopMatchDistanceSq = 4f;
-        private const float OwnerMatchDistanceSq = 4f;
+        // Horizontal identity stays tight, because distinct stops of one prefab are metres apart.
+        // The vertical band is wide: two machines can hold the same stop at different heights after
+        // independent terrain grading, and a stacked platform is still separated horizontally.
+        private const float StopMatchRadiusSq = 16f;
+        private const float StopMatchHeight = 10f;
+        private const float OwnerMatchRadiusSq = 64f;
+        private const float OwnerMatchHeight = 20f;
+        private const float FreeWaypointMatchDistanceSq = 0.25f;
         private const float RouteAnchorMatchDistanceSq = 256f;
+
+        private static bool StopPositionsMatch(float3 a, float3 b) =>
+            math.distancesq(a.xz, b.xz) <= StopMatchRadiusSq &&
+            math.abs(a.y - b.y) <= StopMatchHeight;
+
+        private static bool OwnerPositionsMatch(float3 a, float3 b) =>
+            math.distancesq(a.xz, b.xz) <= OwnerMatchRadiusSq &&
+            math.abs(a.y - b.y) <= OwnerMatchHeight;
 
         private RealizeResult RealizeCreate(RouteCreateCommand command, int originPlayerId, long now)
         {
@@ -31,8 +45,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                              command.PrefabName + "'; skipping.");
                 return RealizeResult.Rejected;
             }
-            if (!ValidateRouteContract(prefab, command.IsComplete, command.Waypoints,
-                    command.PrefabName))
+            if (!ValidateRouteContract(prefab, command.Waypoints, command.PrefabName))
                 return RealizeResult.Rejected;
 
             for (int i = 0; i < _pendingCreateMetadata.Count; i++)
@@ -85,7 +98,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             Entity[] connections;
-            if (!TryResolveConnections(prefab, command.Waypoints, out connections))
+            float3[] positions;
+            if (!TryResolveConnections(prefab, command.Waypoints, out connections,
+                    out positions, out _lastRealizeFailure))
                 return RealizeResult.Retry;
             if (_pendingCreateMetadata.Count >= MaxPendingCommands)
                 return RealizeResult.Retry;
@@ -105,7 +120,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     m_RandomSeed = 0,
                     m_Flags = CreationFlags.Permanent,
                 });
-                AddWaypointDefinitions(definition, command.Waypoints, connections,
+                AddWaypointDefinitions(definition, connections, positions,
                     Entity.Null, appendClosure: command.IsComplete);
                 EntityManager.AddComponentData(definition, new ColorDefinition
                 {
@@ -142,11 +157,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
 
                 MarkCreateGuards(command, now);
-                Diagnostics.FlightRecorder.Note("route create definition armed stops=" +
-                                                  command.Waypoints.Length);
-                Mod.Verbose("[MP] RouteSync create: submitted complete line '" +
-                            command.PrefabName + "' (" + command.Waypoints.Length +
-                            " stops, number " + command.RouteNumber + ") from player " +
+                Diagnostics.FlightRecorder.Note("route create definition armed " +
+                                                  DescribeShape(command.Waypoints));
+                Mod.Verbose("[MP] RouteSync create: submitted line '" +
+                            command.PrefabName + "' (" + DescribeShape(command.Waypoints) +
+                            ", number " + command.RouteNumber + ") from player " +
                             originPlayerId + ".");
                 return RealizeResult.Applied;
             }
@@ -176,8 +191,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                              command.PrefabName + "'; skipping.");
                 return RealizeResult.Rejected;
             }
-            if (!ValidateRouteContract(prefab, command.IsComplete, command.Waypoints,
-                    command.PrefabName))
+            if (!ValidateRouteContract(prefab, command.Waypoints, command.PrefabName))
                 return RealizeResult.Rejected;
 
             bool ambiguous;
@@ -197,7 +211,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return RealizeResult.Retry;
 
             Entity[] connections;
-            if (!TryResolveConnections(prefab, command.Waypoints, out connections))
+            float3[] positions;
+            if (!TryResolveConnections(prefab, command.Waypoints, out connections,
+                    out positions, out _lastRealizeFailure))
                 return RealizeResult.Retry;
 
             RouteSnapshot local;
@@ -214,7 +230,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             _mutatedRoutesThisFrame.Add(route);
 
-            bool rebuildGraph = !RouteGraphMatches(route, command.Waypoints, connections) ||
+            bool rebuildGraph = !RouteGraphMatches(route, connections, positions) ||
                                 local.IsComplete != command.IsComplete;
             Entity definition = Entity.Null;
             PendingUpdateCommit pendingCommit = null;
@@ -251,7 +267,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
                     // Modified routes already close their last segment back to index zero. Only a
                     // brand-new route uses a repeated first definition as the completion signal.
-                    AddWaypointDefinitions(definition, command.Waypoints, connections,
+                    AddWaypointDefinitions(definition, connections, positions,
                         route, appendClosure: false);
                     EntityManager.AddComponent<Updated>(definition);
                     EntityManager.AddComponent<Deleted>(definition);
@@ -287,22 +303,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     command.Waypoints), now);
                 if (!rebuildGraph)
                 {
-                    _knownRoutes[route] = new RouteSnapshot
-                    {
-                        Waypoints = command.Waypoints,
-                        Rgba = rgba,
-                        RouteNumber = command.RouteNumber,
-                        IsComplete = command.IsComplete,
-                    };
+                    // Record what this world actually holds, not what was asked for: its waypoints
+                    // sit on its own stops, and a synthesized snapshot would read as a local edit
+                    // on the next scan.
+                    RouteSnapshot applied;
+                    _knownRoutes[route] = TryCaptureSnapshot(route, out applied)
+                        ? applied
+                        : new RouteSnapshot
+                        {
+                            Waypoints = command.Waypoints,
+                            Rgba = rgba,
+                            RouteNumber = command.RouteNumber,
+                            IsComplete = command.IsComplete,
+                        };
                 }
                 else
                 {
-                    Diagnostics.FlightRecorder.Note("route update definition armed stops=" +
-                                                      command.Waypoints.Length);
+                    Diagnostics.FlightRecorder.Note("route update definition armed " +
+                                                      DescribeShape(command.Waypoints));
                 }
                 Mod.Verbose("[MP] RouteSync update: applied line '" +
-                            command.PrefabName + "' (" + command.Waypoints.Length +
-                            " stops, number " + command.RouteNumber + ") from player " +
+                            command.PrefabName + "' (" + DescribeShape(command.Waypoints) +
+                            ", number " + command.RouteNumber + ") from player " +
                             originPlayerId + ".");
                 return RealizeResult.Applied;
             }
@@ -363,7 +385,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return RealizeResult.Applied;
         }
 
-        private bool ValidateRouteContract(Entity routePrefab, bool isComplete,
+        /// <summary>
+        /// A line may carry waypoints that only shape its path, but it is meaningless - and a sign
+        /// of a truncated graph - if it serves no stop at all.
+        /// </summary>
+        private bool ValidateRouteContract(Entity routePrefab,
             RouteWaypointIntent[] waypoints, string prefabName)
         {
             if (waypoints == null || waypoints.Length < 2 ||
@@ -374,32 +400,34 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             if (!EntityManager.HasComponent<TransportLineData>(routePrefab)) return true;
-            if (!isComplete)
-            {
-                SyncInbox.RequestResync("incomplete public transport route rejected");
-                Mod.log.Warn("[MP] RouteSync rejected incomplete public-transport line '" +
-                             prefabName + "'.");
-                return false;
-            }
             for (int i = 0; i < waypoints.Length; i++)
-            {
-                if (!string.IsNullOrEmpty(waypoints[i].StopPrefabName)) continue;
-                SyncInbox.RequestResync("unconnected public transport waypoint rejected");
-                Mod.log.Warn("[MP] RouteSync rejected public-transport line '" +
-                             prefabName + "' because waypoint " + i +
-                             " has no connected stop identity.");
-                return false;
-            }
-            return true;
+                if (!string.IsNullOrEmpty(waypoints[i].StopPrefabName))
+                    return true;
+
+            SyncInbox.RequestResync("public transport route without any stop rejected");
+            Mod.log.Warn("[MP] RouteSync rejected public-transport line '" + prefabName +
+                         "' because none of its waypoints is connected to a stop.");
+            return false;
         }
 
+        /// <summary>
+        /// Maps each waypoint's portable stop identity onto a live local stop. Also returns the
+        /// waypoint positions to submit: a connected waypoint takes its resolved stop's own
+        /// transform, which is what the route tool records for a locally drawn line.
+        /// </summary>
         private bool TryResolveConnections(Entity routePrefab,
-            RouteWaypointIntent[] waypoints, out Entity[] result)
+            RouteWaypointIntent[] waypoints, out Entity[] result, out float3[] positions,
+            out string failure)
         {
+            failure = null;
             result = new Entity[waypoints.Length];
+            positions = new float3[waypoints.Length];
             bool needsStops = false;
             for (int i = 0; i < waypoints.Length; i++)
+            {
+                positions[i] = WaypointPosition(waypoints[i]);
                 needsStops |= !string.IsNullOrEmpty(waypoints[i].StopPrefabName);
+            }
             if (!needsStops) return true;
 
             TransportLineData lineData = default(TransportLineData);
@@ -410,52 +438,82 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             NativeArray<Entity> stops = _transportStops.ToEntityArray(Allocator.Temp);
             try
             {
+                var stopNames = new string[stops.Length];
+                var stopServes = new bool[stops.Length];
+                var stopPositions = new float3[stops.Length];
+                for (int s = 0; s < stops.Length; s++)
+                {
+                    // Two prefabs can share a name, so identity is checked on each candidate's own
+                    // prefab rather than by resolving the name to a single entity.
+                    Entity candidatePrefab =
+                        EntityManager.GetComponentData<PrefabRef>(stops[s]).m_Prefab;
+                    stopNames[s] = PrefabNameOf(candidatePrefab);
+                    stopServes[s] = !hasLineData || StopServesLine(candidatePrefab, lineData);
+                    stopPositions[s] = EntityManager
+                        .GetComponentData<global::Game.Objects.Transform>(stops[s]).m_Position;
+                }
+
                 for (int i = 0; i < waypoints.Length; i++)
                 {
                     RouteWaypointIntent wanted = waypoints[i];
                     if (string.IsNullOrEmpty(wanted.StopPrefabName)) continue;
 
-                    Entity stopPrefab;
-                    if (!_prefabIndex.TryResolve(wanted.StopPrefabName, out stopPrefab) ||
-                        !EntityManager.HasComponent<TransportStopData>(stopPrefab))
-                        return false;
-                    if (hasLineData)
-                    {
-                        TransportStopData stopData =
-                            EntityManager.GetComponentData<TransportStopData>(stopPrefab);
-                        if (stopData.m_TransportType != lineData.m_TransportType ||
-                            (lineData.m_PassengerTransport && !stopData.m_PassengerTransport) ||
-                            (lineData.m_CargoTransport && !stopData.m_CargoTransport))
-                            return false;
-                    }
-
                     Entity best = Entity.Null;
-                    float bestSq = StopMatchDistanceSq;
-                    bool tied = false;
+                    float3 bestPosition = default(float3);
+                    float bestScore = 0f;
+                    bool bestOwnerMatch = false;
+                    int sameName = 0;
+                    int wrongPurpose = 0;
+                    float nearest = float.MaxValue;
                     float3 wantedPosition = StopPosition(wanted);
+
                     for (int s = 0; s < stops.Length; s++)
                     {
                         Entity candidate = stops[s];
-                        if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab !=
-                            stopPrefab || !StopOwnerMatches(candidate, wanted))
+                        if (!string.Equals(stopNames[s], wanted.StopPrefabName,
+                                StringComparison.Ordinal))
                             continue;
-                        float3 candidatePosition = EntityManager
-                            .GetComponentData<global::Game.Objects.Transform>(candidate).m_Position;
-                        float distanceSq = math.distancesq(candidatePosition, wantedPosition);
-                        if (distanceSq > StopMatchDistanceSq) continue;
-                        if (best == Entity.Null || distanceSq + 0.0001f < bestSq)
+                        sameName++;
+                        if (!stopServes[s])
                         {
-                            best = candidate;
-                            bestSq = distanceSq;
-                            tied = false;
+                            wrongPurpose++;
+                            continue;
                         }
-                        else if (math.abs(distanceSq - bestSq) <= 0.0001f)
-                        {
-                            tied = true;
-                        }
+
+                        float3 candidatePosition = stopPositions[s];
+                        nearest = math.min(nearest,
+                            math.distance(candidatePosition, wantedPosition));
+                        if (!StopPositionsMatch(candidatePosition, wantedPosition)) continue;
+
+                        // The owner is the only thing separating identical platforms of one
+                        // station, so an owner-identified candidate outranks an anonymous one.
+                        bool ownerMatch = StopOwnerMatches(candidate, wanted);
+                        float score = math.distancesq(candidatePosition, wantedPosition);
+                        bool better = best == Entity.Null ||
+                                      (ownerMatch && !bestOwnerMatch) ||
+                                      (ownerMatch == bestOwnerMatch && score < bestScore);
+                        if (!better) continue;
+                        best = candidate;
+                        bestPosition = candidatePosition;
+                        bestScore = score;
+                        bestOwnerMatch = ownerMatch;
                     }
-                    if (best == Entity.Null || tied) return false;
+
+                    if (best == Entity.Null)
+                    {
+                        failure = "waypoint " + i + " found no live '" + wanted.StopPrefabName +
+                                  "' stop near " + Describe(wantedPosition) + " (" + sameName +
+                                  " with that name" +
+                                  (wrongPurpose != 0
+                                      ? ", " + wrongPurpose + " not serving this line"
+                                      : string.Empty) +
+                                  (nearest < float.MaxValue
+                                      ? ", nearest " + nearest.ToString("0.0") + " m)"
+                                      : ")");
+                        return false;
+                    }
                     result[i] = best;
+                    positions[i] = bestPosition;
                 }
                 return true;
             }
@@ -464,6 +522,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 stops.Dispose();
             }
         }
+
+        /// <summary>
+        /// A line whose own purpose the stop does not serve is a blocking validation error in the
+        /// game, so a captured line never used one.
+        /// </summary>
+        private bool StopServesLine(Entity stopPrefab, TransportLineData lineData)
+        {
+            if (!EntityManager.HasComponent<TransportStopData>(stopPrefab)) return false;
+            TransportStopData stopData =
+                EntityManager.GetComponentData<TransportStopData>(stopPrefab);
+            return stopData.m_TransportType == lineData.m_TransportType &&
+                   (!lineData.m_PassengerTransport || stopData.m_PassengerTransport) &&
+                   (!lineData.m_CargoTransport || stopData.m_CargoTransport);
+        }
+
+        private string PrefabNameOf(Entity prefab)
+        {
+            string name;
+            if (_prefabNames.TryGetValue(prefab, out name)) return name;
+            name = _prefabSystem.GetPrefabName(prefab) ?? string.Empty;
+            _prefabNames[prefab] = name;
+            return name;
+        }
+
+        private static string Describe(float3 position) =>
+            "(" + position.x.ToString("0") + "," + position.y.ToString("0") + "," +
+            position.z.ToString("0") + ")";
 
         private bool StopOwnerMatches(Entity stop, RouteWaypointIntent wanted)
         {
@@ -474,67 +559,65 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 !EntityManager.HasComponent<PrefabRef>(topOwner) ||
                 !EntityManager.HasComponent<global::Game.Objects.Transform>(topOwner))
                 return false;
-            string ownerName = _prefabSystem.GetPrefabName(
+            string ownerName = PrefabNameOf(
                 EntityManager.GetComponentData<PrefabRef>(topOwner).m_Prefab);
             if (!string.Equals(ownerName, wanted.OwnerPrefabName,
                     StringComparison.Ordinal))
                 return false;
             float3 ownerPosition = EntityManager
                 .GetComponentData<global::Game.Objects.Transform>(topOwner).m_Position;
-            return math.distancesq(ownerPosition, OwnerPosition(wanted)) <=
-                   OwnerMatchDistanceSq;
+            return OwnerPositionsMatch(ownerPosition, OwnerPosition(wanted));
         }
 
-        private void AddWaypointDefinitions(Entity definition,
-            RouteWaypointIntent[] waypoints, Entity[] connections, Entity originalRoute,
-            bool appendClosure)
+        private void AddWaypointDefinitions(Entity definition, Entity[] connections,
+            float3[] positions, Entity originalRoute, bool appendClosure)
         {
-            Entity[] originals = MatchOriginalWaypoints(originalRoute, waypoints, connections);
+            Entity[] originals = MatchOriginalWaypoints(originalRoute, connections, positions);
             DynamicBuffer<WaypointDefinition> buffer =
                 EntityManager.AddBuffer<WaypointDefinition>(definition);
-            for (int i = 0; i < waypoints.Length; i++)
+            for (int i = 0; i < positions.Length; i++)
             {
                 buffer.Add(new WaypointDefinition
                 {
-                    m_Position = WaypointPosition(waypoints[i]),
+                    m_Position = positions[i],
                     m_Connection = connections[i],
                     m_Original = originals[i],
                 });
             }
 
+            // Route generation reads a repeated first position as "this loop closes", and compares
+            // it exactly - so the closing entry repeats the same value, never a recomputed one.
             if (appendClosure)
             {
                 buffer.Add(new WaypointDefinition
                 {
-                    m_Position = WaypointPosition(waypoints[0]),
+                    m_Position = positions[0],
                     m_Connection = connections[0],
                     m_Original = Entity.Null,
                 });
             }
         }
 
-        private Entity[] MatchOriginalWaypoints(Entity route,
-            RouteWaypointIntent[] desired, Entity[] connections)
+        private Entity[] MatchOriginalWaypoints(Entity route, Entity[] connections,
+            float3[] positions)
         {
-            var result = new Entity[desired.Length];
+            var result = new Entity[positions.Length];
             if (route == Entity.Null || !EntityManager.HasBuffer<RouteWaypoint>(route))
                 return result;
 
             DynamicBuffer<RouteWaypoint> original =
                 EntityManager.GetBuffer<RouteWaypoint>(route, isReadOnly: true);
             var used = new bool[original.Length];
-            for (int i = 0; i < desired.Length; i++)
+            for (int i = 0; i < positions.Length; i++)
             {
-                float3 wantedPosition = WaypointPosition(desired[i]);
-                float positionToleranceSq =
-                    connections[i] == Entity.Null ? 0.01f : StopMatchDistanceSq;
                 for (int j = 0; j < original.Length; j++)
                 {
                     if (used[j]) continue;
                     Entity waypoint = original[j].m_Waypoint;
                     if (!EntityManager.HasComponent<Position>(waypoint) ||
-                        math.distancesq(EntityManager.GetComponentData<Position>(waypoint).m_Position,
-                            wantedPosition) > positionToleranceSq)
+                        !WaypointPositionMatches(
+                            EntityManager.GetComponentData<Position>(waypoint).m_Position,
+                            positions[i], connections[i]))
                         continue;
 
                     Entity oldConnection = Entity.Null;
@@ -550,26 +633,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return result;
         }
 
-        private bool RouteGraphMatches(Entity route, RouteWaypointIntent[] desired,
-            Entity[] connections)
+        private bool RouteGraphMatches(Entity route, Entity[] connections, float3[] positions)
         {
             if (!EntityManager.HasBuffer<RouteWaypoint>(route)) return false;
             DynamicBuffer<RouteWaypoint> current =
                 EntityManager.GetBuffer<RouteWaypoint>(route, isReadOnly: true);
-            if (current.Length != desired.Length ||
-                connections.Length != desired.Length)
-                return false;
+            if (current.Length != positions.Length) return false;
 
-            for (int i = 0; i < desired.Length; i++)
+            for (int i = 0; i < positions.Length; i++)
             {
                 Entity waypoint = current[i].m_Waypoint;
-                float positionToleranceSq =
-                    connections[i] == Entity.Null ? 0.01f : StopMatchDistanceSq;
                 if (!EntityManager.Exists(waypoint) ||
                     !EntityManager.HasComponent<Position>(waypoint) ||
-                    math.distancesq(EntityManager
+                    !WaypointPositionMatches(EntityManager
                             .GetComponentData<Position>(waypoint).m_Position,
-                        WaypointPosition(desired[i])) > positionToleranceSq)
+                        positions[i], connections[i]))
                     return false;
                 Entity connection = Entity.Null;
                 if (EntityManager.HasComponent<Connected>(waypoint))
@@ -579,6 +657,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
             return true;
         }
+
+        /// <summary>
+        /// A waypoint that only shapes the path is placed at exactly the submitted position; one
+        /// bound to a stop follows that stop and is compared with the stop tolerances.
+        /// </summary>
+        private static bool WaypointPositionMatches(float3 actual, float3 wanted,
+            Entity connection) =>
+            connection == Entity.Null
+                ? math.distancesq(actual, wanted) <= FreeWaypointMatchDistanceSq
+                : StopPositionsMatch(actual, wanted);
 
         private Entity FindExistingCreate(Entity prefab, int routeNumber,
             RouteWaypointIntent[] desired, out bool numberConflict)

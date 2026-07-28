@@ -106,7 +106,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Area current = EntityManager.GetComponentData<Area>(area);
             current.m_Flags |= AreaFlags.Complete;
             EntityManager.SetComponentData(area, current);
-            EntityManager.AddComponent<Updated>(area);
+            MarkAreaAndSubAreasUpdated(area);
             EnsureOwnerSubAreaReference(owner, area);
             _knownRings[area] = ring;
             Mod.Verbose("[MP] AreaSync: redrew owned area '" +
@@ -208,6 +208,37 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             EntityManager.AddComponent<Updated>(owner);
         }
 
+        private void MarkAreaAndSubAreasUpdated(Entity area)
+        {
+            Entity[] childAreas = null;
+            if (area != Entity.Null && EntityManager.Exists(area) &&
+                EntityManager.HasBuffer<global::Game.Areas.SubArea>(area))
+            {
+                DynamicBuffer<global::Game.Areas.SubArea> subAreas =
+                    EntityManager.GetBuffer<global::Game.Areas.SubArea>(
+                        area, isReadOnly: true);
+                childAreas = new Entity[subAreas.Length];
+                for (int i = 0; i < subAreas.Length; i++)
+                    childAreas[i] = subAreas[i].m_Area;
+            }
+
+            // Area edits rebuild prefab-owned slave surfaces in the same transaction. Those
+            // surfaces derive their nodes from the parent only when they are tagged Updated.
+            MarkAreaUpdated(area);
+            if (childAreas == null) return;
+            for (int i = 0; i < childAreas.Length; i++)
+                MarkAreaUpdated(childAreas[i]);
+        }
+
+        private void MarkAreaUpdated(Entity area)
+        {
+            if (area == Entity.Null || !EntityManager.Exists(area) ||
+                !EntityManager.HasComponent<Area>(area) ||
+                EntityManager.HasComponent<Deleted>(area) ||
+                EntityManager.HasComponent<Updated>(area)) return;
+            EntityManager.AddComponent<Updated>(area);
+        }
+
         private static int CanonicalOwnedAreaNodeCount(
             OwnedAreaSnapshotCommand command)
         {
@@ -274,7 +305,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     newRing[n] = position;
                     nodes.Add(new Node { m_Position = position, m_Elevation = command.NodeElevation[n] });
                 }
-                EntityManager.AddComponent<Updated>(best);
+                MarkAreaAndSubAreasUpdated(best);
 
                 // Suppress the echo both ways: spatial guard + the scan cache itself.
                 _guard.Mark(AreaUpdateKey(command.PrefabName, CentroidOf(newRing)), now);

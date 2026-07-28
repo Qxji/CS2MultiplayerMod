@@ -22,7 +22,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     public partial class RouteSyncSystem : GameSystemBase
     {
         private const long EditScanIntervalMs = 1000;
-        private const long RetryWindowMs = 10000;
+        // A stop a line depends on is often still being realized from its own command. Waiting is
+        // free; giving up costs a full world transfer, so the window is generous.
+        private const long RetryWindowMs = 30000;
         private const long InitialRetryDelayMs = 100;
         private const long MaximumRetryDelayMs = 1000;
         private const int MaxPendingCommands = 128;
@@ -39,7 +41,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly List<PendingRouteCommand> _pendingCommands = new List<PendingRouteCommand>();
         private readonly List<PendingCreateMetadata> _pendingCreateMetadata =
             new List<PendingCreateMetadata>();
+        private readonly Dictionary<Entity, string> _prefabNames = new Dictionary<Entity, string>();
         private PendingUpdateCommit _pendingUpdateCommit;
+        private string _lastRealizeFailure;
         private long _lastEditScanMs;
         private bool _wasGameplaySyncReady;
 
@@ -60,6 +64,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             public long DeadlineMs;
             public long NextAttemptMs;
             public long RetryDelayMs;
+            public string LastFailure;
         }
 
         private sealed class PendingCreateMetadata
@@ -317,13 +322,27 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             if (_netSync == null || !_netSync.CanBuildDefinitions)
                 return RealizeResult.Retry;
+
+            _lastRealizeFailure = null;
+            RealizeResult result;
             if (pending.Create != null)
-                return RealizeCreate(pending.Create, pending.OriginPlayerId, now);
-            if (pending.Update != null)
-                return RealizeUpdate(pending.Update, pending.OriginPlayerId, now);
-            return pending.Delete != null
-                ? RealizeDelete(pending.Delete, now)
-                : RealizeResult.Rejected;
+                result = RealizeCreate(pending.Create, pending.OriginPlayerId, now);
+            else if (pending.Update != null)
+                result = RealizeUpdate(pending.Update, pending.OriginPlayerId, now);
+            else
+                result = pending.Delete != null
+                    ? RealizeDelete(pending.Delete, now)
+                    : RealizeResult.Rejected;
+
+            // Every unmet dependency looks the same from outside: the command simply keeps
+            // retrying. Recording why the last attempt gave up makes an expired command
+            // attributable from the log instead of only visible as a missing line.
+            if (_lastRealizeFailure == null) return result;
+            if (pending.LastFailure == null)
+                Diagnostics.FlightRecorder.Note("route dependency unresolved: " +
+                                                  _lastRealizeFailure);
+            pending.LastFailure = _lastRealizeFailure;
+            return result;
         }
 
         private void QueueRetry(PendingRouteCommand pending, long now)
@@ -359,6 +378,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 SyncInbox.RequestResync("route " + operation + " dependency did not resolve");
             Mod.log.Warn("[MP] RouteSync " + operation + " for '" + prefabName +
                          "' did not resolve within " + (RetryWindowMs / 1000) + " s" +
+                         (pending.LastFailure != null ? " (" + pending.LastFailure + ")" : string.Empty) +
                          (needsRecovery
                              ? "; requested a fresh world sync."
                              : "; line is already absent."));
@@ -375,9 +395,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _mutatedRoutesThisFrame.Clear();
             _knownRoutes.Clear();
             _nextRoutes.Clear();
+            _prefabNames.Clear();
             _guard.Clear();
+            _lastRealizeFailure = null;
             _lastEditScanMs = 0;
             _wasGameplaySyncReady = false;
+        }
+
+        /// <summary>Stops served plus the waypoints that only shape the path between them.</summary>
+        private static string DescribeShape(RouteWaypointIntent[] waypoints)
+        {
+            int stops = 0;
+            for (int i = 0; i < waypoints.Length; i++)
+                if (!string.IsNullOrEmpty(waypoints[i].StopPrefabName)) stops++;
+            return stops + " stop(s)" + (waypoints.Length != stops
+                ? " + " + (waypoints.Length - stops) + " path waypoint(s)"
+                : string.Empty);
         }
 
         private static string RouteKey(string prefix, string prefabName, int routeNumber,

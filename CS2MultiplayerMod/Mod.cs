@@ -75,7 +75,7 @@ namespace CS2MultiplayerMod
             // screen pauses the simulation, which previously froze all connection
             // handling exactly while the player was looking at the connect buttons.
             updateSystem.UpdateAt<MultiplayerSystem>(SystemUpdatePhase.UIUpdate);
-            // Bindings for the main-menu "Join Game" dialog (UI module in UI/).
+            // Bindings for the main-menu multiplayer screen (UI module in UI/).
             updateSystem.UpdateAt<MultiplayerUISystem>(SystemUpdatePhase.UIUpdate);
             // UIUpdate, not GameSimulation: the GameSimulation phase stops ticking the
             // moment the game is paused (selectedSpeed 0), so a system there can never

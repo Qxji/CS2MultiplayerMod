@@ -123,10 +123,12 @@ namespace CS2MultiplayerMod
         }
 
         // ---- Host tab -----------------------------------------------------------
+        // Setup stays editable in the main menu so the Host Game flow can use the
+        // chosen values as soon as its selected city finishes loading. Only the
+        // direct Host Session action still requires an already loaded city.
 
         [SettingsUITextInput]
         [SettingsUISection(HostTab, HostSetupGroup)]
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUIDisableByCondition(typeof(Setting), nameof(IsHosting))]
         public string HostPort
         {
@@ -140,7 +142,6 @@ namespace CS2MultiplayerMod
 
         [SettingsUITextInput]
         [SettingsUISection(HostTab, HostSetupGroup)]
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
         public string HostPassword
         {
@@ -152,25 +153,20 @@ namespace CS2MultiplayerMod
             }
         }
 
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         public bool LanOnly { get; set; } = false;
 
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         public bool RequireJoinApproval { get; set; } = true;
 
         [SettingsUITextInput]
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         public string MaxPlayers { get; set; } = "8";
 
         [SettingsUITextInput]
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         public string ResyncMinutes { get; set; } = "15";
 
-        [SettingsUIHideByCondition(typeof(Setting), nameof(IsNotInGame))]
         [SettingsUISection(HostTab, HostActionGroup)]
         public string HostStatus => IsNotInGame()
             ? L10n.T(L10n.Key.HostLoadCityFirst)

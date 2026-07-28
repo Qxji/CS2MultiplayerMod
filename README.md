@@ -24,16 +24,16 @@ The easiest way is through **Paradox Mods**: find the mod, add it to your playse
 
 ## Hosting a game
 
-1. Create a new city or open an existing one. If you use an existing save, **make a backup first**.
-2. Open the in-game Multiplayer panel (or the mod settings).
-3. Set your player name.
-4. In the Host tab, choose the port, password, max players, LAN-only mode, and world re-sync interval.
-5. Click **Host Session**.
+1. In the mod settings, set your player name and choose the host port, password, max players, LAN-only mode, and world re-sync interval.
+2. Click **Multiplayer** on the main menu, then **Host Game**.
+3. Choose **Load World** for an existing city or **Create World** for a new one. If you use an existing save, **make a backup first**.
+4. Finish the game's normal world selection. The multiplayer session starts automatically once the city is fully loaded.
+5. If a city is already open, you can still start hosting from the in-game Multiplayer panel or the mod settings.
 6. For internet play, forward the chosen TCP port on your router, allow it through your firewall, and share the host address, port, and password **only with people you trust**.
 
 ## Joining a game
 
-1. Click **Join Game** from the main menu, or open the Join tab in the mod settings.
+1. Click **Multiplayer**, then **Join Game** from the main menu, or open the Join tab in the mod settings.
 2. Enter the host address, port, your player name, and the password.
 3. Click **Join Session**.
 4. Wait while the host's city downloads and loads — larger cities take longer. The dialog closes itself once you're in.

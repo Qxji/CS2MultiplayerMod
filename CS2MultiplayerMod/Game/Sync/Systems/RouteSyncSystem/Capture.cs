@@ -65,14 +65,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             Entity prefab =
                 EntityManager.GetComponentData<PrefabRef>(route).m_Prefab;
-            if (EntityManager.HasComponent<TransportLineData>(prefab))
-            {
-                if (!snapshot.IsComplete || snapshot.RouteNumber <= 0) return false;
-                for (int i = 0; i < waypoints.Length; i++)
-                    if (string.IsNullOrEmpty(waypoints[i].StopPrefabName))
-                        return false;
-            }
-            return true;
+            if (!EntityManager.HasComponent<TransportLineData>(prefab)) return true;
+
+            // The route tool only commits a public transport line once its loop closes, and the
+            // line number is assigned a frame later - either missing means the graph is still
+            // settling. Waypoints without a stop are legitimate: they only shape the path.
+            if (!snapshot.IsComplete || snapshot.RouteNumber <= 0) return false;
+            for (int i = 0; i < waypoints.Length; i++)
+                if (!string.IsNullOrEmpty(waypoints[i].StopPrefabName))
+                    return true;
+            return false;
         }
 
         /// <summary>
@@ -106,14 +108,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     Z = position.z,
                 };
 
+                // No connection component at all means a path-shaping waypoint; a connection that
+                // was cleared (its stop bulldozed) leaves the same empty intent behind.
                 if (EntityManager.HasComponent<Connected>(waypointEntity))
                 {
                     Entity stop =
                         EntityManager.GetComponentData<Connected>(waypointEntity).m_Connected;
-                    if (stop != Entity.Null)
-                    {
-                        if (!TryCaptureStopIdentity(stop, ref value)) return false;
-                    }
+                    if (stop != Entity.Null && !TryCaptureStopIdentity(stop, ref value))
+                        return false;
                 }
                 captured[i] = value;
             }
@@ -138,9 +140,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             value.StopY = stopTransform.m_Position.y;
             value.StopZ = stopTransform.m_Position.z;
 
+            // The owner only disambiguates identical platforms of one station. A stop that has none,
+            // or whose chain cannot be walked, still has a usable prefab-and-position identity.
             Entity topOwner;
-            if (!TryFindTopOwner(stop, out topOwner)) return false;
-            if (topOwner == Entity.Null ||
+            if (!TryFindTopOwner(stop, out topOwner) || topOwner == Entity.Null ||
                 !EntityManager.HasComponent<PrefabRef>(topOwner) ||
                 !EntityManager.HasComponent<global::Game.Objects.Transform>(topOwner))
                 return true;
@@ -302,7 +305,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 };
                 session.SendCommand(0, RouteCreateCommand.Id, command.Encode());
                 Mod.Verbose("[MP] RouteSync captured line '" + name + "' (" +
-                            snapshot.Waypoints.Length + " stops, number " +
+                            DescribeShape(snapshot.Waypoints) + ", number " +
                             snapshot.RouteNumber + ").");
             }
             _knownRoutes[entity] = snapshot;
@@ -372,6 +375,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// Compares a source-world intent with a receiver-world snapshot. Connected objects can
         /// differ slightly in position after independent terrain/object realization, so this uses
         /// the same bounded tolerances as stop resolution while retaining exact prefab identity.
+        /// The owner is only a disambiguator: it is compared when both sides recorded one.
         /// </summary>
         private static bool WaypointsMatchIntent(RouteWaypointIntent[] local,
             RouteWaypointIntent[] intent)
@@ -380,24 +384,30 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return false;
             for (int i = 0; i < local.Length; i++)
             {
-                float waypointToleranceSq =
-                    string.IsNullOrEmpty(intent[i].StopPrefabName)
-                        ? 0.01f
-                        : StopMatchDistanceSq;
-                if (math.distancesq(WaypointPosition(local[i]),
-                        WaypointPosition(intent[i])) > waypointToleranceSq ||
-                    !string.Equals(local[i].StopPrefabName,
-                        intent[i].StopPrefabName, StringComparison.Ordinal) ||
-                    !string.Equals(local[i].OwnerPrefabName,
-                        intent[i].OwnerPrefabName, StringComparison.Ordinal))
+                bool hasStop = !string.IsNullOrEmpty(intent[i].StopPrefabName);
+                if (hasStop != !string.IsNullOrEmpty(local[i].StopPrefabName)) return false;
+                if (hasStop && !string.Equals(local[i].StopPrefabName,
+                        intent[i].StopPrefabName, StringComparison.Ordinal))
                     return false;
-                if (!string.IsNullOrEmpty(intent[i].StopPrefabName) &&
-                    math.distancesq(StopPosition(local[i]),
-                        StopPosition(intent[i])) > StopMatchDistanceSq)
+
+                if (!hasStop)
+                {
+                    if (math.distancesq(WaypointPosition(local[i]),
+                            WaypointPosition(intent[i])) > FreeWaypointMatchDistanceSq)
+                        return false;
+                    continue;
+                }
+
+                if (!StopPositionsMatch(WaypointPosition(local[i]),
+                        WaypointPosition(intent[i])) ||
+                    !StopPositionsMatch(StopPosition(local[i]), StopPosition(intent[i])))
                     return false;
-                if (!string.IsNullOrEmpty(intent[i].OwnerPrefabName) &&
-                    math.distancesq(OwnerPosition(local[i]),
-                        OwnerPosition(intent[i])) > OwnerMatchDistanceSq)
+                if (string.IsNullOrEmpty(local[i].OwnerPrefabName) ||
+                    string.IsNullOrEmpty(intent[i].OwnerPrefabName))
+                    continue;
+                if (!string.Equals(local[i].OwnerPrefabName,
+                        intent[i].OwnerPrefabName, StringComparison.Ordinal) ||
+                    !OwnerPositionsMatch(OwnerPosition(local[i]), OwnerPosition(intent[i])))
                     return false;
             }
             return true;
@@ -474,7 +484,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         continue;
                     }
 
-                    if (_needsCreateCapture.Remove(entity))
+                    // A route that became readable only now is new to this world only if we are not
+                    // already tracking it: a line realized from a remote command is finalized into
+                    // the known set, and republishing it would echo it back to its author.
+                    if (_needsCreateCapture.Remove(entity) && !_knownRoutes.ContainsKey(entity))
                     {
                         string delayedName = _prefabSystem.GetPrefabName(
                             EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
@@ -514,7 +527,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     };
                     session.SendCommand(0, RouteUpdateCommand.Id, command.Encode());
                     Mod.Verbose("[MP] RouteSync captured edit of line '" + name + "' (" +
-                                snapshot.Waypoints.Length + " stops, number " +
+                                DescribeShape(snapshot.Waypoints) + ", number " +
                                 snapshot.RouteNumber + ").");
                 }
             }

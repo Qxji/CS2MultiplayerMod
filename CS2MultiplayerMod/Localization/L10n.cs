@@ -21,8 +21,12 @@ namespace CS2MultiplayerMod.Localization
         /// </summary>
         public static class Key
         {
-            // -- Main-menu Join Game dialog (read by the UI module via useLocalization) --
+            // -- Main-menu multiplayer screen (read by the UI module via useLocalization) --
             public const string UiJoinGame = "CS2MP.UI.JoinGame";
+            public const string UiHostGame = "CS2MP.UI.HostGame";
+            public const string UiHostWorldTitle = "CS2MP.UI.HostWorldTitle";
+            public const string UiLoadWorld = "CS2MP.UI.LoadWorld";
+            public const string UiCreateWorld = "CS2MP.UI.CreateWorld";
             public const string UiDialogTitle = "CS2MP.UI.DialogTitle";
             public const string UiPlayerName = "CS2MP.UI.PlayerName";
             public const string UiHostAddress = "CS2MP.UI.HostAddress";
