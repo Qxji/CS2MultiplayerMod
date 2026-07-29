@@ -412,6 +412,17 @@ namespace CS2MultiplayerMod.Game
                 }
                 else if (status == SessionStatus.Offline || status == SessionStatus.Faulted)
                 {
+                    // Core teardown deliberately knows nothing about game worlds. If this
+                    // client had already installed the host's temporary city, hand the game
+                    // layer a deferred exit request before clearing the client phase.
+                    if (_service._clientHostWorldActive)
+                    {
+                        string reason = status == SessionStatus.Faulted && !string.IsNullOrEmpty(detail)
+                            ? detail
+                            : "the connection to the host closed";
+                        _service.QueueClientMainMenu(reason);
+                    }
+
                     if (status == SessionStatus.Faulted) _service._lastFault = detail;
                     _service.ResetWorldSyncState(restoreSpeed: true);
                     _service.SetPhase(ClientWorldPhase.None);

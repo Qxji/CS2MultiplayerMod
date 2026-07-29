@@ -91,6 +91,13 @@ namespace CS2MultiplayerMod.Game
                 _log.Warn("[MP] Could not auto-load the host world. Still connected - use /sync to " +
                           "request it again, or load '" + JoinMapLoader.TransientName + "' from Load Game.");
             }
+            else
+            {
+                // From this point onward a disconnect must unload this disposable host
+                // world. The preload callback normally marks it synchronously as well;
+                // keeping the marker here covers runtimes which publish that callback later.
+                MarkClientHostWorldActive();
+            }
         }
 
         private static string FindNewestSave(DateTime writtenAfterUtc)

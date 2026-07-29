@@ -23,6 +23,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private const long RecentLocalObjectOperationLifetimeMs = 5000;
 
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
+        // A network prefab can create a top-level object that owns the course it draws. Remember
+        // which tool produced the cached graph so a stale object-tool preview can never be claimed
+        // by an unrelated network-tool Apply.
+        private bool _cachedLocalObjectOperationFromNetTool;
         private readonly List<RecentLocalObjectOperation> _recentLocalObjectOperations =
             new List<RecentLocalObjectOperation>(MaxRecentLocalObjectOperations);
         // Sampled before ToolOutputSystem runs. A one-shot stamp can switch active tools while its
@@ -124,6 +128,36 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // lot it was born with, so the held object graph is the whole local change.
             if (_pendingSpecializedObjectOperation != null)
                 FinishSpecializedAreaCaptureWithoutPolygon();
+
+            // Some network prefabs emit a new top-level object plus owner-linked courses, sub-nets,
+            // and areas. NetSync deliberately excludes OwnerDefinition courses because replaying
+            // them independently would sever that graph. Route the complete batch through the
+            // atomic object transaction instead, while retaining an unchanged standing preview.
+            if (active is global::Game.Tools.NetToolSystem)
+            {
+                if (NativeObjectGraph.HasNewTopLevelObjectRoot(EntityManager, definitions))
+                {
+                    CaptureObjectToolOperation(definitions, fromNetTool: true);
+                }
+                else if (definitions.Length != 0 || _toolSystem == null ||
+                         _toolSystem.applyMode != ApplyMode.None)
+                {
+                    _cachedLocalObjectOperation = null;
+                    _cachedLocalObjectOperationFromNetTool = false;
+                }
+                return;
+            }
+
+            // An empty steady frame normally preserves an object tool's standing preview. Do not
+            // carry that rule across tool families: after leaving the network tool, its owner graph
+            // can only remain in the recent-root set for commit correlation, never as the current
+            // object tool's cached operation.
+            if (_cachedLocalObjectOperationFromNetTool)
+            {
+                _cachedLocalObjectOperation = null;
+                _cachedLocalObjectOperationFromNetTool = false;
+            }
+
             if (!IsObjectLifecycleTool(active))
             {
                 // ToolSystem keeps the tool that actually ran this ToolUpdate as its last tool even
@@ -265,7 +299,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return false;
         }
 
-        private void CaptureObjectToolOperation(NativeArray<Entity> definitions)
+        private void CaptureObjectToolOperation(NativeArray<Entity> definitions,
+            bool fromNetTool = false)
         {
             // A relocation or an upgrade of a live building is not shipped as definitions at all.
             // Capturing one walks that building's full owned-element buffers once for every one of
@@ -381,6 +416,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 AssetStampPrefabName = stampPrefabName,
                 Definitions = captured.ToArray(),
             };
+            _cachedLocalObjectOperationFromNetTool = fromNetTool;
             RememberRecentLocalObjectOperation(_cachedLocalObjectOperation);
             Diagnostics.FlightRecorder.Note(hasStampingNet
                 ? "asset stamp native definitions observed=" + captured.Count +

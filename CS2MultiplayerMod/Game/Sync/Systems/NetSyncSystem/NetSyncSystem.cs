@@ -152,18 +152,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // on the deleted span). See CaptureNewEdges.
         private readonly List<NetPlacementCommand> _deferredSpanPieces = new List<NetPlacementCommand>();
 
-        // Remote courses use the same Temp-backed network transaction as an interactive placement.
-        // The net domain is applied directly while local previews are structurally isolated.
+        // Remote courses use the same Temp-backed transaction as an interactive placement. Besides
+        // network entities, generation can update objects attached to a touched node/edge (and any
+        // geometry they own), so the complete side-effect graph must stay isolated and commit as one.
         private global::Game.Tools.ToolSystem _toolSystem;
         private global::Game.Tools.ApplyNetSystem _applyNetSystem;
         private global::Game.Tools.ApplyObjectsSystem _applyObjectsSystem;
         private global::Game.Tools.ApplyAreasSystem _applyAreasSystem;
         private global::Game.Tools.ApplyBrushesSystem _applyBrushesSystem;
         private global::Game.Tools.ApplyRoutesSystem _applyRoutesSystem;
-        // Exact entity set consumed by the net apply pass. A road transaction is not only its
-        // visible nodes and edges: generated lanes and street-name aggregates participate too.
-        // Every isolation, validation, commit, drain, and discard must use this same boundary.
+        // Structural subset consumed by the net apply pass. RecordPlacementOriginals uses this to
+        // inspect replacement edges without walking attached-object or owned-area side effects.
         private EntityQuery _netTransactionTemps;
+        // Complete native output of a net definition. GenerateObjectsSystem mirrors attached
+        // objects (roundabout islands, road signs, and similar objects) into the preview graph so
+        // their transforms follow a node/edge that moves during the network operation.
+        private EntityQuery _netOperationTemps;
         // The object apply pass consumes Object Temps while owned driveways/connectors and lots are
         // consumed by the net and area passes. Keep this query equal to the union of those three
         // apply domains. Other tools can legitimately create unrelated Temp shapes in the same
@@ -310,9 +314,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _applyAreasSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyAreasSystem>();
             _applyBrushesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyBrushesSystem>();
             _applyRoutesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyRoutesSystem>();
-            // Mirror the net apply pass's complete transaction query, including any Temp already
-            // carrying Deleted. Such an entity makes validation reject the whole batch; silently
-            // omitting it here would still leave it visible to the apply pass and defeat isolation.
+            // Mirror the net apply pass's structural query, including any Temp already carrying
+            // Deleted. The operation-level query below expands this with native side-effect domains.
             _netTransactionTemps = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[] { ComponentType.ReadOnly<Temp>() },
@@ -322,6 +325,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     ComponentType.ReadOnly<Edge>(),
                     ComponentType.ReadOnly<Lane>(),
                     ComponentType.ReadOnly<Aggregate>(),
+                },
+            });
+
+            _netOperationTemps = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<Temp>() },
+                Any = new[]
+                {
+                    ComponentType.ReadOnly<global::Game.Objects.Object>(),
+                    ComponentType.ReadOnly<Node>(),
+                    ComponentType.ReadOnly<Edge>(),
+                    ComponentType.ReadOnly<Lane>(),
+                    ComponentType.ReadOnly<Aggregate>(),
+                    ComponentType.ReadOnly<global::Game.Areas.Area>(),
                 },
             });
 

@@ -3,7 +3,7 @@ import { InputActionBarrier } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { Button, Portal } from "cs2/ui";
 import { CSSProperties, useEffect, useState } from "react";
-import { currentMenuBackdropImage } from "mods/join-game";
+import { MULTIPLAYER_BLUE } from "mods/multiplayer-theme";
 
 // Binding group shared with MultiplayerUISystem on the C# side.
 const GROUP = "cs2mp";
@@ -48,33 +48,10 @@ const styles: Record<string, CSSProperties> = {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        // Opaque so the main menu / game behind it is fully hidden (also the
-        // fallback if the backdrop image cannot be resolved).
-        backgroundColor: "rgb(11, 16, 27)",
+        // Host sync and every client join phase use the same opaque blue, so no
+        // stale menu artwork or underlying screen can bleed through.
+        backgroundColor: MULTIPLAYER_BLUE,
         pointerEvents: "auto",
-    },
-    // Menu artwork behind the loading content, same image the join screen shows.
-    // zIndex -1 keeps it above the overlay background but below the in-flow text
-    // (the same layering the vanilla menu backdrop uses).
-    backdrop: {
-        position: "absolute",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        zIndex: -1,
-        backgroundPosition: "center",
-        backgroundSize: "cover",
-        backgroundRepeat: "no-repeat",
-    },
-    backdropDim: {
-        position: "absolute",
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        zIndex: -1,
-        backgroundColor: "rgba(11, 16, 27, 0.60)",
     },
     title: {
         fontSize: "44rem",
@@ -207,10 +184,9 @@ const IndeterminateBar = () => {
     );
 };
 
-// Full-screen, branded loading screen shown to a joining client from the moment
-// "Join" is pressed until the host's world is live (or the attempt fails). It
-// covers connecting + the world download — the long part — after which the game's
-// own native loading screen takes over for the final map load.
+// Blocking full-screen state shared by host world synchronization and every
+// client join phase. A client sees it immediately after pressing Join, including
+// the time spent waiting for manual host approval, through world transfer/load.
 export const JoinLoadingScreen = () => {
     const t = useT();
     const statusKind = useValue(statusKind$);
@@ -226,25 +202,17 @@ export const JoinLoadingScreen = () => {
     // Shown from the first "connecting" until connected/offline. An error keeps it
     // up (so the failure is visible) until the player dismisses it.
     const [active, setActive] = useState(false);
-    // Backdrop snapshot taken when the screen activates, while the menu's
-    // backdrop element is still there to read; static for the whole attempt.
-    const [backdropImage, setBackdropImage] = useState<string | null>(null);
     useEffect(() => {
         if (statusKind === "error") {
             setActive(true);
-            setBackdropImage((current) => current ?? currentMenuBackdropImage());
         } else if (statusKind === "syncing") {
             setActive(true);
-            setBackdropImage((current) => current ?? currentMenuBackdropImage());
         } else if (isHost) {
             setActive(false);
-            setBackdropImage(null);
         } else if (statusKind === "connecting") {
             setActive(true);
-            setBackdropImage((current) => current ?? currentMenuBackdropImage());
         } else if (statusKind === "connected" || statusKind === "offline" || statusKind === "disabled") {
             setActive(false);
-            setBackdropImage(null);
         }
     }, [statusKind, isHost]);
 
@@ -266,12 +234,6 @@ export const JoinLoadingScreen = () => {
         <Portal>
             <InputActionBarrier>
                 <div style={styles.overlay}>
-                    {backdropImage ? (
-                        <>
-                            <div style={{ ...styles.backdrop, backgroundImage: backdropImage }} />
-                            <div style={styles.backdropDim} />
-                        </>
-                    ) : null}
                     <div style={styles.title}>{t(LOC.multiplayer, "Multiplayer")}</div>
 
                     {failed ? (

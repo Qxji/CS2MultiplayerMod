@@ -166,12 +166,21 @@ namespace CS2MultiplayerMod.Game
 
         public void Disconnect()
         {
+            if (_session.Role == SessionRole.Client && _clientHostWorldActive)
+                QueueClientMainMenu("the player disconnected");
+
             ResetWorldSyncState(restoreSpeed: true);
             // A host that stops hosting owes its clients a reason: without the notice they
             // only ever see the socket drop, which reads as a network failure.
             _session.StopWithNotice("The host ended this multiplayer session.");
             SetPhase(ClientWorldPhase.None);
-            JoinMapLoader.DeleteTransient(_log); // a joining client keeps no copy of the host world
+
+            // Do not delete a save which is still loading or is the currently open client
+            // world. The lifecycle pump removes it after MainMenu has completed.
+            if (_clientHostWorldActive || _clientMainMenuPending)
+                _transientCleanupPending = true;
+            else
+                JoinMapLoader.DeleteTransient(_log);
         }
 
         public void Shutdown()
@@ -180,6 +189,7 @@ namespace CS2MultiplayerMod.Game
             _session.StopWithNotice("The host closed the game, so this session has ended.");
             SetPhase(ClientWorldPhase.None);
             RestoreAutosave(); // even if the phase was already None
+            ForgetClientHostWorld(); // process teardown owns the world; do not start MainMenu
             JoinMapLoader.DeleteTransient(_log);
         }
 

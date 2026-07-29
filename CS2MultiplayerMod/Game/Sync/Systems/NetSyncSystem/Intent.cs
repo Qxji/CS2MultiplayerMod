@@ -34,6 +34,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 _cachedLocalCourses.Clear();
                 return;
             }
+
+            // A network prefab may create a top-level object as the owner of its course graph.
+            // Owner-linked courses cannot be replayed as independent network placements; the
+            // complete heterogeneous batch is captured atomically by BuildSyncSystem.
+            if (global::CS2MultiplayerMod.Game.Sync.Systems.NativeObjectGraph
+                .HasNewTopLevelObjectRoot(EntityManager, definitions))
+            {
+                _cachedLocalCourses.Clear();
+                return;
+            }
+
             var netTool = (global::Game.Tools.NetToolSystem)active;
             bool pointOperation = netTool.actualMode == global::Game.Tools.NetToolSystem.Mode.Point;
 

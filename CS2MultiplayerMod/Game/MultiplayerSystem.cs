@@ -70,6 +70,12 @@ namespace CS2MultiplayerMod.Game
                     Mod.log.Info("[MP] Mod disabled in settings - closing the active session.");
                     service.Disconnect();
                 }
+
+                // Disconnecting a client can queue a safe return to the main menu while
+                // its streamed world is still loading. Keep the lifecycle pump alive even
+                // with gameplay sync disabled so that deferred close and cleanup can finish.
+                service.Update(World);
+                PumpHealth(service);
                 return;
             }
 

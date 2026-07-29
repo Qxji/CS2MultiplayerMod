@@ -10,9 +10,10 @@ using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
 namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 {
-    // Commit orchestration for NetSyncSystem. Remote net Temps are applied through the net domain
-    // alone; the complete local preview graph is temporarily Disabled so an unrelated tool can
-    // remain selected without either transaction consuming the other one's entities.
+    // Commit orchestration for NetSyncSystem. A remote net operation includes the objects and areas
+    // its native generation updates as side effects; the complete local preview graph is temporarily
+    // Disabled so an unrelated tool can remain selected without either transaction consuming the
+    // other one's entities.
     public partial class NetSyncSystem
     {
         /// <summary>How long an armed batch may wait for its commit before it is discarded and re-queued.</summary>
@@ -390,7 +391,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 return _objectTransactionTemps;
             if (IsRouteTransaction(_pendingTransactionKind))
                 return _routeTransactionTemps;
-            return _netTransactionTemps;
+            return _netOperationTemps;
         }
 
         private void CommitRemoteTemps(EntityQuery transactionQuery, int count)
@@ -402,11 +403,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             int validateMs = System.Environment.TickCount - _validateStartTick;
             int applyStartTick = System.Environment.TickCount;
             _committingRemoteNetTemps.Clear();
+            bool hasObjectTemps = false;
+            bool hasAreaTemps = false;
             NativeArray<Entity> remoteTemps = transactionQuery.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < remoteTemps.Length; i++)
+                {
                     _committingRemoteNetTemps.Add(remoteTemps[i]);
+                    hasObjectTemps |= EntityManager.HasComponent<global::Game.Objects.Object>(remoteTemps[i]);
+                    hasAreaTemps |= EntityManager.HasComponent<global::Game.Areas.Area>(remoteTemps[i]);
+                }
             }
             finally
             {
@@ -430,7 +437,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 }
                 else
                 {
+                    // Net generation creates update Temps for objects attached to every touched
+                    // node/edge. Apply them first so their parent references resolve while the Temp
+                    // net graph is intact, matching the normal ApplyTool domain order.
+                    if (hasObjectTemps) _applyObjectsSystem.Update();
                     _applyNetSystem.Update();
+                    if (hasAreaTemps) _applyAreasSystem.Update();
+                    if (hasObjectTemps) _objectCommitThisFrame = true;
                 }
             }
             catch (System.Exception ex)
@@ -1073,7 +1086,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         private bool ValidateArmedNetTransaction(out string reason)
         {
-            NativeArray<Entity> temps = _netTransactionTemps.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> temps = _netOperationTemps.ToEntityArray(Allocator.Temp);
             try
             {
                 if (temps.Length == 0)
@@ -1099,27 +1112,52 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     CollectEnabledTransactionConnections(members);
 
                 int structuralEntities = 0;
+                int attachedObjectRoots = 0;
+                int areaEntities = 0;
                 for (int i = 0; i < temps.Length; i++)
                 {
                     Entity entity = temps[i];
                     Temp temp = EntityManager.GetComponentData<Temp>(entity);
+                    bool isObject = EntityManager.HasComponent<global::Game.Objects.Object>(entity);
                     bool isNode = EntityManager.HasComponent<Node>(entity);
                     bool isEdge = EntityManager.HasComponent<Edge>(entity);
                     bool isLane = EntityManager.HasComponent<Lane>(entity);
                     bool isAggregate = EntityManager.HasComponent<Aggregate>(entity);
-                    if (!isNode && !isEdge && !isLane && !isAggregate)
+                    bool isArea = EntityManager.HasComponent<global::Game.Areas.Area>(entity);
+                    if (!isObject && !isNode && !isEdge && !isLane && !isAggregate && !isArea)
                     {
                         reason = "the generated net transaction contains an unknown entity shape";
                         return false;
                     }
                     if (isNode || isEdge) structuralEntities++;
+                    if (isArea) areaEntities++;
 
                     if (!ValidateTransactionOwner(entity, members, out reason)) return false;
-                    if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge,
-                            enabledTransactionConnections, out reason)) return false;
+                    if (!ValidateOwnedBuffers(entity, members, out reason)) return false;
+
+                    if (isObject)
+                    {
+                        if ((temp.m_Flags & TempFlags.Delete) == 0 &&
+                            !ValidateObjectPrefabReference(entity, out reason)) return false;
+                        if (!ValidateObjectOriginal(temp, out reason)) return false;
+                        if (!ValidateAttachment(entity, members, out reason)) return false;
+                        if (!EntityManager.HasComponent<Owner>(entity))
+                        {
+                            if (!ValidateNetAttachedObjectRoot(entity, temp, members, out reason))
+                                return false;
+                            attachedObjectRoots++;
+                        }
+                    }
+
+                    if (isNode || isEdge)
+                    {
+                        if (!ValidateTransactionOriginal(entity, temp, isNode, isEdge,
+                                enabledTransactionConnections, out reason)) return false;
+                    }
                     if (isNode && !ValidateTempNode(entity, temp, out reason)) return false;
                     if (isEdge && !ValidateTempEdge(entity, temp, members,
                             enabledTransactionConnections, out reason)) return false;
+                    if (isArea && !ValidateAreaEntity(entity, temp, out reason)) return false;
 
                     bool missingReplacementOriginal =
                         isEdge && (temp.m_Flags & (TempFlags.Replace | TempFlags.Combine)) != 0 ||
@@ -1138,12 +1176,88 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 }
 
                 reason = null;
+                if (attachedObjectRoots > 0 || areaEntities > 0)
+                    Diagnostics.FlightRecorder.Note("net side-effect graph validated temps=" +
+                        temps.Length + " attachedRoots=" + attachedObjectRoots +
+                        " areas=" + areaEntities);
                 return true;
             }
             finally
             {
                 temps.Dispose();
             }
+        }
+
+        /// <summary>
+        /// An owner-less object in a net transaction must be the native update copy of an existing
+        /// object attached to a touched node/edge. This excludes an unrelated placement preview from
+        /// the net apply pass while retaining the exact path that recentres roundabout islands.
+        /// </summary>
+        private bool ValidateNetAttachedObjectRoot(Entity entity, Temp temp,
+            HashSet<Entity> members, out string reason)
+        {
+            reason = null;
+            const TempFlags incompatible = TempFlags.Create | TempFlags.Dragging |
+                TempFlags.Select | TempFlags.Modify | TempFlags.Replace | TempFlags.Upgrade |
+                TempFlags.Combine | TempFlags.Cancel | TempFlags.Duplicate;
+            if (temp.m_Original == Entity.Null ||
+                (temp.m_Flags & TempFlags.Essential) == 0 ||
+                (temp.m_Flags & incompatible) != 0)
+            {
+                reason = "the net transaction contains an unrelated top-level object Temp";
+                return false;
+            }
+
+            Entity original = temp.m_Original;
+            if (!EntityManager.HasComponent<global::Game.Objects.Attached>(entity) ||
+                !EntityManager.HasComponent<global::Game.Objects.Attached>(original) ||
+                !EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(entity) ||
+                !EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(original))
+            {
+                reason = "a generated net-side object is not an attached-object update";
+                return false;
+            }
+
+            global::Game.Prefabs.PrefabRef prefab =
+                EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(entity);
+            global::Game.Prefabs.PrefabRef originalPrefab =
+                EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(original);
+            if (prefab.m_Prefab != originalPrefab.m_Prefab)
+            {
+                reason = "a generated net-side object changed prefab unexpectedly";
+                return false;
+            }
+
+            global::Game.Objects.Attached attached =
+                EntityManager.GetComponentData<global::Game.Objects.Attached>(entity);
+            global::Game.Objects.Attached originalAttached =
+                EntityManager.GetComponentData<global::Game.Objects.Attached>(original);
+            bool deletesWithoutParent = (temp.m_Flags & TempFlags.Delete) != 0 &&
+                                         attached.m_Parent == Entity.Null;
+            if ((!deletesWithoutParent &&
+                 !ValidateNetAttachmentParent(attached.m_Parent, members,
+                     "generated attachment parent", out reason)) ||
+                !ValidateNetAttachmentParent(originalAttached.m_Parent, members,
+                    "original attachment parent", out reason)) return false;
+
+            return true;
+        }
+
+        private bool ValidateNetAttachmentParent(Entity parent, HashSet<Entity> members,
+            string label, out string reason)
+        {
+            if (parent == Entity.Null)
+            {
+                reason = label + " is null";
+                return false;
+            }
+            if (!ValidateLiveOrMemberReference(parent, members, label, out reason)) return false;
+            if (!EntityManager.HasComponent<Node>(parent) && !EntityManager.HasComponent<Edge>(parent))
+            {
+                reason = label + " is not a network node or edge";
+                return false;
+            }
+            return true;
         }
 
         private bool ValidateTransactionOwner(Entity entity, HashSet<Entity> members, out string reason)

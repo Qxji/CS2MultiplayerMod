@@ -5,6 +5,7 @@ import { getModule } from "cs2/modding";
 import { Button, DialogContext, DialogStack, MenuButton } from "cs2/ui";
 import { CSSProperties, ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
+import { MULTIPLAYER_BLUE } from "mods/multiplayer-theme";
 import { VersionWarningBanner } from "mods/version-banner";
 
 // Binding group shared with MultiplayerUISystem on the C# side. The field values
@@ -27,7 +28,6 @@ const LOC = {
     hostAddress: "CS2MP.UI.HostAddress",
     port: "CS2MP.UI.Port",
     password: "CS2MP.UI.Password",
-    worldTransfer: "CS2MP.UI.WorldTransfer",
     join: "CS2MP.UI.Join",
     disconnect: "CS2MP.UI.Disconnect",
 };
@@ -44,7 +44,6 @@ const address$ = bindValue<string>(GROUP, "joinAddress", "127.0.0.1");
 const port$ = bindValue<string>(GROUP, "joinPort", "25001");
 const password$ = bindValue<string>(GROUP, "joinPassword", "");
 const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
-const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const inSession$ = bindValue<boolean>(GROUP, "inSession", false);
 // The same native save-list binding that enables/disables the game's Load Game
 // menu item. Using it keeps our Load World choice in exact lockstep with vanilla.
@@ -86,34 +85,6 @@ const subScreenClasses: Record<string, string> | null =
 const childOpacityTransitionClass = subScreenClasses?.header
     ?.split(/\s+/)
     .find((className) => className.startsWith("child-opacity-transition"));
-const backdropClasses: Record<string, string> | null =
-    tryModule("game-ui/menu/components/menu-ui-backdrops/menu-ui-backdrops.module.scss", "classes");
-
-// Same backdrop pool the vanilla menu rotates through ("Backgound" spelling is
-// the game's own file naming). Only used if the live backdrop cannot be read.
-const FALLBACK_BACKDROPS = [1, 2, 3, 4, 5, 6, 7].map((n) => `Media/Menu/Backdrops/Backgound0${n}.png`);
-
-// The join loading overlay also needs to preserve the menu's current artwork.
-// Resolve it on demand so the menu has rendered its live backdrop already.
-export const currentMenuBackdropImage = (): string => {
-    try {
-        if (backdropClasses && backdropClasses.backdropImage) {
-            const els = document.getElementsByClassName(backdropClasses.backdropImage.split(" ")[0]);
-            if (els.length > 0) {
-                // Newest element wins if a vanilla cross-fade is mid-flight.
-                const bg = (els[els.length - 1] as HTMLElement).style.backgroundImage;
-                if (bg) return bg;
-            }
-        }
-    } catch {
-        // Fall through to the static pool.
-    }
-    const list: string[] =
-        tryModule("game-ui/menu/components/menu-ui-backdrops/menu-ui-backdrops.tsx", "BACKDROPS_LIST") ||
-        FALLBACK_BACKDROPS;
-    return `url('${list[Math.floor(Math.random() * list.length)]}')`;
-};
-
 // The game scales its UI by adjusting the root font size, so rem behaves like
 // resolution-independent pixels; all sizes below follow that convention.
 const styles: Record<string, CSSProperties> = {
@@ -252,7 +223,7 @@ const styles: Record<string, CSSProperties> = {
     panel: {
         width: "760rem",
         maxWidth: "85%",
-        backgroundColor: "rgba(24, 33, 51, 0.90)",
+        backgroundColor: MULTIPLAYER_BLUE,
         borderRadius: "4rem",
         padding: "32rem",
         boxShadow: "0 16rem 48rem rgba(0, 0, 0, 0.45)",
@@ -281,40 +252,6 @@ const styles: Record<string, CSSProperties> = {
     inputDisabled: {
         opacity: 0.55,
         cursor: "not-allowed",
-    },
-    progress: {
-        margin: "0 0 16rem 0",
-    },
-    progressHeader: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "center",
-        fontSize: "14rem",
-        color: "rgba(157, 193, 222, 0.9)",
-        textTransform: "uppercase",
-        marginBottom: "5rem",
-    },
-    progressTrack: {
-        position: "relative",
-        height: "9rem",
-        backgroundColor: "rgba(0, 0, 0, 0.4)",
-        border: "1rem solid rgba(157, 193, 222, 0.25)",
-        borderRadius: "2rem",
-        overflow: "hidden",
-    },
-    progressFill: {
-        height: "100%",
-        backgroundColor: "#72c8f0",
-        boxShadow: "0 0 8rem rgba(114, 200, 240, 0.45)",
-        transition: "width 160ms linear",
-    },
-    progressSweep: {
-        position: "absolute",
-        top: 0,
-        bottom: 0,
-        width: "30%",
-        background:
-            "linear-gradient(90deg, rgba(114,200,240,0) 0%, rgba(114,200,240,0.9) 50%, rgba(114,200,240,0) 100%)",
     },
     buttons: {
         display: "flex",
@@ -426,51 +363,6 @@ const ChoiceScreen = ({
     </div>
 );
 
-const ProgressSweep = () => {
-    const [position, setPosition] = useState(-30);
-
-    useEffect(() => {
-        let raf = 0;
-        const tick = (time: number) => {
-            setPosition(((time * 0.06) % 160) - 30);
-            raf = requestAnimationFrame(tick);
-        };
-        raf = requestAnimationFrame(tick);
-        return () => cancelAnimationFrame(raf);
-    }, []);
-
-    return <div style={{ ...styles.progressSweep, left: `${position}%` }} />;
-};
-
-export const TransferProgress = ({
-    percent,
-    label,
-    indeterminate = false,
-}: {
-    percent: number;
-    label?: string;
-    indeterminate?: boolean;
-}) => {
-    // Hook must run unconditionally (before the early return) to keep hook order stable.
-    const t = useT();
-    if (percent < 0 && !indeterminate) return null;
-
-    const clamped = Math.max(0, Math.min(100, Math.floor(percent)));
-    return (
-        <div style={styles.progress}>
-            <div style={styles.progressHeader}>
-                <span>{label ?? t(LOC.worldTransfer, "World Transfer")}</span>
-                {!indeterminate ? <span>{clamped}%</span> : null}
-            </div>
-            <div style={styles.progressTrack}>
-                {indeterminate
-                    ? <ProgressSweep />
-                    : <div style={{ ...styles.progressFill, width: `${clamped}%` }} />}
-            </div>
-        </div>
-    );
-};
-
 type MultiplayerView = "choice" | "join" | "host";
 
 const PAGE_INDEX: Record<MultiplayerView, number> = {
@@ -502,7 +394,6 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
     const port = useValue(port$);
     const password = useValue(password$);
     const statusKind = useValue(statusKind$);
-    const mapTransferPercent = useValue(mapTransferPercent$);
     const inSession = useValue(inSession$);
     const hasSavedGame = useValue(savedGames$).length > 0;
     const [view, setView] = useState<MultiplayerView>("choice");
@@ -584,7 +475,6 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
                         value={password}
                         onChange={(v) => trigger(GROUP, "setJoinPassword", v)}
                     />
-                    <TransferProgress percent={mapTransferPercent} />
                     <div style={styles.buttons}>
                         {inSession ? (
                             <Button

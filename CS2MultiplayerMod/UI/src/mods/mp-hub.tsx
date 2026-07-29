@@ -4,8 +4,8 @@ import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
 import { Button, Portal, Tooltip } from "cs2/ui";
 import { CSSProperties, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
-import { TransferProgress } from "mods/join-game";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
+import { TransferProgress } from "mods/transfer-progress";
 import { VersionWarningBanner } from "mods/version-banner";
 
 // Binding group shared with MultiplayerUISystem (same group as the join dialog).

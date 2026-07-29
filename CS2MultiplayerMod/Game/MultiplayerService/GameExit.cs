@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using Colossal.Serialization.Entities;
 using Game;
 using Game.SceneFlow;
@@ -29,6 +30,10 @@ namespace CS2MultiplayerMod.Game
         private bool _inCityWorld;
         private bool _leavingSession;
         private long _expectedWorldLoadMs = long.MinValue;
+        private bool _clientHostWorldActive;
+        private bool _clientMainMenuPending;
+        private Task _clientMainMenuTask;
+        private int _clientMainMenuAttempts;
         private bool _transientCleanupPending;
 
         /// <summary>
@@ -55,6 +60,22 @@ namespace CS2MultiplayerMod.Game
         /// </summary>
         internal void HandleWorldTransition(Purpose purpose, GameMode mode)
         {
+            // Consume our claim before checking the session role. The host can disappear
+            // after its save load was queued but before this callback arrives; that world
+            // still belongs to the dead session and must be closed once loading finishes.
+            if (mode.IsGame() && ConsumeExpectedWorldLoad())
+            {
+                _clientHostWorldActive = true;
+                if (_session.Role == SessionRole.None)
+                    QueueClientMainMenu("the host disconnected while its world was loading");
+                return;
+            }
+
+            // Any other load replaces the temporary client world. Clear the ownership
+            // marker before Stop() publishes Offline, otherwise that observer would start
+            // a second, competing main-menu load while the player's chosen load is active.
+            ForgetClientHostWorld();
+
             if (_session.Role == SessionRole.None)
             {
                 _expectedWorldLoadMs = long.MinValue;
@@ -63,9 +84,6 @@ namespace CS2MultiplayerMod.Game
 
             if (mode.IsGame())
             {
-                // The host's world arriving for a join or a /sync - the session continues.
-                if (ConsumeExpectedWorldLoad()) return;
-
                 LeaveSharedSession(
                     "Loading another world (" + purpose + ")",
                     "The host loaded a different city, so this session has ended.");
@@ -117,7 +135,122 @@ namespace CS2MultiplayerMod.Game
                 }
             }
 
+            PumpClientMainMenu(manager);
             PumpTransientCleanup(manager);
+        }
+
+        /// <summary>
+        /// Remember that the current (or currently loading) city is the disposable copy
+        /// received from the host. A disconnect must leave it rather than turning that copy
+        /// into an apparently normal single-player city.
+        /// </summary>
+        internal void MarkClientHostWorldActive()
+        {
+            _clientHostWorldActive = true;
+        }
+
+        /// <summary>
+        /// Queue, rather than immediately start, the return to the main menu. Disconnects
+        /// can arrive inside the session pump while the host save is still loading; starting
+        /// another load there would race the game's active load pipeline.
+        /// </summary>
+        private void QueueClientMainMenu(string reason)
+        {
+            if (!_clientHostWorldActive) return;
+
+            _transientCleanupPending = true;
+            if (_clientMainMenuPending) return;
+
+            _clientMainMenuPending = true;
+            _clientMainMenuAttempts = 0;
+            _log.Info("[MP] Client session ended (" + reason + "); returning to the main menu.");
+            FlightRecorder.Note("client world exit queued: " + reason);
+        }
+
+        private void PumpClientMainMenu(GameManager manager)
+        {
+            if (!_clientMainMenuPending) return;
+
+            GameManager.State state = manager.state;
+            if (state == GameManager.State.Quitting || state == GameManager.State.Terminated)
+            {
+                // The process is already disposing this world; starting another load would
+                // only compete with shutdown.
+                _clientMainMenuPending = false;
+                _clientMainMenuTask = null;
+                return;
+            }
+
+            if (!_clientHostWorldActive || !manager.gameMode.IsGame())
+            {
+                ForgetClientHostWorld();
+                return;
+            }
+
+            // Let a host-world load which was already in flight finish first. The service
+            // keeps pumping in UIUpdate throughout loading and will enter here afterward.
+            if (manager.isGameLoading) return;
+
+            if (_clientMainMenuTask != null)
+            {
+                if (!_clientMainMenuTask.IsCompleted) return;
+
+                if (_clientMainMenuTask.IsFaulted)
+                {
+                    Exception failure = _clientMainMenuTask.Exception != null
+                        ? _clientMainMenuTask.Exception.GetBaseException()
+                        : null;
+                    _log.Warn("[MP] Returning the disconnected client to the main menu failed" +
+                              (failure != null ? ": " + failure.Message : "."));
+                }
+                else if (_clientMainMenuTask.IsCanceled)
+                    _log.Warn("[MP] Returning the disconnected client to the main menu was canceled.");
+
+                _clientMainMenuTask = null;
+                if (!manager.gameMode.IsGame())
+                {
+                    ForgetClientHostWorld();
+                    return;
+                }
+
+                // A transient load collision can reject the first request. Retry once on
+                // the following frame; after that, leave the marker intact so the transient
+                // save is not deleted underneath an open world.
+                if (_clientMainMenuAttempts < 2) return;
+                _clientMainMenuPending = false;
+                _log.Error("[MP] Could not close the disconnected client's host world after two attempts.");
+                return;
+            }
+
+            try
+            {
+                _clientMainMenuAttempts++;
+                Task task = manager.MainMenu();
+
+                // MainMenu changes gameMode before its first asynchronous wait. Its preload
+                // callback normally clears the pending state during the call itself.
+                if (_clientMainMenuPending && manager.gameMode.IsGame())
+                    _clientMainMenuTask = task;
+                else
+                    ForgetClientHostWorld();
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("[MP] Could not start the return to the main menu: " + ex.Message);
+                if (_clientMainMenuAttempts >= 2)
+                {
+                    _clientMainMenuPending = false;
+                    _log.Error("[MP] Could not close the disconnected client's host world after two attempts.");
+                }
+            }
+        }
+
+        private void ForgetClientHostWorld()
+        {
+            _clientHostWorldActive = false;
+            _clientMainMenuPending = false;
+            _clientMainMenuTask = null;
+            _clientMainMenuAttempts = 0;
         }
 
         /// <summary>
@@ -164,6 +297,7 @@ namespace CS2MultiplayerMod.Game
         private void PumpTransientCleanup(GameManager manager)
         {
             if (!_transientCleanupPending) return;
+            if (_clientHostWorldActive || _clientMainMenuPending) return;
             if (manager.isGameLoading) return;
             _transientCleanupPending = false;
             JoinMapLoader.DeleteTransient(_log);

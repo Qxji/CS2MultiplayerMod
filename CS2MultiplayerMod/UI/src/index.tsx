@@ -19,15 +19,27 @@ const register: ModRegistrar = (moduleRegistry) => {
         // Binding not reachable; the C# watchdog will report the module missing.
     }
 
+    // The loading view belongs to the two root UI surfaces rather than a menu
+    // button column. That keeps it mounted while native sub-screens replace the
+    // main navigation (including the Multiplayer screen and an approval wait).
+    // It renders only a Portal while connecting/syncing, so these append hooks
+    // add no visible inline element.
+    try {
+        moduleRegistry.append("Menu", JoinLoadingScreen);
+    } catch (e) {
+        console.warn("[cs2mp] menu connection view could not be registered.", e);
+    }
+    try {
+        moduleRegistry.append("Game", JoinLoadingScreen);
+    } catch (e) {
+        console.warn("[cs2mp] in-game connection view could not be registered.", e);
+    }
+
     // In-game multiplayer hub: the right-menu column renders the official
     // "GameBottomRight" modding hook directly above the notification/Chirper
     // buttons, so this lands exactly on top of the bird icon in vanilla style.
-    // The full-screen join loading overlay also mounts here so it can appear
-    // when a join is started in-game (Options > Join). It renders nothing inline
-    // (just a Portal), so it adds no visible right-menu item.
     try {
         moduleRegistry.append("GameBottomRight", MultiplayerRightMenuButton);
-        moduleRegistry.append("GameBottomRight", JoinLoadingScreen);
     } catch (e) {
         console.warn("[cs2mp] GameBottomRight append failed; in-game hub button unavailable.", e);
     }
@@ -49,15 +61,12 @@ const register: ModRegistrar = (moduleRegistry) => {
     }
 
     // Insert a "Multiplayer" button into the vanilla main-menu button column,
-    // after Continue / New Game / Load Game (index 3). The loading overlay is
-    // appended here too (Portal-only, renders nothing in the column) so it covers
-    // the connect + world-download phase that runs while still in the main menu.
+    // after Continue / New Game / Load Game (index 3).
     try {
         if (moduleRegistry.registry.has(MAIN_MENU_MODULE)) {
             if (multiplayerScreenRegistered) {
                 moduleRegistry.append(MAIN_MENU_MODULE, "MainMenuNavigation", MultiplayerMenuButton, 3);
             }
-            moduleRegistry.append(MAIN_MENU_MODULE, "MainMenuNavigation", JoinLoadingScreen);
             return;
         }
         console.warn("[cs2mp] " + MAIN_MENU_MODULE + " not in module registry; using generic Menu hook.");
@@ -67,7 +76,6 @@ const register: ModRegistrar = (moduleRegistry) => {
     if (multiplayerScreenRegistered) {
         moduleRegistry.append("Menu", MultiplayerMenuButton);
     }
-    moduleRegistry.append("Menu", JoinLoadingScreen);
 };
 
 export default register;

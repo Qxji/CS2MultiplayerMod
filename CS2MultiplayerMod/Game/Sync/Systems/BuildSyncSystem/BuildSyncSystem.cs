@@ -318,6 +318,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             bool activeIsLifecycleTool = IsObjectLifecycleTool(active);
+            bool activeIsNetOwnedObjectGraph =
+                active is global::Game.Tools.NetToolSystem &&
+                _cachedLocalObjectOperation != null &&
+                _cachedLocalObjectOperationFromNetTool;
             // Only a hand-back to the default tool is a one-shot apply. Choosing a different build
             // tool is a user action, and its own Apply must never be read as the object tool's.
             global::Game.Tools.ToolBaseSystem lifecycleTool = activeIsLifecycleTool ? active
@@ -328,11 +332,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             bool applying = lifecycleTool != null &&
                             lifecycleTool.applyMode == ApplyMode.Apply;
+            bool netOwnedObjectApplying = activeIsNetOwnedObjectGraph &&
+                                           active.applyMode == ApplyMode.Apply;
             RememberSelectedAssetStampPrefab(lifecycleTool);
             SampleLifecycleToolSeed(lifecycleTool);
-            _localObjectToolRanThisFrame = activeIsLifecycleTool || applying;
-            _localObjectApplyThisFrame = _localObjectToolRanThisFrame && applying;
-            _localLifecycleApplyThisFrame = applying;
+            _localObjectToolRanThisFrame = activeIsLifecycleTool || applying ||
+                                           activeIsNetOwnedObjectGraph;
+            _localObjectApplyThisFrame = applying || netOwnedObjectApplying;
+            _localLifecycleApplyThisFrame = _localObjectApplyThisFrame;
         }
 
         // Sampled at ToolUpdate and kept for the rest of the frame, unlike
