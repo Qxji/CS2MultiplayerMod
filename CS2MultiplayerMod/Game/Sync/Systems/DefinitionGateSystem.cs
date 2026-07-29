@@ -19,6 +19,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     public partial class DefinitionGateSystem : GameSystemBase
     {
         private NetSyncSystem _netSync;
+        private BuildSyncSystem _buildSync;
+        private ToolSystem _toolSystem;
         private EntityQuery _foreignDefinitions;
 
         protected override void OnCreate()
@@ -26,6 +28,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             base.OnCreate();
             Mod.log.Info(nameof(DefinitionGateSystem) + " ready.");
             _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
+            _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+            _toolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
 
             // Fresh, entity-visible definitions that are not a sync feeder's own (those carry
             // Deleted from birth) - i.e. the active tool's buffered preview definitions.
@@ -50,6 +54,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // transaction was temporarily Disabled before inspecting newly buffered definitions.
             _netSync.FinishIsolationAfterToolOutput();
 
+            // Object/upgrade previews no longer need their regenerated definition graph here. They
+            // are captured once from the standing graph immediately before ToolOutputSystem applies
+            // it. Avoid even materializing the often-hundreds-strong preview batch unless NetSync
+            // needs it or an armed remote transaction must gate it.
+            bool armedCommit = _netSync.HasArmedToolCommit;
+            bool activeNetTool = _toolSystem != null &&
+                                 _toolSystem.activeTool is global::Game.Tools.NetToolSystem;
+            if (!armedCommit && !activeNetTool)
+            {
+                _netSync.ObserveLocalNetDefinitions(default(NativeArray<Entity>));
+                if (_buildSync == null)
+                    _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+                _buildSync.ObserveLocalObjectToolOutput();
+                return;
+            }
+
             int killed = 0;
             NativeArray<Entity> definitions = _foreignDefinitions.IsEmptyIgnoreFilter
                 ? default(NativeArray<Entity>)
@@ -61,15 +81,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // armed: the next Apply frame publishes this preview rather than inferring from
                 // its final Created edges.
                 _netSync.ObserveLocalNetDefinitions(definitions);
-                BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
-                // ObjectToolSystem can pulse Apply entirely between SyncRealizeSystem's early
-                // ToolUpdate sample and this barrier. ToolOutputSystem has just applied the standing
-                // preview; publish that cached graph before observing this frame's definitions,
-                // which describe the replacement preview generated after the click.
-                buildSync.ObserveLocalObjectToolOutput(definitions,
-                    !_netSync.HasArmedToolCommit);
+                if (_buildSync == null)
+                    _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+                _buildSync.ObserveLocalObjectToolOutput();
 
-                if (!_netSync.HasArmedToolCommit) return;
+                if (!armedCommit) return;
                 for (int i = 0; i < definitions.Length; i++)
                 {
                     CreationDefinition def =

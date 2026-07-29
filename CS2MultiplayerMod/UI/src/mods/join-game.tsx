@@ -5,6 +5,7 @@ import { getModule } from "cs2/modding";
 import { Button, DialogContext, DialogStack, MenuButton } from "cs2/ui";
 import { CSSProperties, ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
+import { MultiplayerJoinLoadingScreen } from "mods/loading-screen";
 import { MULTIPLAYER_BLUE } from "mods/multiplayer-theme";
 import { VersionWarningBanner } from "mods/version-banner";
 
@@ -569,19 +570,15 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
 
     const screenContent = <div style={styles.pageHost}>{focusedPage}</div>;
 
-    if (VanillaSubScreen) {
-        return (
-            <VanillaSubScreen
-                focusKey={focusKey}
-                className={className}
-                title={title}
-                onClose={backAction}>
-                {screenContent}
-            </VanillaSubScreen>
-        );
-    }
-
-    return (
+    const nativeScreen = VanillaSubScreen ? (
+        <VanillaSubScreen
+            focusKey={focusKey}
+            className={className}
+            title={title}
+            onClose={backAction}>
+            {screenContent}
+        </VanillaSubScreen>
+    ) : (
         <BackConsumer onAction={backAction}>
             <div className={className} style={styles.fallbackScreenRoot}>
                 <div style={styles.fallbackHeader}>
@@ -599,6 +596,15 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
                 <div style={styles.fallbackContent}>{screenContent}</div>
             </div>
         </BackConsumer>
+    );
+
+    return (
+        <>
+            {/* Keep the join overlay inside the native screen that starts the
+                connection; root Menu hooks are not retained by every sub-screen. */}
+            <MultiplayerJoinLoadingScreen />
+            {nativeScreen}
+        </>
     );
 };
 

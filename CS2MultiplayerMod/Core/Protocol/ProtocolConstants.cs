@@ -4,7 +4,9 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v29 marks a disconnect notice as graceful, so a host that simply left the game
+        /// Current v30 carries zoning-block geometry and portable cell-state metadata so zoning is
+        /// mapped by world position when road-generated block layouts differ between peers. v29
+        /// marks a disconnect notice as graceful, so a host that simply left the game
         /// ends the session cleanly on every client instead of reporting a connection error.
         /// v28 carries the placing tool's random seed and control-point elevation with
         /// upgrade and relocation commands, so the receiver can re-run the game's own definition
@@ -40,7 +42,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 29;
+        public const int ProtocolVersion = 30;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

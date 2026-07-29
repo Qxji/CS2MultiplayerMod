@@ -24,6 +24,13 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
         /// </summary>
         public int MaxBodyBytes = int.MaxValue;
 
+        /// <summary>
+        /// Per-system inbox ceiling. Systems that deliberately spread large, independent bursts
+        /// over multiple frames can opt into a larger bounded queue without weakening the default
+        /// limit used by dependent command streams.
+        /// </summary>
+        public int QueueCap = SyncInbox.DefaultCap;
+
         // Backpressure warnings are throttled so a flood can't itself spam the log.
         private const int WarnThrottleMs = 5000;
         private int _lastWarnTick;
@@ -47,7 +54,7 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
                     SyncInbox.RequestResync("oversized sync command rejected");
                     return;
                 }
-                SyncInbox.Push(_sink, command);
+                SyncInbox.Push(_sink, command, QueueCap);
                 return;
             }
         }

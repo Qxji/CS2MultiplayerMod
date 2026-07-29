@@ -7,7 +7,6 @@ using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Game.Sync.Systems.Net;
 using Game;
-using Game.SceneFlow;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
@@ -56,10 +55,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly HashSet<int> _pendingJoinRequests = new HashSet<int>();
         private readonly List<ConnectionId> _joiningParticipants = new List<ConnectionId>();
 
-        private AutoSaveSystem _autoSave;
         private NetSyncSystem _netSync;
         private Observer _observer;
-        private Task _saveTask;
+        private Task<byte[]> _saveTask;
         private RecoveryState _state;
         private bool _recoveryRequested;
         private bool _rerunRequested;
@@ -68,7 +66,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private long _deadlineMs;
         private long _lastResyncMs = -1;
         private long _saveStartMs;
-        private DateTime _saveStartUtc;
         private float _resumeSpeed;
         private int _cleanFrames;
 
@@ -76,7 +73,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             base.OnCreate();
             Mod.log.Info(nameof(WorldResyncSystem) + " ready (atomic epoch barrier).");
-            _autoSave = World.GetOrCreateSystemManaged<AutoSaveSystem>();
             _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
 
             if (Mod.Service != null)
@@ -292,8 +288,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             try
             {
-                _saveStartUtc = DateTime.UtcNow.AddSeconds(-5);
-                _saveTask = _autoSave.PerformAutoSave(GameManager.instance.settings.general);
+                _saveTask = service.CreateWorldSnapshot(World);
                 _saveStartMs = now;
                 _state = RecoveryState.Saving;
                 service.SetHostWorldSyncUiStage(HostWorldSyncUiStage.Saving);
@@ -320,13 +315,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return;
             }
 
-            byte[] snapshot;
-            string saveName;
-            if (!service.TryReadWorldSnapshot(_saveStartUtc, out snapshot, out saveName))
+            byte[] snapshot = _saveTask.Result;
+            _saveTask = null;
+            if (snapshot == null || snapshot.Length == 0)
             {
-                AbortEpoch(service, "authoritative save file was unavailable");
+                AbortEpoch(service, "authoritative save produced no snapshot data");
                 return;
             }
+            string saveName = MultiplayerService.WorldSnapshotFileName;
 
             for (int i = 0; i < _participants.Count; i++)
                 service.StreamWorldSnapshot(_participants[i], _epoch, snapshot, saveName);

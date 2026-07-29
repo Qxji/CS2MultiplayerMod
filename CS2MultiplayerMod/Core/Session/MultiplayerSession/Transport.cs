@@ -142,7 +142,9 @@ namespace CS2MultiplayerMod.Core.Session
         private void EndByRemote(string reason)
         {
             _log.Info("Host ended the session (" + reason + "). Disconnecting cleanly.");
-            Stop();
+            // Preserve the host notice / transport failure for the game layer. It uses
+            // this detail to tell the player why their temporary host world is closing.
+            Stop(reason);
         }
 
         private void OnTransportData(ConnectionId connection, byte[] payload, long nowUnixMs)

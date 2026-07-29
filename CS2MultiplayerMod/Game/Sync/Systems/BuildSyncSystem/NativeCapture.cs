@@ -23,10 +23,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private const long RecentLocalObjectOperationLifetimeMs = 5000;
 
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
-        // A network prefab can create a top-level object that owns the course it draws. Remember
-        // which tool produced the cached graph so a stale object-tool preview can never be claimed
-        // by an unrelated network-tool Apply.
-        private bool _cachedLocalObjectOperationFromNetTool;
         private readonly List<RecentLocalObjectOperation> _recentLocalObjectOperations =
             new List<RecentLocalObjectOperation>(MaxRecentLocalObjectOperations);
         // Sampled before ToolOutputSystem runs. A one-shot stamp can switch active tools while its
@@ -57,25 +53,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             (_areaToolSystem != null && _areaToolSystem.recreate != Entity.Null);
 
         /// <summary>
-        /// Process object-tool output after the output barrier. A late Apply must publish the
-        /// previously cached standing preview before this frame's replacement preview is cached.
-        /// Keeping both actions here makes that ordering an invariant of the capture pipeline.
+        /// Observe the object/area tool hand-off after the output barrier. Complete object graphs
+        /// are captured once from the standing definitions on the Apply frame; this phase only
+        /// advances the specialized-industry two-tool transaction.
         /// </summary>
-        public void ObserveLocalObjectToolOutput(NativeArray<Entity> definitions,
-            bool allowLateApplyCapture)
+        public void ObserveLocalObjectToolOutput()
         {
-            if (allowLateApplyCapture)
-                CaptureLocalObjectApplyAfterToolOutput();
-            ObserveLocalObjectDefinitions(definitions);
+            ObserveLocalObjectToolStateAfterOutput();
         }
 
         /// <summary>
-        /// Cache the active object-lifecycle tool's complete definition batch after the output
-        /// barrier. This is the last point at which exact placement, ownership, relocation, area,
-        /// and connector intent is available together, before generation reduces it to final
-        /// entities.
+        /// Advance the specialized-industry object/area hand-off after tool output. The expensive
+        /// definition encoding deliberately does not happen here: regenerated hover previews pass
+        /// this point many times per second.
         /// </summary>
-        private void ObserveLocalObjectDefinitions(NativeArray<Entity> definitions)
+        private void ObserveLocalObjectToolStateAfterOutput()
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             Entity recreate = _areaToolSystem != null ? _areaToolSystem.recreate : Entity.Null;
@@ -128,55 +120,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // lot it was born with, so the held object graph is the whole local change.
             if (_pendingSpecializedObjectOperation != null)
                 FinishSpecializedAreaCaptureWithoutPolygon();
-
-            // Some network prefabs emit a new top-level object plus owner-linked courses, sub-nets,
-            // and areas. NetSync deliberately excludes OwnerDefinition courses because replaying
-            // them independently would sever that graph. Route the complete batch through the
-            // atomic object transaction instead, while retaining an unchanged standing preview.
-            if (active is global::Game.Tools.NetToolSystem)
-            {
-                if (NativeObjectGraph.HasNewTopLevelObjectRoot(EntityManager, definitions))
-                {
-                    CaptureObjectToolOperation(definitions, fromNetTool: true);
-                }
-                else if (definitions.Length != 0 || _toolSystem == null ||
-                         _toolSystem.applyMode != ApplyMode.None)
-                {
-                    _cachedLocalObjectOperation = null;
-                    _cachedLocalObjectOperationFromNetTool = false;
-                }
-                return;
-            }
-
-            // An empty steady frame normally preserves an object tool's standing preview. Do not
-            // carry that rule across tool families: after leaving the network tool, its owner graph
-            // can only remain in the recent-root set for commit correlation, never as the current
-            // object tool's cached operation.
-            if (_cachedLocalObjectOperationFromNetTool)
-            {
-                _cachedLocalObjectOperation = null;
-                _cachedLocalObjectOperationFromNetTool = false;
-            }
-
-            if (!IsObjectLifecycleTool(active))
-            {
-                // ToolSystem keeps the tool that actually ran this ToolUpdate as its last tool even
-                // when a one-shot placement switches activeTool before the output barrier. Its Apply
-                // pulse therefore remains authoritative here. Require an ObjectDefinition or a
-                // Stamping NetCourse in this exact output batch so an immediately-applied net/area
-                // tool can never publish a stale object preview left over from the previous
-                // selection. Asset stamps intentionally emit no root ObjectDefinition.
-                if (_toolSystem != null && _toolSystem.applyMode == ApplyMode.Apply &&
-                    ContainsObjectOrAssetStampDefinition(definitions))
-                {
-                    CaptureObjectToolOperation(definitions);
-                    return;
-                }
-                _cachedLocalObjectOperation = null;
-                return;
-            }
-
-            CaptureObjectToolOperation(definitions);
         }
 
         private static bool IsObjectLifecycleTool(global::Game.Tools.ToolBaseSystem tool) =>
@@ -284,23 +227,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return true;
         }
 
-        private bool ContainsObjectOrAssetStampDefinition(NativeArray<Entity> definitions)
-        {
-            for (int i = 0; i < definitions.Length; i++)
-            {
-                Entity entity = definitions[i];
-                if (!EntityManager.Exists(entity) ||
-                    !EntityManager.HasComponent<CreationDefinition>(entity)) continue;
-                if (EntityManager.HasComponent<ObjectDefinition>(entity)) return true;
-                CreationDefinition creation = EntityManager.GetComponentData<CreationDefinition>(entity);
-                if (EntityManager.HasComponent<NetCourse>(entity) &&
-                    (creation.m_Flags & CreationFlags.Stamping) != 0) return true;
-            }
-            return false;
-        }
-
-        private void CaptureObjectToolOperation(NativeArray<Entity> definitions,
-            bool fromNetTool = false)
+        private void CaptureObjectToolOperation(NativeArray<Entity> definitions)
         {
             // A relocation or an upgrade of a live building is not shipped as definitions at all.
             // Capturing one walks that building's full owned-element buffers once for every one of
@@ -416,12 +343,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 AssetStampPrefabName = stampPrefabName,
                 Definitions = captured.ToArray(),
             };
-            _cachedLocalObjectOperationFromNetTool = fromNetTool;
             RememberRecentLocalObjectOperation(_cachedLocalObjectOperation);
             Diagnostics.FlightRecorder.Note(hasStampingNet
-                ? "asset stamp native definitions observed=" + captured.Count +
+                ? "asset stamp native definitions captured=" + captured.Count +
                   " prefab=" + stampPrefabName
-                : "object native definitions observed=" + captured.Count +
+                : "object native definitions captured=" + captured.Count +
                   " root=" + captured[root].PrefabName +
                   " seed=" + unchecked((ushort)captured[root].RandomSeed));
         }
@@ -1083,45 +1009,94 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// <c>m_Original</c> and its destination in <see cref="ObjectDefinition"/>, which together are
         /// the whole compact command; the receiver re-derives the owned graph from them.
         /// </summary>
-        private void CaptureLocalRelocationForApply()
+        private void CaptureLocalRelocationForApply(NativeArray<Entity> definitions)
         {
-            if (_standingDefinitions.IsEmptyIgnoreFilter) return;
             MoveSyncSystem moveSync = World.GetExistingSystemManaged<MoveSyncSystem>();
             if (moveSync == null) return;
+
+            for (int i = 0; i < definitions.Length; i++)
+            {
+                Entity entity = definitions[i];
+                if (!EntityManager.Exists(entity) ||
+                    !EntityManager.HasComponent<CreationDefinition>(entity) ||
+                    !EntityManager.HasComponent<ObjectDefinition>(entity)) continue;
+
+                CreationDefinition creation =
+                    EntityManager.GetComponentData<CreationDefinition>(entity);
+                if ((creation.m_Flags & CreationFlags.Relocate) == 0) continue;
+                // Owned elements of the moved building carry their own Relocate definitions; the
+                // root is the one the tool was given, which has no owner above it.
+                if (creation.m_Owner != Entity.Null ||
+                    EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
+
+                Entity original = creation.m_Original;
+                if (original == Entity.Null || !EntityManager.Exists(original) ||
+                    !EntityManager.HasComponent<global::Game.Objects.Transform>(original) ||
+                    !EntityManager.HasComponent<PrefabRef>(original)) continue;
+
+                ObjectDefinition placement =
+                    EntityManager.GetComponentData<ObjectDefinition>(entity);
+                moveSync.PublishLocalRelocation(
+                    EntityManager.GetComponentData<PrefabRef>(original).m_Prefab,
+                    EntityManager.GetComponentData<global::Game.Objects.Transform>(original)
+                        .m_Position,
+                    placement.m_Position, placement.m_Rotation, placement.m_Elevation,
+                    AppliedLifecycleToolSeed);
+                return;
+            }
+        }
+
+        /// <summary>
+        /// Capture an object lifecycle action once, in the narrow phase between its tool selecting
+        /// Apply and ToolOutputSystem consuming the standing preview. Hover/movement frames never
+        /// encode the graph or build portable world indexes.
+        /// </summary>
+        public void CaptureLocalObjectApplyBeforeToolOutput()
+        {
+            if (_nativeLifecycleCapturedThisFrame || _toolSystem == null ||
+                _toolSystem.applyMode != ApplyMode.Apply) return;
+            if (_standingDefinitions.IsEmptyIgnoreFilter) return;
 
             NativeArray<Entity> definitions = _standingDefinitions.ToEntityArray(Allocator.Temp);
             try
             {
-                for (int i = 0; i < definitions.Length; i++)
-                {
-                    Entity entity = definitions[i];
-                    if (!EntityManager.Exists(entity) ||
-                        !EntityManager.HasComponent<CreationDefinition>(entity) ||
-                        !EntityManager.HasComponent<ObjectDefinition>(entity)) continue;
+                bool fromObjectLifecycleTool = _localObjectToolRanThisFrame;
+                bool fromNetOwnedObjectGraph = !fromObjectLifecycleTool &&
+                    (_localNetToolRanThisFrame ||
+                     _toolSystem.activeTool is global::Game.Tools.NetToolSystem) &&
+                    NativeObjectGraph.HasNewTopLevelObjectRoot(EntityManager, definitions);
+                if (!fromObjectLifecycleTool && !fromNetOwnedObjectGraph) return;
 
-                    CreationDefinition creation =
-                        EntityManager.GetComponentData<CreationDefinition>(entity);
-                    if ((creation.m_Flags & CreationFlags.Relocate) == 0) continue;
-                    // Owned elements of the moved building carry their own Relocate definitions; the
-                    // root is the one the tool was given, which has no owner above it.
-                    if (creation.m_Owner != Entity.Null ||
-                        EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
-
-                    Entity original = creation.m_Original;
-                    if (original == Entity.Null || !EntityManager.Exists(original) ||
-                        !EntityManager.HasComponent<global::Game.Objects.Transform>(original) ||
-                        !EntityManager.HasComponent<PrefabRef>(original)) continue;
-
-                    ObjectDefinition placement =
-                        EntityManager.GetComponentData<ObjectDefinition>(entity);
-                    moveSync.PublishLocalRelocation(
-                        EntityManager.GetComponentData<PrefabRef>(original).m_Prefab,
-                        EntityManager.GetComponentData<global::Game.Objects.Transform>(original)
-                            .m_Position,
-                        placement.m_Position, placement.m_Rotation, placement.m_Elevation,
-                        AppliedLifecycleToolSeed);
+                // A remote net transaction owns this frame's ApplyTool pass. Its isolation
+                // deliberately prevents the local preview from committing, so it must not be
+                // published as local work.
+                if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedToolCommit)
                     return;
+
+                // Read a relocation from the same one-shot snapshot. The committed entity is not a
+                // reliable signal because the apply pass does not retain its old position.
+                if (fromObjectLifecycleTool)
+                    CaptureLocalRelocationForApply(definitions);
+
+                CaptureObjectToolOperation(definitions);
+                ObjectToolOperationCommand operation = _cachedLocalObjectOperation;
+                if (operation == null || operation.Definitions == null) return;
+
+                if (operation.IsAssetStamp)
+                {
+                    string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
+                                           _selectedAssetStampPrefabName;
+                    if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
+                            System.StringComparison.Ordinal)) return;
                 }
+
+                _localObjectApplyThisFrame = true;
+                _localLifecycleApplyThisFrame = true;
+                Diagnostics.FlightRecorder.Note((operation.IsAssetStamp
+                    ? "asset stamp"
+                    : "object lifecycle") + " apply captured from standing definitions=" +
+                                                  operation.Definitions.Length);
+                PublishCachedLocalObjectOperation();
             }
             finally
             {
@@ -1130,100 +1105,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         /// <summary>
-        /// Capture an object lifecycle action in the narrow phase between its tool selecting Apply
-        /// and ToolOutputSystem consuming the standing preview. The cached command is that complete
-        /// graph; definitions generated later in the frame belong to the next preview.
-        /// </summary>
-        public void CaptureLocalObjectApplyBeforeToolOutput()
-        {
-            if (_nativeLifecycleCapturedThisFrame || _toolSystem == null ||
-                !_localObjectToolRanThisFrame ||
-                _toolSystem.applyMode != ApplyMode.Apply) return;
-
-            // Read the relocation the tool is about to apply straight from its definitions. The
-            // committed entity is not a reliable signal: the apply pass does not record where an
-            // object came from, so a detector keyed on that never fires for a building.
-            CaptureLocalRelocationForApply();
-
-            // A remote net transaction owns this frame's ApplyTool pass. Its isolation deliberately
-            // prevents the local preview from committing, so it must not be published as local work.
-            if (_nativeNetCoordinator != null && _nativeNetCoordinator.HasArmedToolCommit) return;
-
-            ObjectToolOperationCommand operation = _cachedLocalObjectOperation;
-            if (operation == null || operation.Definitions == null) return;
-
-            if (operation.IsAssetStamp)
-            {
-                string selectedStamp = GetSelectedAssetStampPrefabName(_toolSystem.activeTool) ??
-                                       _selectedAssetStampPrefabName;
-                if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
-                        System.StringComparison.Ordinal)) return;
-            }
-
-            _localObjectApplyThisFrame = true;
-            Diagnostics.FlightRecorder.Note((operation.IsAssetStamp
-                ? "asset stamp"
-                : "object lifecycle") + " apply captured before tool output defs=" +
-                                              operation.Definitions.Length);
-            PublishCachedLocalObjectOperation();
-        }
-
-        /// <summary>
-        /// Process the cached batch when an object lifecycle tool enters Apply. New top-level
-        /// placements and upgrades remain cached until their generated root proves which preview
-        /// graph committed.
+        /// Reset the one-frame native-capture marker at the front of ToolUpdate. Actual capture is
+        /// deferred to <see cref="CaptureLocalObjectApplyBeforeToolOutput"/>, where the applying
+        /// standing definitions are still available and the work happens only once per click.
         /// </summary>
         public void CaptureLocalObjectApply()
         {
-            // ApplyMode is a stored tool state, not an edge-triggered event. A capture performed
-            // after the previous early sample still owns that Apply pulse; consume the marker and
-            // let the tool update before accepting another one. Any genuinely new Apply later in
-            // this ToolUpdate is caught at the output barrier.
-            bool applyAlreadyCaptured = _nativeLifecycleCapturedThisFrame;
             _nativeLifecycleCapturedThisFrame = false;
-            if (applyAlreadyCaptured) return;
-            if (!_localObjectApplyThisFrame || _cachedLocalObjectOperation == null) return;
-
-            // A rootless stamp has no Created object that can prove its commit later. Its dedicated
-            // pre-ToolOutput hook observes the current Apply decision while the standing graph is
-            // still intact; a stored Apply sampled at the front of the phase is not sufficient.
-            if (_cachedLocalObjectOperation.IsAssetStamp) return;
-
-            PublishCachedLocalObjectOperation();
-        }
-
-        /// <summary>
-        /// Catch one-frame object-tool applies at the first point after the tool has made its update
-        /// decision. At this point <see cref="ToolOutputSystem"/> has applied the standing preview,
-        /// while <see cref="ToolOutputBarrier"/> has exposed the replacement definitions generated
-        /// after the click. The cached operation still describes the graph that actually committed;
-        /// callers must invoke this before replacing that cache with the new output batch.
-        /// </summary>
-        private void CaptureLocalObjectApplyAfterToolOutput()
-        {
-            if (_nativeLifecycleCapturedThisFrame || _cachedLocalObjectOperation == null) return;
-
-            // ToolSystem chooses its last tool before entering ToolUpdate. Sampling activeTool at
-            // the front of that phase therefore identifies the tool that ran even when a one-shot
-            // object/stamp switches activeTool while applying. Do not let another tool's Apply
-            // publish an object preview cached before a tool switch.
-            if (!_localObjectToolRanThisFrame || _toolSystem == null ||
-                _toolSystem.applyMode != ApplyMode.Apply) return;
-
-            // Specialized-industry placement intentionally commits its building first and then
-            // hands the owned lot to AreaToolSystem. ObserveLocalObjectDefinitions must retain this
-            // standing graph until the polygon closes, when both halves are published atomically.
-            Entity recreate = _areaToolSystem != null ? _areaToolSystem.recreate : Entity.Null;
-            global::Game.Tools.ToolBaseSystem active = _toolSystem.activeTool;
-            if (recreate != Entity.Null &&
-                (active is AreaToolSystem || active is ObjectToolSystem)) return;
-
-            // Preserve the late observation through ModificationEnd. If native encoding is rejected,
-            // the legacy final-entity path still sees this as a genuine local object-tool apply.
-            _localObjectApplyThisFrame = true;
-            Diagnostics.FlightRecorder.Note("object apply observed after output; processing standing defs=" +
-                                              _cachedLocalObjectOperation.Definitions.Length);
-            PublishCachedLocalObjectOperation();
         }
 
         private void PublishCachedLocalObjectOperation()

@@ -24,6 +24,21 @@ const LOC = {
     maxPlayers: "CS2MP.UI.MaxPlayers",
     resyncMinutes: "CS2MP.UI.ResyncMinutes",
     syncWorld: "CS2MP.UI.SyncWorld",
+    saveCopy: "CS2MP.UI.SaveCopy",
+    saveCopyTitle: "CS2MP.UI.SaveCopyTitle",
+    saveCopyBody: "CS2MP.UI.SaveCopyBody",
+    worldName: "CS2MP.UI.WorldName",
+    saveToPC: "CS2MP.UI.SaveToPC",
+    savingCopy: "CS2MP.UI.SavingCopy",
+    saveCopySuccess: "CS2MP.UI.SaveCopySuccess",
+    saveCopyExists: "CS2MP.UI.SaveCopyExists",
+    saveCopyInvalid: "CS2MP.UI.SaveCopyInvalid",
+    saveCopyUnavailable: "CS2MP.UI.SaveCopyUnavailable",
+    saveCopyFailed: "CS2MP.UI.SaveCopyFailed",
+    multiplayerWorld: "CS2MP.UI.MultiplayerWorld",
+    suggestedCopyName: "CS2MP.UI.SuggestedCopyName",
+    cancel: "CS2MP.UI.Cancel",
+    close: "CS2MP.UI.Close",
     sendingWorld: "CS2MP.UI.SendingWorld",
     lockedInSession: "CS2MP.UI.LockedInSession",
     players: "CS2MP.UI.Players",
@@ -81,6 +96,10 @@ const requireApproval$ = bindValue<boolean>(GROUP, "requireApproval", true);
 const resyncMinutes$ = bindValue<string>(GROUP, "resyncMinutes", "15");
 const playerList$ = bindValue<string>(GROUP, "playerList", "[]");
 const pendingJoins$ = bindValue<string>(GROUP, "pendingJoins", "[]");
+const canSaveClientWorld$ = bindValue<boolean>(GROUP, "canSaveClientWorld", false);
+const clientWorldSaveStatus$ = bindValue<string>(GROUP, "clientWorldSaveStatus", "idle");
+const clientWorldSaveName$ = bindValue<string>(GROUP, "clientWorldSaveName", "");
+const cityName$ = bindValue<string>("toolbarBottom", "cityName", "");
 
 interface ChatEntry {
     id: number;
@@ -577,6 +596,76 @@ const styles: Record<string, CSSProperties> = {
         marginLeft: "10rem",
         padding: "7rem 18rem",
     },
+    saveDialogOverlay: {
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 10003,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: "rgba(0, 0, 0, 0.62)",
+        pointerEvents: "auto",
+    },
+    saveDialog: {
+        width: "500rem",
+        maxWidth: "90%",
+        backgroundColor: "rgba(24, 33, 51, 0.98)",
+        border: "1rem solid rgba(157, 193, 222, 0.3)",
+        borderRadius: "4rem",
+        padding: "22rem 24rem",
+        boxShadow: "0 16rem 48rem rgba(0, 0, 0, 0.5)",
+        pointerEvents: "auto",
+    },
+    saveDialogTitle: {
+        color: "#ffffff",
+        fontSize: "23rem",
+        textTransform: "uppercase",
+        marginBottom: "10rem",
+    },
+    saveDialogBody: {
+        color: "rgba(255, 255, 255, 0.78)",
+        fontSize: "14rem",
+        lineHeight: "1.4",
+        marginBottom: "18rem",
+    },
+    saveDialogLabel: {
+        color: "#9dc1de",
+        fontSize: "12rem",
+        textTransform: "uppercase",
+        marginBottom: "6rem",
+    },
+    saveDialogInput: {
+        width: "100%",
+        boxSizing: "border-box",
+        color: "#ffffff",
+        backgroundColor: "rgba(0, 0, 0, 0.36)",
+        border: "1rem solid rgba(157, 193, 222, 0.4)",
+        borderRadius: "3rem",
+        fontSize: "16rem",
+        padding: "9rem 11rem",
+        marginBottom: "12rem",
+    },
+    saveDialogStatus: {
+        minHeight: "20rem",
+        color: "#ffd7d1",
+        fontSize: "13rem",
+        lineHeight: "1.35",
+        marginBottom: "12rem",
+    },
+    saveDialogSuccess: {
+        color: "#8ee08c",
+    },
+    saveDialogButtons: {
+        display: "flex",
+        justifyContent: "flex-end",
+    },
+    saveDialogButton: {
+        marginLeft: "10rem",
+        padding: "8rem 18rem",
+    },
 };
 
 // ---- Form building blocks -----------------------------------------------------
@@ -908,8 +997,145 @@ const HostPlayerList = ({ players }: { players: PlayerEntry[] }) => {
     );
 };
 
+const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
+    const t = useT();
+    const canSave = useValue(canSaveClientWorld$);
+    const saveStatus = useValue(clientWorldSaveStatus$);
+    const savedName = useValue(clientWorldSaveName$);
+    const cityName = useValue(cityName$).trim();
+    const [draft, setDraft] = useState(() =>
+        t(LOC.suggestedCopyName, "{0} - Copy")
+            .replace("{0}", cityName || t(LOC.multiplayerWorld, "Multiplayer World"))
+            .slice(0, 85)
+            .trim());
+    const [submitted, setSubmitted] = useState(false);
+    const inputRef = useRef<HTMLInputElement | null>(null);
+
+    const saving = submitted && saveStatus === "saving";
+    const saved = submitted && saveStatus === "saved";
+
+    useEffect(() => {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+    }, []);
+
+    const submit = () => {
+        const saveName = draft.trim();
+        if (!canSave || saving || saved || !saveName) return;
+        setSubmitted(true);
+        trigger(GROUP, "saveClientWorld", saveName);
+    };
+
+    let statusText = "";
+    if (submitted) {
+        switch (saveStatus) {
+            case "saving":
+                statusText = t(LOC.savingCopy, "Saving a local copy...");
+                break;
+            case "saved":
+                statusText = t(LOC.saveCopySuccess, "Saved to this PC as \"{0}\".")
+                    .replace("{0}", savedName || draft.trim());
+                break;
+            case "exists":
+                statusText = t(LOC.saveCopyExists,
+                    "A saved world with this name already exists. Choose a different name.");
+                break;
+            case "invalid":
+                statusText = t(LOC.saveCopyInvalid,
+                    "Enter a name between 1 and 85 characters.");
+                break;
+            case "unavailable":
+                statusText = t(LOC.saveCopyUnavailable,
+                    "Wait until the host world has fully loaded before saving a copy.");
+                break;
+            case "failed":
+                statusText = t(LOC.saveCopyFailed,
+                    "The copy could not be saved. Try another name and check free disk space.");
+                break;
+        }
+    } else if (!canSave) {
+        statusText = t(LOC.saveCopyUnavailable,
+            "Wait until the host world has fully loaded before saving a copy.");
+    }
+
+    return (
+        <Portal>
+            <InputActionBarrier>
+                <div
+                    style={styles.saveDialogOverlay}
+                    onMouseDown={(event) => event.stopPropagation()}>
+                    <div style={styles.saveDialog}>
+                        <div style={styles.saveDialogTitle}>
+                            {t(LOC.saveCopyTitle, "Save a World Copy")}
+                        </div>
+                        <div style={styles.saveDialogBody}>
+                            {t(LOC.saveCopyBody,
+                                "Keep the current shared city on this PC so you can continue it later in single-player.")}
+                        </div>
+                        <div style={styles.saveDialogLabel}>
+                            {t(LOC.worldName, "World Name")}
+                        </div>
+                        <input
+                            ref={inputRef}
+                            type="text"
+                            value={draft}
+                            maxLength={85}
+                            disabled={saving || saved}
+                            spellCheck={false}
+                            autoComplete="off"
+                            style={styles.saveDialogInput}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onChange={(event) => {
+                                setDraft((event.target as HTMLInputElement).value);
+                                setSubmitted(false);
+                                trigger(GROUP, "resetClientWorldSaveStatus");
+                            }}
+                            onKeyDown={(event) => {
+                                event.stopPropagation();
+                                if (event.key === "Enter") submit();
+                                if (event.key === "Escape" && !saving) onClose();
+                            }}
+                        />
+                        <div style={saved
+                            ? { ...styles.saveDialogStatus, ...styles.saveDialogSuccess }
+                            : styles.saveDialogStatus}>
+                            {statusText}
+                        </div>
+                        <div style={styles.saveDialogButtons}>
+                            {saved ? (
+                                <Button variant="primary" style={styles.saveDialogButton} onSelect={onClose}>
+                                    {t(LOC.close, "Close")}
+                                </Button>
+                            ) : (
+                                <>
+                                    <Button
+                                        variant="primary"
+                                        style={styles.saveDialogButton}
+                                        disabled={!canSave || saving || !draft.trim()}
+                                        onSelect={submit}>
+                                        {saving
+                                            ? t(LOC.savingCopy, "Saving a local copy...")
+                                            : t(LOC.saveToPC, "Save to This PC")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.saveDialogButton}
+                                        disabled={saving}
+                                        onSelect={onClose}>
+                                        {t(LOC.cancel, "Cancel")}
+                                    </Button>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            </InputActionBarrier>
+        </Portal>
+    );
+};
+
 // Active session: player count, chat feed (player lines + "X joined." event
-// lines), send box, world sync and disconnect.
+// lines), send box, world sync, local client copy and disconnect.
 const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: PlayerEntry[] }) => {
     const t = useT();
     const playerCount = useValue(playerCount$);
@@ -919,8 +1145,10 @@ const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: Play
     const progressMode = useValue(progressMode$);
     const statusTitle = useValue(statusTitle$);
     const statusDetail = useValue(statusDetail$);
+    const canSaveClientWorld = useValue(canSaveClientWorld$);
     const [draft, setDraft] = useState("");
     const [typing, setTyping] = useState(false);
+    const [saveDialogOpen, setSaveDialogOpen] = useState(false);
     const listRef = useRef<HTMLDivElement | null>(null);
 
     // Keep the newest line in view (only auto-stick when already near the bottom,
@@ -944,6 +1172,9 @@ const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: Play
 
     return (
         <div style={styles.body}>
+            {saveDialogOpen ? (
+                <ClientWorldSaveDialog onClose={() => setSaveDialogOpen(false)} />
+            ) : null}
             {/* Single string child: Gameface puts each adjacent bare text node on
                 its own line, which split "Players: 3" into three lines. */}
             {isHost
@@ -1003,6 +1234,18 @@ const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: Play
                 <Button variant="flat" style={styles.footerButton} onSelect={() => trigger(GROUP, "syncNow")}>
                     {t(LOC.syncWorld, "Sync World")}
                 </Button>
+                {!isHost ? (
+                    <Button
+                        variant="flat"
+                        style={styles.footerButton}
+                        disabled={!canSaveClientWorld}
+                        onSelect={() => {
+                            trigger(GROUP, "resetClientWorldSaveStatus");
+                            setSaveDialogOpen(true);
+                        }}>
+                        {t(LOC.saveCopy, "Save Copy")}
+                    </Button>
+                ) : null}
                 <Button variant="flat" style={styles.footerButton} onSelect={() => trigger(GROUP, "disconnect")}>
                     {t(LOC.disconnect, "Disconnect")}
                 </Button>

@@ -63,7 +63,7 @@ namespace CS2MultiplayerMod.Game
         /// <summary>Admit a join the host accepted in the approval prompt.</summary>
         public void ApproveJoinFromUi(int playerId)
         {
-            if (!_session.ApproveJoin(playerId))
+            if (!_session.ApproveJoin(playerId, NowMs))
                 _log.Warn("[MP] Ignored approve for unknown pending join #" + playerId + ".");
             RefreshPendingJoinsJson();
         }

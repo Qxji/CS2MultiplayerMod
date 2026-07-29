@@ -79,11 +79,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             private readonly Dictionary<Entity, List<Entity>> _byPrefab =
                 new Dictionary<Entity, List<Entity>>();
             private static readonly List<Entity> Empty = new List<Entity>();
+            private bool _filled;
 
-            public void Fill(EntityManager entityManager, EntityQuery query)
+            public void Invalidate()
             {
-                _byPrefab.Clear();
-                if (query.IsEmptyIgnoreFilter) return;
+                foreach (KeyValuePair<Entity, List<Entity>> pair in _byPrefab)
+                    pair.Value.Clear();
+                _filled = false;
+            }
+
+            public void FillIfNeeded(EntityManager entityManager, EntityQuery query)
+            {
+                if (_filled) return;
+                if (query.IsEmptyIgnoreFilter)
+                {
+                    _filled = true;
+                    return;
+                }
                 NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
                 try
                 {
@@ -102,6 +114,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     }
                 }
                 finally { entities.Dispose(); }
+                _filled = true;
             }
 
             public List<Entity> Of(Entity prefab)
@@ -118,16 +131,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private int _portableIndexDepth;
 
         /// <summary>
-        /// Snapshot the candidate domains for the duration of one resolution pass. Nothing inside a
-        /// pass creates or destroys world entities, so one snapshot stays correct throughout it.
+        /// Prepare candidate domains for one resolution pass. Each domain is snapshotted lazily on
+        /// its first lookup, so a plain building placement does not walk unrelated nodes, edges, and
+        /// areas. Nothing inside a pass creates or destroys world entities, so each snapshot stays
+        /// correct throughout it.
         /// </summary>
         private void BeginPortableResolve()
         {
             if (_portableIndexDepth++ != 0) return;
-            _objectCandidates.Fill(EntityManager, _portableObjects);
-            _nodeCandidates.Fill(EntityManager, _liveNodes);
-            _edgeCandidates.Fill(EntityManager, _liveEdges);
-            _areaCandidates.Fill(EntityManager, _portableAreas);
+            _objectCandidates.Invalidate();
+            _nodeCandidates.Invalidate();
+            _edgeCandidates.Invalidate();
+            _areaCandidates.Invalidate();
         }
 
         private void EndPortableResolve()
@@ -142,7 +157,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// </summary>
         private List<Entity> Candidates(PortableCandidateIndex index, EntityQuery query, Entity prefab)
         {
-            if (_portableIndexDepth == 0) index.Fill(EntityManager, query);
+            if (_portableIndexDepth == 0) index.Invalidate();
+            index.FillIfNeeded(EntityManager, query);
             return index.Of(prefab);
         }
 

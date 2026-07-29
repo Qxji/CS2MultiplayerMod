@@ -52,8 +52,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _buildSync.CaptureLocalObjectApply();
 
             // The active net tool has already selected Apply, while ToolOutputSystem has not yet
-            // consumed its standing preview. Publish the native definition cached after last
-            // frame's tool-output barrier and remember its exact split originals now.
+            // consumed its standing preview. Publish its cached native courses and remember exact
+            // split originals now. Object graphs are captured later at the dedicated pre-output
+            // hook, directly from their standing definitions and only on the Apply frame.
             _netSync.CaptureLocalNetApply();
 
             // Hold NEW net/object realizes while remote terrain edits are backlogged: a course or

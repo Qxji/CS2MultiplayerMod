@@ -150,7 +150,7 @@ namespace CS2MultiplayerMod
             updateSystem.UpdateAt<Game.Sync.Systems.SyncRealizeSystem>(SystemUpdatePhase.ToolUpdate);
             // Capture one-frame object lifecycle applies after the active object/upgrade tool made
             // its decision but before ToolOutputSystem consumes the complete standing definition
-            // graph. Asset stamps use the same hand-off despite having no persistent root object.
+            // graph. This is the only frame that serializes the graph; hover previews stay cheap.
             updateSystem.UpdateBefore<Game.Sync.Systems.ObjectToolApplyCaptureSystem,
                 global::Game.Tools.ToolOutputSystem>(SystemUpdatePhase.ToolUpdate);
             // After ToolOutputBarrier: tools record their definitions through that end-of-phase

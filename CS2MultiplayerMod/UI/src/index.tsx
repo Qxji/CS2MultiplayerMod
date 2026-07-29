@@ -2,7 +2,7 @@ import { trigger } from "cs2/api";
 import { ModRegistrar } from "cs2/modding";
 import { extendCreditsScreen, MultiplayerMenuButton } from "mods/join-game";
 import { MultiplayerRightMenuButton } from "mods/mp-hub";
-import { JoinLoadingScreen } from "mods/loading-screen";
+import { GameJoinLoadingScreen, MenuJoinLoadingScreen } from "mods/loading-screen";
 
 // Vanilla-internal module hosting the main-menu button column. Game updates can
 // rename it, so registration falls back to the official "Menu" append hook.
@@ -19,18 +19,17 @@ const register: ModRegistrar = (moduleRegistry) => {
         // Binding not reachable; the C# watchdog will report the module missing.
     }
 
-    // The loading view belongs to the two root UI surfaces rather than a menu
-    // button column. That keeps it mounted while native sub-screens replace the
-    // main navigation (including the Multiplayer screen and an approval wait).
-    // It renders only a Portal while connecting/syncing, so these append hooks
-    // add no visible inline element.
+    // Root owners cover joins started through Options and keep the overlay alive
+    // across the menu-to-game world hand-off. The native Multiplayer sub-screen
+    // also mounts its own explicitly owned instance for the initial connection.
+    // Each renders only a Portal while connecting/syncing.
     try {
-        moduleRegistry.append("Menu", JoinLoadingScreen);
+        moduleRegistry.append("Menu", MenuJoinLoadingScreen);
     } catch (e) {
         console.warn("[cs2mp] menu connection view could not be registered.", e);
     }
     try {
-        moduleRegistry.append("Game", JoinLoadingScreen);
+        moduleRegistry.append("Game", GameJoinLoadingScreen);
     } catch (e) {
         console.warn("[cs2mp] in-game connection view could not be registered.", e);
     }

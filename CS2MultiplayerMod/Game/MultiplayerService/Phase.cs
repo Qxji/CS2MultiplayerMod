@@ -34,6 +34,8 @@ namespace CS2MultiplayerMod.Game
         {
             _currentWorld = world;
             _session.Update(_clock.ElapsedMilliseconds);
+            PumpClientWorldSave();
+            PumpDeferredReceivedMap();
             RefreshPendingJoinsJson();
             string recoveryReason;
             if (_session.Status == SessionStatus.Connected &&
@@ -135,6 +137,7 @@ namespace CS2MultiplayerMod.Game
         {
             if (!ModEnabled) { _log.Warn("Cannot host: the mod is disabled in settings."); return; }
             if (_session.Role != SessionRole.None) { _log.Warn("Cannot host: a session is already active."); return; }
+            ClearClientExitNotice();
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: true);
@@ -152,6 +155,7 @@ namespace CS2MultiplayerMod.Game
         {
             if (!ModEnabled) { _log.Warn("Cannot join: the mod is disabled in settings."); return; }
             if (_session.Role != SessionRole.None) { _log.Warn("Cannot join: a session is already active."); return; }
+            ClearClientExitNotice();
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: false);
@@ -167,7 +171,7 @@ namespace CS2MultiplayerMod.Game
         public void Disconnect()
         {
             if (_session.Role == SessionRole.Client && _clientHostWorldActive)
-                QueueClientMainMenu("the player disconnected");
+                QueueClientMainMenu("You disconnected from the multiplayer session.");
 
             ResetWorldSyncState(restoreSpeed: true);
             // A host that stops hosting owes its clients a reason: without the notice they
@@ -190,6 +194,7 @@ namespace CS2MultiplayerMod.Game
             SetPhase(ClientWorldPhase.None);
             RestoreAutosave(); // even if the phase was already None
             ForgetClientHostWorld(); // process teardown owns the world; do not start MainMenu
+            ClearClientExitNotice();
             JoinMapLoader.DeleteTransient(_log);
         }
 

@@ -1,6 +1,7 @@
 import { bindValue, trigger, useValue } from "cs2/api";
 import { InputActionBarrier } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
+import { getModule } from "cs2/modding";
 import { Button, Portal } from "cs2/ui";
 import { CSSProperties, useEffect, useState } from "react";
 import { MULTIPLAYER_BLUE } from "mods/multiplayer-theme";
@@ -18,6 +19,13 @@ const LOC = {
     tryThis: "CS2MP.UI.TryThis",
     cancel: "CS2MP.UI.Cancel",
     close: "CS2MP.UI.Close",
+    sessionEnded: "CS2MP.UI.SessionEnded",
+    returningToMenu: "CS2MP.UI.ReturningToMenu",
+    returningToMenuHint: "CS2MP.UI.ReturningToMenuHint",
+    sharedWorldClosed: "CS2MP.UI.SharedWorldClosed",
+    worldExitFailedTitle: "CS2MP.UI.WorldExitFailedTitle",
+    worldExitFailed: "CS2MP.UI.WorldExitFailed",
+    tryAgain: "CS2MP.UI.TryAgain",
 };
 
 const useT = () => {
@@ -33,6 +41,81 @@ const progressMode$ = bindValue<string>(GROUP, "progressMode", "none");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const isHost$ = bindValue<boolean>(GROUP, "isHost", false);
+const inGameWorld$ = bindValue<boolean>(GROUP, "inGameWorld", false);
+const multiplayerMenuActive$ = bindValue<boolean>(GROUP, "multiplayerMenuActive", false);
+const clientExitNoticeActive$ = bindValue<boolean>(GROUP, "clientExitNoticeActive", false);
+const clientExitReturning$ = bindValue<boolean>(GROUP, "clientExitReturning", false);
+const clientExitFailed$ = bindValue<boolean>(GROUP, "clientExitFailed", false);
+const clientExitReason$ = bindValue<string>(GROUP, "clientExitReason", "");
+
+type LoadingScreenSurface = "menu" | "game" | "multiplayer";
+
+const tryModule = (path: string, exportName: string): any => {
+    try {
+        return getModule(path, exportName);
+    } catch {
+        return null;
+    }
+};
+
+const backdropClasses: Record<string, string> | null =
+    tryModule("game-ui/menu/components/menu-ui-backdrops/menu-ui-backdrops.module.scss", "classes");
+
+// This is the same pool used by the vanilla main menu. "Backgound" is the
+// spelling in the game's asset names, not a typo introduced here.
+const FALLBACK_BACKDROPS = [1, 2, 3, 4, 5, 6, 7]
+    .map((n) => `Media/Menu/Backdrops/Backgound0${n}.png`);
+
+const currentMenuBackdropImage = (): string => {
+    try {
+        const className = backdropClasses?.backdropImage?.split(/\s+/)[0];
+        if (className) {
+            const elements = document.getElementsByClassName(className);
+            // The newest element is the visible one while vanilla cross-fades.
+            for (let i = elements.length - 1; i >= 0; i--) {
+                const element = elements[i] as HTMLElement;
+                const image = element.style.backgroundImage || getComputedStyle(element).backgroundImage;
+                if (image && image !== "none") return image;
+            }
+        }
+    } catch {
+        // The menu can already be unmounting; use the native/static pool below.
+    }
+
+    const nativeList = tryModule(
+        "game-ui/menu/components/menu-ui-backdrops/menu-ui-backdrops.tsx",
+        "BACKDROPS_LIST",
+    );
+    const list: string[] = Array.isArray(nativeList) && nativeList.length > 0
+        ? nativeList
+        : FALLBACK_BACKDROPS;
+    return `url('${list[Math.floor(Math.random() * list.length)]}')`;
+};
+
+// Menu and Game roots overlap briefly during a world transition. Share one captured
+// image across those mounts so the artwork does not jump midway through loading.
+let sharedBackdropImage: string | null = null;
+let sharedBackdropUsers = 0;
+let sharedBackdropClearTimer: number | null = null;
+
+const acquireBackdropImage = (): string => {
+    sharedBackdropUsers++;
+    if (sharedBackdropClearTimer !== null) {
+        window.clearTimeout(sharedBackdropClearTimer);
+        sharedBackdropClearTimer = null;
+    }
+    if (!sharedBackdropImage) sharedBackdropImage = currentMenuBackdropImage();
+    return sharedBackdropImage;
+};
+
+const releaseBackdropImage = () => {
+    sharedBackdropUsers = Math.max(0, sharedBackdropUsers - 1);
+    if (sharedBackdropUsers !== 0) return;
+    sharedBackdropClearTimer = window.setTimeout(() => {
+        if (sharedBackdropUsers === 0) sharedBackdropImage = null;
+        sharedBackdropClearTimer = null;
+    }, 500);
+};
 
 // rem behaves like resolution-independent pixels (the game scales root font size).
 const styles: Record<string, CSSProperties> = {
@@ -48,10 +131,42 @@ const styles: Record<string, CSSProperties> = {
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
-        // Host sync and every client join phase use the same opaque blue, so no
-        // stale menu artwork or underlying screen can bleed through.
+        overflow: "hidden",
+        // Fallback while the main-menu city image is being resolved.
         backgroundColor: MULTIPLAYER_BLUE,
         pointerEvents: "auto",
+    },
+    backdrop: {
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 0,
+        backgroundPosition: "center",
+        backgroundSize: "cover",
+        backgroundRepeat: "no-repeat",
+        pointerEvents: "none",
+    },
+    backdropDim: {
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 0,
+        backgroundColor: "rgba(11, 16, 27, 0.60)",
+        pointerEvents: "none",
+    },
+    content: {
+        position: "relative",
+        zIndex: 1,
+        width: "100%",
+        height: "100%",
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
     },
     title: {
         fontSize: "44rem",
@@ -187,7 +302,7 @@ const IndeterminateBar = () => {
 // Blocking full-screen state shared by host world synchronization and every
 // client join phase. A client sees it immediately after pressing Join, including
 // the time spent waiting for manual host approval, through world transfer/load.
-export const JoinLoadingScreen = () => {
+export const JoinLoadingScreen = ({ surface }: { surface: LoadingScreenSurface }) => {
     const t = useT();
     const statusKind = useValue(statusKind$);
     const statusTitle = useValue(statusTitle$);
@@ -197,7 +312,23 @@ export const JoinLoadingScreen = () => {
     const mapTransferPercent = useValue(mapTransferPercent$);
     const worldSendPercent = useValue(worldSendPercent$);
     const isHost = useValue(isHost$);
+    const inGameWorld = useValue(inGameWorld$);
+    const multiplayerMenuActive = useValue(multiplayerMenuActive$);
+    const clientExitNoticeActive = useValue(clientExitNoticeActive$);
+    const clientExitReturning = useValue(clientExitReturning$);
+    const clientExitFailed = useValue(clientExitFailed$);
+    const clientExitReason = useValue(clientExitReason$);
     const percent = isHost ? worldSendPercent : mapTransferPercent;
+
+    // The native Multiplayer sub-screen is the most reliable owner while a player
+    // starts a join. Outside it, select exactly one root hook. Menu and Game may both
+    // be mounted for a few frames during a world replacement, so rendering from both
+    // would create overlapping input barriers and duplicate focus keys.
+    const ownsSurface = surface === "multiplayer"
+        ? multiplayerMenuActive && !inGameWorld
+        : surface === "game"
+            ? inGameWorld
+            : !multiplayerMenuActive && !inGameWorld;
 
     // Shown from the first "connecting" until connected/offline. An error keeps it
     // up (so the failure is visible) until the player dismisses it.
@@ -216,7 +347,19 @@ export const JoinLoadingScreen = () => {
         }
     }, [statusKind, isHost]);
 
-    if (!active) return null;
+    const overlayVisible = active || clientExitNoticeActive;
+    const [backdropImage, setBackdropImage] = useState<string | null>(null);
+    useEffect(() => {
+        if (!overlayVisible) {
+            setBackdropImage(null);
+            return;
+        }
+
+        setBackdropImage(acquireBackdropImage());
+        return releaseBackdropImage;
+    }, [overlayVisible]);
+
+    if (!ownsSurface || !overlayVisible) return null;
 
     const failed = statusKind === "error";
     const synchronizing = statusKind === "syncing";
@@ -225,6 +368,11 @@ export const JoinLoadingScreen = () => {
         // Clear the faulted session so the next attempt starts clean.
         trigger(GROUP, "disconnect");
     };
+    const dismissClientExit = () => {
+        setActive(false);
+        trigger(GROUP, "dismissClientExitNotice");
+    };
+    const retryClientExit = () => trigger(GROUP, "retryClientWorldExit");
 
     const phaseTitle = statusTitle || t(LOC.joiningTitle, "Joining Multiplayer Game");
     const clamped = Math.max(0, Math.min(100, Math.floor(percent)));
@@ -234,56 +382,131 @@ export const JoinLoadingScreen = () => {
         <Portal>
             <InputActionBarrier>
                 <div style={styles.overlay}>
-                    <div style={styles.title}>{t(LOC.multiplayer, "Multiplayer")}</div>
+                    {backdropImage ? (
+                        <>
+                            <div style={{ ...styles.backdrop, backgroundImage: backdropImage }} />
+                            <div style={styles.backdropDim} />
+                        </>
+                    ) : null}
 
-                    {failed ? (
-                        <>
-                            <div style={styles.error}>
-                                <div style={styles.errorTitle}>
-                                    {statusTitle || t(LOC.connectionFailed, "Connection failed")}
-                                </div>
-                                {statusDetail ? <div style={styles.errorSummary}>{statusDetail}</div> : null}
-                                {statusHelp ? (
-                                    <>
-                                        <div style={styles.helpTitle}>{t(LOC.tryThis, "Try this")}</div>
-                                        <div style={styles.errorHelp}>{statusHelp}</div>
-                                    </>
-                                ) : null}
-                            </div>
-                            <Button variant="primary" style={styles.cancel} onSelect={dismiss}>
-                                {t(LOC.close, "Close")}
-                            </Button>
-                        </>
-                    ) : (
-                        <>
-                            <div style={styles.barOuter}>
-                                <div style={styles.barHeader}>
-                                    <span style={styles.phase}>{phaseTitle}</span>
-                                    {determinate ? <span style={styles.percent}>{clamped}%</span> : null}
-                                </div>
-                                {determinate ? (
-                                    <div style={styles.track}>
-                                        <div style={{ ...styles.fill, width: `${clamped}%` }} />
+                    <div style={styles.content}>
+                        <div style={styles.title}>{t(LOC.multiplayer, "Multiplayer")}</div>
+
+                        {clientExitNoticeActive ? (
+                            clientExitReturning ? (
+                                <div style={styles.barOuter}>
+                                    <div style={styles.barHeader}>
+                                        <span style={styles.phase}>
+                                            {t(LOC.returningToMenu, "Returning to the main menu")}
+                                        </span>
                                     </div>
-                                ) : (
                                     <IndeterminateBar />
-                                )}
-                                <div style={styles.detail}>{statusDetail}</div>
-                                <div style={styles.hint}>
-                                    {isHost
-                                        ? t(LOC.hostLoadingHint, "The city will resume when every player is ready.")
-                                        : t(LOC.loadingHint, "Keep this window open while the host's city is transferred.")}
+                                    <div style={styles.detail}>{clientExitReason}</div>
+                                    <div style={styles.hint}>
+                                        {t(
+                                            LOC.returningToMenuHint,
+                                            "The disconnected shared city is being closed so you cannot keep editing its temporary copy.",
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
-                            {!synchronizing || !isHost ? (
-                                <Button variant="flat" style={styles.cancel} onSelect={dismiss}>
-                                    {t(LOC.cancel, "Cancel")}
+                            ) : (
+                                <>
+                                    <div style={{
+                                        ...styles.error,
+                                        borderLeftColor: clientExitFailed ? "#ff8a7a" : "#72c8f0",
+                                    }}>
+                                        <div style={{
+                                            ...styles.errorTitle,
+                                            color: clientExitFailed ? "#ff9c8f" : "#9dc1de",
+                                        }}>
+                                            {clientExitFailed
+                                                ? t(LOC.worldExitFailedTitle, "Could not close the shared city")
+                                                : t(LOC.sessionEnded, "Multiplayer session ended")}
+                                        </div>
+                                        {clientExitReason ? (
+                                            <div style={styles.errorSummary}>{clientExitReason}</div>
+                                        ) : null}
+                                        {clientExitFailed ? (
+                                            <div style={styles.helpTitle}>{t(LOC.tryThis, "Try this")}</div>
+                                        ) : null}
+                                        <div style={styles.errorHelp}>
+                                            {clientExitFailed
+                                                ? t(
+                                                    LOC.worldExitFailed,
+                                                    "The game did not accept the automatic return. The temporary world has not been deleted while it is open. Try again; if this keeps failing, close the game instead of continuing in this disconnected copy.",
+                                                )
+                                                : t(
+                                                    LOC.sharedWorldClosed,
+                                                    "The shared city was closed automatically. Its downloaded copy is temporary; the host owns the session save, and changes made after the connection ended cannot be sent back.",
+                                                )}
+                                        </div>
+                                    </div>
+                                    <Button
+                                        variant="primary"
+                                        style={styles.cancel}
+                                        onSelect={clientExitFailed ? retryClientExit : dismissClientExit}
+                                    >
+                                        {clientExitFailed
+                                            ? t(LOC.tryAgain, "Try again")
+                                            : t(LOC.close, "Close")}
+                                    </Button>
+                                </>
+                            )
+                        ) : failed ? (
+                            <>
+                                <div style={styles.error}>
+                                    <div style={styles.errorTitle}>
+                                        {statusTitle || t(LOC.connectionFailed, "Connection failed")}
+                                    </div>
+                                    {statusDetail ? <div style={styles.errorSummary}>{statusDetail}</div> : null}
+                                    {statusHelp ? (
+                                        <>
+                                            <div style={styles.helpTitle}>{t(LOC.tryThis, "Try this")}</div>
+                                            <div style={styles.errorHelp}>{statusHelp}</div>
+                                        </>
+                                    ) : null}
+                                </div>
+                                <Button variant="primary" style={styles.cancel} onSelect={dismiss}>
+                                    {t(LOC.close, "Close")}
                                 </Button>
-                            ) : null}
-                        </>
-                    )}
+                            </>
+                        ) : (
+                            <>
+                                <div style={styles.barOuter}>
+                                    <div style={styles.barHeader}>
+                                        <span style={styles.phase}>{phaseTitle}</span>
+                                        {determinate ? <span style={styles.percent}>{clamped}%</span> : null}
+                                    </div>
+                                    {determinate ? (
+                                        <div style={styles.track}>
+                                            <div style={{ ...styles.fill, width: `${clamped}%` }} />
+                                        </div>
+                                    ) : (
+                                        <IndeterminateBar />
+                                    )}
+                                    <div style={styles.detail}>{statusDetail}</div>
+                                    <div style={styles.hint}>
+                                        {isHost
+                                            ? t(LOC.hostLoadingHint, "The city will resume when every player is ready.")
+                                            : t(LOC.loadingHint, "Keep this window open while the host's city is transferred.")}
+                                    </div>
+                                </div>
+                                {!synchronizing || !isHost ? (
+                                    <Button variant="flat" style={styles.cancel} onSelect={dismiss}>
+                                        {t(LOC.cancel, "Cancel")}
+                                    </Button>
+                                ) : null}
+                            </>
+                        )}
+                    </div>
                 </div>
             </InputActionBarrier>
         </Portal>
     );
 };
+
+// Prop-free wrappers satisfy the game's append-hook component contract while
+// keeping surface ownership explicit.
+export const MenuJoinLoadingScreen = () => <JoinLoadingScreen surface="menu" />;
+export const GameJoinLoadingScreen = () => <JoinLoadingScreen surface="game" />;
+export const MultiplayerJoinLoadingScreen = () => <JoinLoadingScreen surface="multiplayer" />;

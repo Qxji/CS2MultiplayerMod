@@ -26,6 +26,8 @@ namespace CS2MultiplayerMod.Game
     {
         /// <summary>A world load we started ourselves stays "expected" for this long.</summary>
         private const long ExpectedWorldLoadWindowMs = 180000;
+        private const int ClientMainMenuMaxAttempts = 5;
+        private const long ClientMainMenuRetryDelayMs = 750;
 
         private bool _inCityWorld;
         private bool _leavingSession;
@@ -34,7 +36,15 @@ namespace CS2MultiplayerMod.Game
         private bool _clientMainMenuPending;
         private Task _clientMainMenuTask;
         private int _clientMainMenuAttempts;
+        private long _clientMainMenuNextAttemptMs;
+        private bool _clientMainMenuFailed;
+        private string _clientExitNotice;
         private bool _transientCleanupPending;
+
+        internal bool ClientExitNoticeActive => !string.IsNullOrEmpty(_clientExitNotice);
+        internal bool ClientExitReturning => _clientMainMenuPending;
+        internal bool ClientExitFailed => _clientMainMenuFailed;
+        internal string ClientExitReason => _clientExitNotice ?? "";
 
         /// <summary>
         /// Marks the world load this mod is about to start as its own, so the transition
@@ -67,7 +77,7 @@ namespace CS2MultiplayerMod.Game
             {
                 _clientHostWorldActive = true;
                 if (_session.Role == SessionRole.None)
-                    QueueClientMainMenu("the host disconnected while its world was loading");
+                    QueueClientMainMenu("The host disconnected while its world was loading.");
                 return;
             }
 
@@ -159,12 +169,54 @@ namespace CS2MultiplayerMod.Game
             if (!_clientHostWorldActive) return;
 
             _transientCleanupPending = true;
+            if (string.IsNullOrEmpty(_clientExitNotice))
+                _clientExitNotice = string.IsNullOrWhiteSpace(reason)
+                    ? "The connection to the host closed."
+                    : reason.Trim();
             if (_clientMainMenuPending) return;
 
             _clientMainMenuPending = true;
             _clientMainMenuAttempts = 0;
+            _clientMainMenuNextAttemptMs = NowMs;
+            _clientMainMenuFailed = false;
             _log.Info("[MP] Client session ended (" + reason + "); returning to the main menu.");
             FlightRecorder.Note("client world exit queued: " + reason);
+        }
+
+        /// <summary>
+        /// The notice remains on the main menu until acknowledged, so a disconnect can
+        /// never look like the host's world silently became a normal local save.
+        /// </summary>
+        internal void DismissClientExitNotice()
+        {
+            // Never let UI dismissal expose a disconnected host world. The automatic
+            // close must finish first, or the player can retry it from the blocking screen.
+            if (_clientHostWorldActive || _clientMainMenuPending) return;
+            ClearClientExitNotice();
+            // A kick/ban first reports Faulted, but this session-ended notice already
+            // presented that reason. Do not reveal the generic connection-error overlay
+            // underneath it after the player acknowledges the close.
+            _lastFault = null;
+        }
+
+        internal void RetryClientWorldExit()
+        {
+            if (!_clientHostWorldActive) return;
+
+            _transientCleanupPending = true;
+            _clientMainMenuPending = true;
+            _clientMainMenuTask = null;
+            _clientMainMenuAttempts = 0;
+            _clientMainMenuNextAttemptMs = NowMs;
+            _clientMainMenuFailed = false;
+            _log.Info("[MP] Retrying the return from the disconnected host world to the main menu.");
+            FlightRecorder.Note("client world exit retry requested");
+        }
+
+        private void ClearClientExitNotice()
+        {
+            _clientExitNotice = null;
+            _clientMainMenuFailed = false;
         }
 
         private void PumpClientMainMenu(GameManager manager)
@@ -191,20 +243,28 @@ namespace CS2MultiplayerMod.Game
             // keeps pumping in UIUpdate throughout loading and will enter here afterward.
             if (manager.isGameLoading) return;
 
+            // A save and a main-menu load cannot safely own the same world together. If the
+            // session ends while the player is keeping a copy, finish that copy first.
+            if (ClientWorldSaveInProgress) return;
+
             if (_clientMainMenuTask != null)
             {
                 if (!_clientMainMenuTask.IsCompleted) return;
 
+                string failure;
                 if (_clientMainMenuTask.IsFaulted)
                 {
-                    Exception failure = _clientMainMenuTask.Exception != null
+                    Exception exception = _clientMainMenuTask.Exception != null
                         ? _clientMainMenuTask.Exception.GetBaseException()
                         : null;
-                    _log.Warn("[MP] Returning the disconnected client to the main menu failed" +
-                              (failure != null ? ": " + failure.Message : "."));
+                    failure = exception != null
+                        ? exception.Message
+                        : "the game reported an unknown load failure";
                 }
                 else if (_clientMainMenuTask.IsCanceled)
-                    _log.Warn("[MP] Returning the disconnected client to the main menu was canceled.");
+                    failure = "the game canceled the main-menu load";
+                else
+                    failure = "the main-menu request completed without leaving the world";
 
                 _clientMainMenuTask = null;
                 if (!manager.gameMode.IsGame())
@@ -213,14 +273,11 @@ namespace CS2MultiplayerMod.Game
                     return;
                 }
 
-                // A transient load collision can reject the first request. Retry once on
-                // the following frame; after that, leave the marker intact so the transient
-                // save is not deleted underneath an open world.
-                if (_clientMainMenuAttempts < 2) return;
-                _clientMainMenuPending = false;
-                _log.Error("[MP] Could not close the disconnected client's host world after two attempts.");
+                ScheduleClientMainMenuRetry(failure);
                 return;
             }
+
+            if (NowMs < _clientMainMenuNextAttemptMs) return;
 
             try
             {
@@ -230,19 +287,40 @@ namespace CS2MultiplayerMod.Game
                 // MainMenu changes gameMode before its first asynchronous wait. Its preload
                 // callback normally clears the pending state during the call itself.
                 if (_clientMainMenuPending && manager.gameMode.IsGame())
-                    _clientMainMenuTask = task;
+                {
+                    if (task != null)
+                        _clientMainMenuTask = task;
+                    else
+                        ScheduleClientMainMenuRetry("the game returned no main-menu load task");
+                }
                 else
                     ForgetClientHostWorld();
             }
             catch (Exception ex)
             {
-                _log.Warn("[MP] Could not start the return to the main menu: " + ex.Message);
-                if (_clientMainMenuAttempts >= 2)
-                {
-                    _clientMainMenuPending = false;
-                    _log.Error("[MP] Could not close the disconnected client's host world after two attempts.");
-                }
+                ScheduleClientMainMenuRetry(ex.Message);
             }
+        }
+
+        private void ScheduleClientMainMenuRetry(string failure)
+        {
+            _clientMainMenuTask = null;
+            if (_clientMainMenuAttempts >= ClientMainMenuMaxAttempts)
+            {
+                // Keep ownership marked: PumpTransientCleanup must not delete the save
+                // beneath an open world. The UI stays blocking and offers an explicit retry.
+                _clientMainMenuPending = false;
+                _clientMainMenuFailed = true;
+                _log.Error("[MP] Could not close the disconnected client's host world after " +
+                           ClientMainMenuMaxAttempts + " attempts: " + failure);
+                FlightRecorder.Note("client world exit failed: " + failure);
+                return;
+            }
+
+            _clientMainMenuNextAttemptMs = NowMs + ClientMainMenuRetryDelayMs;
+            _log.Warn("[MP] Returning the disconnected client to the main menu failed (attempt " +
+                      _clientMainMenuAttempts + "/" + ClientMainMenuMaxAttempts + "): " +
+                      failure + ". Retrying.");
         }
 
         private void ForgetClientHostWorld()
@@ -251,6 +329,8 @@ namespace CS2MultiplayerMod.Game
             _clientMainMenuPending = false;
             _clientMainMenuTask = null;
             _clientMainMenuAttempts = 0;
+            _clientMainMenuNextAttemptMs = 0;
+            _clientMainMenuFailed = false;
         }
 
         /// <summary>

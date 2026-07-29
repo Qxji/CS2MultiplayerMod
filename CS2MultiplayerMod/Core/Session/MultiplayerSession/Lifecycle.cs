@@ -155,6 +155,17 @@ namespace CS2MultiplayerMod.Core.Session
 
         public void Stop()
         {
+            Stop("Stopped");
+        }
+
+        /// <summary>
+        /// Tear down locally while preserving a remote close reason for observers. The
+        /// public no-argument Stop keeps its historical "Stopped" detail; clients which
+        /// lose their host use this overload so the game layer can explain why it is
+        /// closing the downloaded host world.
+        /// </summary>
+        private void Stop(string detail)
+        {
             if (_transport != null)
             {
                 _transport.Shutdown();
@@ -184,7 +195,8 @@ namespace CS2MultiplayerMod.Core.Session
             EncryptionActive = false;
             _worldSyncSuspended = false;
             _worldSyncEpoch = 0;
-            SetStatus(SessionStatus.Offline, "Stopped");
+            SetStatus(SessionStatus.Offline,
+                string.IsNullOrWhiteSpace(detail) ? "The connection to the host closed." : detail);
         }
 
     }

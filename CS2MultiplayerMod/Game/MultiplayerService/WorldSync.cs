@@ -256,6 +256,8 @@ namespace CS2MultiplayerMod.Game
             float speed = _worldSyncResumeSpeed;
             _worldSyncBarrierActive = false;
             _activeWorldSyncEpoch = 0;
+            _deferredMapTransferId = 0;
+            _deferredMapData = null;
             _worldSyncHadUsableWorld = false;
             _clientQuiescencePending = false;
             _clientQuiescenceCleanFrames = 0;

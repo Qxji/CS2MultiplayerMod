@@ -81,6 +81,25 @@ namespace CS2MultiplayerMod.Game
                 () => Mod.Service != null ? Mod.Service.WorldSendPercent : -1));
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "inSession",
                 () => Mod.Service != null && Mod.Service.Session.Role != SessionRole.None));
+            // UI append hooks for Menu and Game can briefly coexist while the game swaps
+            // worlds. Give the connection overlay one authoritative surface so only one
+            // blocking screen owns focus during that hand-off.
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "inGameWorld",
+                () => GameManager.instance != null && GameManager.instance.gameMode.IsGame()));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "canSaveClientWorld",
+                () => Mod.Service != null && Mod.Service.CanSaveClientWorld));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "clientWorldSaveStatus",
+                () => Mod.Service != null ? Mod.Service.ClientWorldSaveStatus : "idle"));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "clientWorldSaveName",
+                () => Mod.Service != null ? Mod.Service.ClientWorldSaveName : ""));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "clientExitNoticeActive",
+                () => Mod.Service != null && Mod.Service.ClientExitNoticeActive));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "clientExitReturning",
+                () => Mod.Service != null && Mod.Service.ClientExitReturning));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "clientExitFailed",
+                () => Mod.Service != null && Mod.Service.ClientExitFailed));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "clientExitReason",
+                () => Mod.Service != null ? Mod.Service.ClientExitReason : ""));
 
             // Untested game-version warning: localized sentence when the running build
             // is not in GameVersionCheck.TestedVersions, otherwise "" (banner hidden).
@@ -170,6 +189,12 @@ namespace CS2MultiplayerMod.Game
             {
                 if (Mod.Service != null) Mod.Service.RequestWorldSync();
             }));
+            AddBinding(new TriggerBinding<string>(Group, "saveClientWorld",
+                value => { if (Mod.Service != null) Mod.Service.SaveClientWorldFromUi(value); }));
+            AddBinding(new TriggerBinding(Group, "resetClientWorldSaveStatus", () =>
+            {
+                if (Mod.Service != null) Mod.Service.ResetClientWorldSaveStatusFromUi();
+            }));
 
             // Field edits: written straight into Setting (persisted on Join).
             AddBinding(new TriggerBinding<string>(Group, "setPlayerName",
@@ -190,6 +215,14 @@ namespace CS2MultiplayerMod.Game
             AddBinding(new TriggerBinding(Group, "disconnect", () =>
             {
                 if (Mod.Service != null) Mod.Service.Disconnect();
+            }));
+            AddBinding(new TriggerBinding(Group, "dismissClientExitNotice", () =>
+            {
+                if (Mod.Service != null) Mod.Service.DismissClientExitNotice();
+            }));
+            AddBinding(new TriggerBinding(Group, "retryClientWorldExit", () =>
+            {
+                if (Mod.Service != null) Mod.Service.RetryClientWorldExit();
             }));
 
             Mod.log.Info(nameof(MultiplayerUISystem) + " created (binding group '" + Group + "').");

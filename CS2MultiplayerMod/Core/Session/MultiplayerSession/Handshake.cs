@@ -142,7 +142,7 @@ namespace CS2MultiplayerMod.Core.Session
                 return;
             }
 
-            FinalizeJoin(connection, peer);
+            FinalizeJoin(connection, peer, nowUnixMs);
         }
 
         /// <summary>
@@ -150,10 +150,15 @@ namespace CS2MultiplayerMod.Core.Session
         /// unique, mark the peer authenticated, and announce the arrival to everyone. Shared
         /// by the immediate-accept path and the host's manual approval.
         /// </summary>
-        private void FinalizeJoin(ConnectionId connection, Peer peer)
+        private void FinalizeJoin(ConnectionId connection, Peer peer, long nowUnixMs)
         {
             if (peer.PlayerId == 0) peer.PlayerId = _nextPlayerId++;
             peer.Name = UniquePlayerName(peer.Name);
+            // A manually approved peer may have been silent for longer than the normal
+            // post-handshake timeout while waiting at the approval gate. Start its live
+            // liveness window at admission, before the next reaper pass can classify the
+            // old handshake timestamp as an immediate timeout.
+            peer.LastSeenUnixMs = nowUnixMs;
             peer.AwaitingApproval = false;
             peer.Handshaked = true;
 
@@ -175,7 +180,7 @@ namespace CS2MultiplayerMod.Core.Session
         /// the session filled up in between, the waiting player is declined with that reason
         /// instead. Returns false when no pending join carries this id.
         /// </summary>
-        public bool ApproveJoin(int playerId)
+        public bool ApproveJoin(int playerId, long nowUnixMs)
         {
             if (Role != SessionRole.Host) return false;
             Peer peer = FindPendingJoin(playerId);
@@ -190,7 +195,7 @@ namespace CS2MultiplayerMod.Core.Session
                 return true;
             }
 
-            FinalizeJoin(peer.Connection, peer);
+            FinalizeJoin(peer.Connection, peer, nowUnixMs);
             return true;
         }
 

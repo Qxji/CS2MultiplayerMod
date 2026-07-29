@@ -417,9 +417,9 @@ namespace CS2MultiplayerMod.Game
                     // layer a deferred exit request before clearing the client phase.
                     if (_service._clientHostWorldActive)
                     {
-                        string reason = status == SessionStatus.Faulted && !string.IsNullOrEmpty(detail)
+                        string reason = !string.IsNullOrWhiteSpace(detail) && detail != "Stopped"
                             ? detail
-                            : "the connection to the host closed";
+                            : "The connection to the host closed.";
                         _service.QueueClientMainMenu(reason);
                     }
 

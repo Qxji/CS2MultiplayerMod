@@ -67,6 +67,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private ToolSystem _toolSystem;
         private AreaToolSystem _areaToolSystem;
         private bool _localObjectToolRanThisFrame;
+        private bool _localNetToolRanThisFrame;
         private bool _localObjectApplyThisFrame;
         // The object/upgrade tool that was active until it applied and handed activeTool back to the
         // default tool. Valid for that one frame only - see ObserveLocalToolOutput.
@@ -245,6 +246,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             ClearSpecializedAreaCapture();
             _nativeLifecycleCapturedThisFrame = false;
             _localObjectToolRanThisFrame = false;
+            _localNetToolRanThisFrame = false;
             _localObjectApplyThisFrame = false;
             _switchedAwayObjectTool = null;
             _localLifecycleApplyThisFrame = false;
@@ -318,10 +320,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             bool activeIsLifecycleTool = IsObjectLifecycleTool(active);
-            bool activeIsNetOwnedObjectGraph =
-                active is global::Game.Tools.NetToolSystem &&
-                _cachedLocalObjectOperation != null &&
-                _cachedLocalObjectOperationFromNetTool;
+            _localNetToolRanThisFrame = active is global::Game.Tools.NetToolSystem;
             // Only a hand-back to the default tool is a one-shot apply. Choosing a different build
             // tool is a user action, and its own Apply must never be read as the object tool's.
             global::Game.Tools.ToolBaseSystem lifecycleTool = activeIsLifecycleTool ? active
@@ -332,13 +331,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             bool applying = lifecycleTool != null &&
                             lifecycleTool.applyMode == ApplyMode.Apply;
-            bool netOwnedObjectApplying = activeIsNetOwnedObjectGraph &&
-                                           active.applyMode == ApplyMode.Apply;
             RememberSelectedAssetStampPrefab(lifecycleTool);
             SampleLifecycleToolSeed(lifecycleTool);
-            _localObjectToolRanThisFrame = activeIsLifecycleTool || applying ||
-                                           activeIsNetOwnedObjectGraph;
-            _localObjectApplyThisFrame = applying || netOwnedObjectApplying;
+            _localObjectToolRanThisFrame = activeIsLifecycleTool || applying;
+            _localObjectApplyThisFrame = applying;
             _localLifecycleApplyThisFrame = _localObjectApplyThisFrame;
         }
 
