@@ -81,6 +81,12 @@ namespace CS2MultiplayerMod.Core.Session
         /// <summary>True when hosting beyond the local network (LAN filter off).</summary>
         public bool PublicExposure => Role == SessionRole.Host && _config != null && !_config.LanOnly;
 
+        /// <summary>How the active session reaches its peers (Direct before the first session).</summary>
+        public TransportMode Transport => _config != null ? _config.Transport : TransportMode.Direct;
+
+        /// <summary>True when the active session runs over a relay rather than a direct socket.</summary>
+        public bool UsesRelay => _config != null && _config.Transport == TransportMode.SteamRelay;
+
         /// <summary>TCP port of the active session's config (0 before the first session).</summary>
         public int Port => _config != null ? _config.Port : 0;
 

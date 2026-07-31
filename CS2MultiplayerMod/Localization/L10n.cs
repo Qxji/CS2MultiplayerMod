@@ -101,6 +101,8 @@ namespace CS2MultiplayerMod.Localization
             public const string AccessOpen = "CS2MP.Status.AccessOpen";
             public const string ExposureInternet = "CS2MP.Status.ExposureInternet";
             public const string ExposureLan = "CS2MP.Status.ExposureLan";
+            public const string ExposureRelay = "CS2MP.Status.ExposureRelay";
+            public const string ExposureRelayClient = "CS2MP.Status.ExposureRelayClient";
             public const string WorldNone = "CS2MP.Status.WorldNone";
             public const string WorldHosting = "CS2MP.Status.WorldHosting";
             public const string WorldMapProgress = "CS2MP.Status.WorldMapProgress";
@@ -160,6 +162,20 @@ namespace CS2MultiplayerMod.Localization
             public const string ErrorDeclinedHelp = "CS2MP.Error.Declined.Help";
             public const string ErrorGeneric = "CS2MP.Error.Generic";
             public const string ErrorGenericHelp = "CS2MP.Error.Generic.Help";
+
+            // -- Connection mode --
+            public const string ConnectionRelay = "CS2MP.Connection.Relay";
+            public const string ConnectionDirect = "CS2MP.Connection.Direct";
+            public const string ConnectionMode = "CS2MP.Connection.Mode";
+            public const string JoinCode = "CS2MP.Connection.JoinCode";
+            public const string JoinCodeUnavailable = "CS2MP.Connection.JoinCodeUnavailable";
+            public const string JoinCodeHint = "CS2MP.Connection.JoinCodeHint";
+            public const string JoinCodeSelectHint = "CS2MP.Connection.JoinCodeSelectHint";
+            public const string JoinCodeEntry = "CS2MP.Connection.JoinCodeEntry";
+            public const string JoinCodeEntryHint = "CS2MP.Connection.JoinCodeEntryHint";
+            public const string RelayHint = "CS2MP.Connection.RelayHint";
+            public const string DirectHint = "CS2MP.Connection.DirectHint";
+            public const string RelayUnavailableHint = "CS2MP.Connection.RelayUnavailableHint";
 
             // -- Host tab state line --
             public const string HostLoadCityFirst = "CS2MP.Host.LoadCityFirst";

@@ -1,11 +1,29 @@
+using CS2MultiplayerMod.Core.Networking;
+
 namespace CS2MultiplayerMod.Core.Session
 {
     /// <summary>Immutable parameters used to start a host or join a session.</summary>
     public sealed class MultiplayerConfig
     {
         public readonly string PlayerName;
+
+        /// <summary>Direct mode: the host's address. Relay mode: unused.</summary>
         public readonly string HostAddress;
+
+        /// <summary>Direct mode: the TCP port. Relay mode: unused.</summary>
         public readonly int Port;
+
+        /// <summary>
+        /// How to reach the peers. Relay mode opens no port and needs no forwarding;
+        /// it addresses the host by <see cref="JoinCode"/> instead.
+        /// </summary>
+        public readonly TransportMode Transport;
+
+        /// <summary>
+        /// Relay mode when joining: the host's join code. Ignored in direct mode and
+        /// unused when hosting (a host's own code comes from the relay provider).
+        /// </summary>
+        public readonly string JoinCode;
 
         /// <summary>When hosting: required password (empty = open). When joining: password to present.</summary>
         public readonly string Password;
@@ -46,8 +64,11 @@ namespace CS2MultiplayerMod.Core.Session
         public MultiplayerConfig(string playerName, string hostAddress, int port, string password = "",
                                  bool lanOnly = true, bool useEncryption = true, int maxPlayers = 8,
                                  string modVersion = "", string gameVersion = "", string[] dlcList = null,
-                                 bool requireJoinApproval = false)
+                                 bool requireJoinApproval = false,
+                                 TransportMode transport = TransportMode.Direct, string joinCode = "")
         {
+            Transport = transport;
+            JoinCode = joinCode ?? string.Empty;
             PlayerName = string.IsNullOrEmpty(playerName) ? "Player" : playerName;
             HostAddress = string.IsNullOrEmpty(hostAddress) ? "127.0.0.1" : hostAddress;
             Port = port;

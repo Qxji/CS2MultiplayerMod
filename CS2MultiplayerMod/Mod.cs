@@ -64,7 +64,13 @@ namespace CS2MultiplayerMod
 
             // Stand up the multiplayer core (portable session + game logger adapter) and
             // register the ECS system that pumps it once per simulation tick.
-            Service = new MultiplayerService(new ColossalModLogger(log));
+            var coreLog = new ColossalModLogger(log);
+
+            // Offer Steam's relay as a hosting backend. Availability is decided here once;
+            // when Steam is absent the mod simply keeps to direct connections.
+            Core.Networking.Steam.SteamRelayProvider.Register(coreLog);
+
+            Service = new MultiplayerService(coreLog);
             FlightRecorder.Note("startup-stage service-created");
             log.Info("Multiplayer core initialised. Protocol v" +
                      CS2MultiplayerMod.Core.Protocol.ProtocolConstants.ProtocolVersion +

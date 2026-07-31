@@ -1,4 +1,5 @@
 using System;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
 
@@ -66,6 +67,12 @@ namespace CS2MultiplayerMod.Game
         {
             get
             {
+                // A relay session has no exposure to describe: nothing on this machine is
+                // reachable, so the useful line is the code players need instead.
+                if (_session.UsesRelay && _session.Role == SessionRole.Host)
+                    return L10n.F(L10n.Key.ExposureRelay, RelayProvider.LocalJoinCode);
+                if (_session.UsesRelay && _session.Role == SessionRole.Client)
+                    return L10n.T(L10n.Key.ExposureRelayClient);
                 if (_session.Role == SessionRole.Host)
                     return L10n.T(_session.PublicExposure ? L10n.Key.ExposureInternet : L10n.Key.ExposureLan);
                 if (_session.Role == SessionRole.Client) return L10n.T(L10n.Key.ConnectedToHost);

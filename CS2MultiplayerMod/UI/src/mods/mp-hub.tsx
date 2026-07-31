@@ -3,6 +3,13 @@ import { InputActionBarrier } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
 import { Button, Portal, Tooltip } from "cs2/ui";
+import {
+    CONNECTION_DIRECT,
+    CONNECTION_LOC,
+    CONNECTION_RELAY,
+    ConnectionSegmented,
+    JoinCodeDisplay,
+} from "mods/connection-picker";
 import { CSSProperties, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
 import { TransferProgress } from "mods/transfer-progress";
@@ -21,6 +28,7 @@ const LOC = {
     noMessages: "CS2MP.UI.NoMessages",
     hostSession: "CS2MP.UI.HostSession",
     lanOnly: "CS2MP.UI.LanOnly",
+    ...CONNECTION_LOC,
     maxPlayers: "CS2MP.UI.MaxPlayers",
     resyncMinutes: "CS2MP.UI.ResyncMinutes",
     syncWorld: "CS2MP.UI.SyncWorld",
@@ -88,6 +96,9 @@ const progressMode$ = bindValue<string>(GROUP, "progressMode", "none");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const playerName$ = bindValue<string>(GROUP, "playerName", "Player");
+const hostConnection$ = bindValue<string>(GROUP, "hostConnection", "relay");
+const sessionUsesRelay$ = bindValue<boolean>(GROUP, "sessionUsesRelay", false);
+const joinCode$ = bindValue<string>(GROUP, "joinCode", "");
 const hostPort$ = bindValue<string>(GROUP, "hostPort", "25001");
 const hostPassword$ = bindValue<string>(GROUP, "hostPassword", "");
 const maxPlayers$ = bindValue<string>(GROUP, "maxPlayers", "8");
@@ -791,6 +802,13 @@ const SettingsFields = () => {
     const lanOnly = useValue(lanOnly$);
     const requireApproval = useValue(requireApproval$);
     const resyncMinutes = useValue(resyncMinutes$);
+    const hostConnection = useValue(hostConnection$);
+    const sessionUsesRelay = useValue(sessionUsesRelay$);
+    const joinCode = useValue(joinCode$);
+
+    // In a live session follow what it actually runs on; outside one, what is
+    // configured for the next.
+    const relay = inSession ? sessionUsesRelay : hostConnection !== CONNECTION_DIRECT;
 
     return (
         <>
@@ -800,12 +818,29 @@ const SettingsFields = () => {
                 disabled={inSession}
                 onChange={(v) => trigger(GROUP, "setPlayerName", v)}
             />
-            <HubField
-                label={t(LOC.port, "Port")}
-                value={hostPort}
-                disabled={inSession}
-                onChange={(v) => trigger(GROUP, "setHostPort", v)}
-            />
+            <div style={styles.row}>
+                <div style={styles.label}>{t(LOC.mode, "Connection")}</div>
+                <ConnectionSegmented
+                    value={relay ? CONNECTION_RELAY : CONNECTION_DIRECT}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setHostConnection", v)}
+                />
+            </div>
+            {/* A relay session has no port to show; the code is what a host passes on.
+                Read-only and select-on-click - the game exposes no clipboard API. */}
+            {relay ? (
+                <div style={styles.row}>
+                    <div style={styles.label}>{t(LOC.joinCode, "Join Code")}</div>
+                    <JoinCodeDisplay code={joinCode} style={styles.input} />
+                </div>
+            ) : (
+                <HubField
+                    label={t(LOC.port, "Port")}
+                    value={hostPort}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setHostPort", v)}
+                />
+            )}
             <HubField
                 label={t(LOC.password, "Password")}
                 secret
@@ -819,12 +854,16 @@ const SettingsFields = () => {
                 disabled={inSession}
                 onChange={(v) => trigger(GROUP, "setMaxPlayers", v)}
             />
-            <HubToggle
-                label={t(LOC.lanOnly, "LAN Only")}
-                value={lanOnly}
-                disabled={inSession}
-                onChange={(v) => trigger(GROUP, "setLanOnly", v)}
-            />
+            {/* Nothing on this machine is reachable over a relay, so there is no
+                exposure for the LAN filter to narrow. */}
+            {!relay && (
+                <HubToggle
+                    label={t(LOC.lanOnly, "LAN Only")}
+                    value={lanOnly}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setLanOnly", v)}
+                />
+            )}
             <HubToggle
                 label={t(LOC.requireApproval, "Approve Players")}
                 value={requireApproval}
