@@ -18,13 +18,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     {
         private void RealizeObjectDeletes(List<(ObjectDeleteCommand cmd, long deadline)> commands, long now)
         {
-            // Resolve prefab names once; an unknown prefab (Entity.Null) still allows the
-            // building fallback below to match a levelled growable.
+            // Resolve prefab names once, restricted to object prefabs: net, area and stamp
+            // collections can expose the same display name, and resolving to one of those left
+            // every comparison below unable to match anything the tree could return.
             var targets = new List<(Entity prefab, float3 pos, string name)>();
             for (int i = 0; i < commands.Count; i++)
             {
                 Entity prefab;
-                _prefabIndex.TryResolve(commands[i].cmd.PrefabName, out prefab);
+                _prefabIndex.TryResolve(commands[i].cmd.PrefabName, IsObjectPrefab, out prefab);
                 targets.Add((prefab, new float3(commands[i].cmd.PosX, commands[i].cmd.PosY, commands[i].cmd.PosZ),
                     commands[i].cmd.PrefabName));
             }
@@ -33,29 +34,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             float radiusSq = ObjectMatchRadius * ObjectMatchRadius;
             int deleted = 0, deletedOwned = 0, waiting = 0, expired = 0;
 
-            // Candidates are top-level objects plus live owned service upgrades. A removal aimed at
-            // one upgrade has to find that owned entity; the cross-prefab growable fallback below
-            // cannot reach it, because an upgrade is not a spawnable building.
-            NativeArray<Entity> topLevel = _liveObjects.ToEntityArray(Allocator.Temp);
-            NativeArray<Entity> ownedUpgrades = _liveOwnedUpgrades.IsEmptyIgnoreFilter
-                ? default(NativeArray<Entity>)
-                : _liveOwnedUpgrades.ToEntityArray(Allocator.Temp);
-            int ownedCount = ownedUpgrades.IsCreated ? ownedUpgrades.Length : 0;
-            int n = topLevel.Length + ownedCount;
-            var entities = new NativeArray<Entity>(n, Allocator.Temp);
-            var positions = new NativeArray<float3>(n, Allocator.Temp);
-            var prefabs = new NativeArray<Entity>(n, Allocator.Temp);
+            // Candidates come from the game's object search tree (see ObjectSearch), which covers
+            // Object+Static and drops Deleted entries — exactly the top-level objects and owned
+            // upgrades this match used to walk the whole object domain to find.
+            var candidates = new NativeList<Entity>(64, Allocator.Temp);
             var taken = new HashSet<Entity>();
             try
             {
-                for (int i = 0; i < topLevel.Length; i++) entities[i] = topLevel[i];
-                for (int i = 0; i < ownedCount; i++) entities[topLevel.Length + i] = ownedUpgrades[i];
-                for (int i = 0; i < n; i++)
-                {
-                    positions[i] = EntityManager.GetComponentData<Transform>(entities[i]).m_Position;
-                    prefabs[i] = EntityManager.GetComponentData<PrefabRef>(entities[i]).m_Prefab;
-                }
-
                 for (int t = 0; t < targets.Count; t++)
                 {
                     // The cross-prefab fallback exists for ONE case: a growable that levelled up
@@ -71,24 +56,30 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     float bestDistSq = radiusSq;
                     bool bestExact = false;
 
-                    for (int i = 0; i < n; i++)
-                    {
-                        Entity e = entities[i];
-                        if (taken.Contains(e)) continue;
+                    _objectSearch.CollectNear(targets[t].pos, ObjectMatchRadius, candidates);
 
-                        float d = math.distancesq(targets[t].pos, positions[i]);
+                    for (int i = 0; i < candidates.Length; i++)
+                    {
+                        Entity e = candidates[i];
+                        if (taken.Contains(e)) continue;
+                        if (!IsDeleteCandidate(e)) continue;
+
+                        float3 position = EntityManager.GetComponentData<Transform>(e).m_Position;
+                        float d = math.distancesq(targets[t].pos, position);
                         if (d > radiusSq) continue;
 
-                        bool exact = targets[t].prefab != Entity.Null && prefabs[i] == targets[t].prefab;
+                        Entity candidatePrefab = EntityManager.GetComponentData<PrefabRef>(e).m_Prefab;
+                        bool exact = targets[t].prefab != Entity.Null &&
+                                     candidatePrefab == targets[t].prefab;
                         if (!exact && !(growableCmd
                             && EntityManager.HasComponent<Building>(e)
-                            && EntityManager.HasComponent<SpawnableObjectData>(prefabs[i]))) continue;
+                            && EntityManager.HasComponent<SpawnableObjectData>(candidatePrefab))) continue;
 
                         // Prefer an exact prefab match; within the same category prefer the nearest.
                         bool better = best == Entity.Null
                             || (exact && !bestExact)
                             || (exact == bestExact && d < bestDistSq);
-                        if (better) { best = e; bestPrefab = prefabs[i]; bestDistSq = d; bestExact = exact; }
+                        if (better) { best = e; bestPrefab = candidatePrefab; bestDistSq = d; bestExact = exact; }
                     }
 
                     if (best != Entity.Null)
@@ -148,16 +139,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         _objectRetry.Add(commands[t]);
                         waiting++;
                     }
-                    else expired++;
+                    else
+                    {
+                        expired++;
+                        // Name the target: a delete that never finds a victim means the two cities
+                        // disagree about what stands here, and the prefab says which kind.
+                        Mod.log.Warn("[MP] DeleteSync: no local match for '" + targets[t].name +
+                                     "' at " + targets[t].pos + " within " + ObjectMatchRadius +
+                                     "m (" + candidates.Length + " object(s) in range, prefab " +
+                                     (targets[t].prefab == Entity.Null ? "unknown here" : "resolved") +
+                                     "); dropping this delete.");
+                    }
                 }
             }
             finally
             {
-                positions.Dispose();
-                prefabs.Dispose();
-                entities.Dispose();
-                topLevel.Dispose();
-                if (ownedUpgrades.IsCreated) ownedUpgrades.Dispose();
+                candidates.Dispose();
             }
 
             if (deleted > 0 || waiting > 0 || expired > 0)
@@ -234,6 +231,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             reason = null;
             return true;
+        }
+
+        /// <summary>
+        /// The candidate pools the match runs against: live top-level objects, plus owned service
+        /// upgrades so a removal aimed at one can reach that owned entity (the cross-prefab growable
+        /// fallback cannot, because an upgrade is not a spawnable building).
+        /// </summary>
+        private bool IsDeleteCandidate(Entity entity)
+        {
+            if (!EntityManager.Exists(entity)) return false;
+            if (EntityManager.HasComponent<Deleted>(entity) ||
+                EntityManager.HasComponent<Temp>(entity)) return false;
+            if (!EntityManager.HasComponent<Transform>(entity) ||
+                !EntityManager.HasComponent<PrefabRef>(entity)) return false;
+            if (!EntityManager.HasComponent<Owner>(entity)) return true;
+            return EntityManager.HasComponent<global::Game.Buildings.ServiceUpgrade>(entity) ||
+                   EntityManager.HasComponent<Extension>(entity);
+        }
+
+        /// <summary>Restricts a name lookup to the object collection. See RealizeObjectDeletes.</summary>
+        private bool IsObjectPrefab(Entity prefab)
+        {
+            return EntityManager.HasComponent<ObjectData>(prefab);
         }
 
         private bool ValidateOwnedDeleteElement(Entity expectedOwner, Entity child, out string reason)

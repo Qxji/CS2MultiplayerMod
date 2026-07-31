@@ -31,7 +31,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
         private EntityQuery _movedObjects;
-        private EntityQuery _liveObjects;
+        private ObjectSearch _objectSearch;
         private CommandObserver _observer;
         private bool _hasBlockedMove;
         private SimulationCommandMessage _blockedMove;
@@ -65,21 +65,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 },
             });
 
-            _liveObjects = GetEntityQuery(new EntityQueryDesc
-            {
-                All = new[]
-                {
-                    ComponentType.ReadOnly<PrefabRef>(),
-                    ComponentType.ReadOnly<Transform>(),
-                },
-                None = new[]
-                {
-                    ComponentType.ReadOnly<Temp>(),
-                    ComponentType.ReadOnly<Owner>(),
-                    ComponentType.ReadOnly<Deleted>(),
-                    ComponentType.ReadOnly<global::Game.Net.Edge>(),
-                },
-            });
+            // A blocked move re-runs FindAt every frame until its retry window closes; that lookup
+            // goes through the game's object search tree, not a query over the object domain.
+            _objectSearch = new ObjectSearch(
+                World.GetOrCreateSystemManaged<global::Game.Objects.SearchSystem>());
 
             if (Mod.Service != null)
             {
@@ -410,12 +399,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Entity bestSeedMatch = Entity.Null;
             float bestDistanceSq = float.MaxValue;
             float bestSeedDistanceSq = float.MaxValue;
-            NativeArray<Entity> candidates = _liveObjects.ToEntityArray(Allocator.Temp);
+            // The distance test below rejects past 2 m, so the tree only has to be asked about
+            // that neighbourhood. The tree carries owned sub-objects the old query excluded, so
+            // the Owner/Edge/liveness filtering that query did moves into the loop.
+            var candidates = new NativeList<Entity>(16, Allocator.Temp);
             try
             {
+                _objectSearch.CollectNear(position, FindRadius, candidates);
                 for (int i = 0; i < candidates.Length; i++)
                 {
                     Entity candidate = candidates[i];
+                    if (!IsMoveCandidate(candidate)) continue;
                     if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab) continue;
                     if (requireAttachment &&
                         NetAttachment.GetNetParent(EntityManager, candidate) != attachmentParent)
@@ -423,7 +417,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
                     float3 pos = EntityManager.GetComponentData<Transform>(candidate).m_Position;
                     float distanceSq = math.distancesq(pos, position);
-                    if (distanceSq > 4f) continue;
+                    if (distanceSq > FindRadius * FindRadius) continue;
 
                     if (distanceSq < bestDistanceSq)
                     {
@@ -446,6 +440,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // Seed is a strong discriminator for adjacent identical props, but position remains a
             // compatibility fallback for old/save-created entities whose seed drifted historically.
             return bestSeedMatch != Entity.Null ? bestSeedMatch : best;
+        }
+
+        /// <summary>How far a relocation's endpoint may sit from the entity it names (metres).</summary>
+        private const float FindRadius = 2f;
+
+        /// <summary>The live top-level objects the old candidate query selected.</summary>
+        private bool IsMoveCandidate(Entity entity)
+        {
+            if (!EntityManager.Exists(entity)) return false;
+            if (EntityManager.HasComponent<Temp>(entity) ||
+                EntityManager.HasComponent<Owner>(entity) ||
+                EntityManager.HasComponent<Deleted>(entity) ||
+                EntityManager.HasComponent<global::Game.Net.Edge>(entity)) return false;
+            return EntityManager.HasComponent<PrefabRef>(entity) &&
+                   EntityManager.HasComponent<Transform>(entity);
         }
 
         private static bool TryResolveAttachment(BuildSyncSystem buildSync, bool known,

@@ -19,8 +19,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     /// <summary>
     /// Replicates deletions (bulldozing) bidirectionally: detect <see cref="Deleted"/> at
     /// ModificationEnd, broadcast delete command (prefab + position). Realize at ToolUpdate
-    /// via <see cref="SyncRealizeSystem"/>, add <see cref="Deleted"/> tag. Echo-guarded,
-    /// includes sim-triggered demolitions.
+    /// via <see cref="SyncRealizeSystem"/>, add <see cref="Deleted"/> tag. Echo-guarded.
+    /// Objects whose lifecycle belongs to the simulation are excluded, mirroring the rule
+    /// BuildSyncSystem already applies to their creation — see <see cref="IsSimulationOwnedLifecycle"/>.
     /// </summary>
     public partial class DeleteSyncSystem : GameSystemBase
     {
@@ -50,16 +51,20 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private readonly List<(NetDeleteCommand cmd, long deadline)> _edgeRetry =
             new List<(NetDeleteCommand, long)>();
 
+        // Originals named by a tool's Temp transaction this frame — the difference between a
+        // player bulldozing something and the simulation retiring it on its own.
+        private readonly HashSet<Entity> _toolDeleteOriginals = new HashSet<Entity>();
+
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
         private NetSyncSystem _netSync;
+        private ObjectSearch _objectSearch;
+        private EntityQuery _toolDeleteTemps;
         private EntityQuery _deletedObjects;
         private EntityQuery _deletedOwnedUpgrades;
-        private EntityQuery _liveOwnedUpgrades;
         private EntityQuery _deletedEdges;
         private EntityQuery _createdEdges;
         private EntityQuery _updatedEdges;
-        private EntityQuery _liveObjects;
         private EntityQuery _liveEdges;
         private CommandObserver _observer;
 
@@ -72,6 +77,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _prefabIndex = new PrefabIndex(_prefabSystem, GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
             // Edge deletes are committed through NetSync's ApplyTool pipeline (see RealizeEdgeDeletes).
             _netSync = World.GetOrCreateSystemManaged<NetSyncSystem>();
+            // Realizing a remote delete asks "what stands at this point" — see ObjectSearch.
+            _objectSearch = new ObjectSearch(
+                World.GetOrCreateSystemManaged<global::Game.Objects.SearchSystem>());
+
+            // Tool output still standing this frame. A bulldoze (and any tool that removes an
+            // object as part of its transaction) reaches the victim through a Temp carrying
+            // TempFlags.Delete; a simulation-driven removal has no such lineage.
+            _toolDeleteTemps = GetEntityQuery(ComponentType.ReadOnly<Temp>());
 
             // Top-level objects being deleted this frame. Temp excludes tool previews;
             // Owner keeps the dependent object graph off the wire because realization traverses
@@ -100,28 +113,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // Owned service upgrades removed on their own (the building properties panel tags just
             // that entity Deleted - no tool involved). See IsStandaloneUpgradeRemoval for why a host
             // delete's children are not published here.
-            // Live owned service upgrades, so a removal aimed at one can find it (see Realize).
-            _liveOwnedUpgrades = GetEntityQuery(new EntityQueryDesc
-            {
-                All = new[]
-                {
-                    ComponentType.ReadOnly<PrefabRef>(),
-                    ComponentType.ReadOnly<Transform>(),
-                    ComponentType.ReadOnly<Owner>(),
-                },
-                Any = new[]
-                {
-                    ComponentType.ReadOnly<global::Game.Buildings.ServiceUpgrade>(),
-                    ComponentType.ReadOnly<global::Game.Buildings.Extension>(),
-                },
-                None = new[]
-                {
-                    ComponentType.ReadOnly<Temp>(),
-                    ComponentType.ReadOnly<Deleted>(),
-                    ComponentType.ReadOnly<Edge>(),
-                },
-            });
-
             _deletedOwnedUpgrades = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[]
@@ -204,26 +195,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 },
             });
 
-            // Lookup pools for realizing remote deletes (scan + match by prefab/position).
-            // Vehicles/creatures excluded to mirror the capture query above.
-            _liveObjects = GetEntityQuery(new EntityQueryDesc
-            {
-                All = new[]
-                {
-                    ComponentType.ReadOnly<PrefabRef>(),
-                    ComponentType.ReadOnly<Transform>(),
-                },
-                None = new[]
-                {
-                    ComponentType.ReadOnly<Temp>(),
-                    ComponentType.ReadOnly<Owner>(),
-                    ComponentType.ReadOnly<Deleted>(),
-                    ComponentType.ReadOnly<Edge>(),
-                    ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
-                    ComponentType.ReadOnly<global::Game.Creatures.Creature>(),
-                },
-            });
-
+            // Remote object deletes match against the game's object search tree, not a query —
+            // see RealizeObjectDeletes. Edges have no equivalent pool small enough to matter.
             _liveEdges = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[]

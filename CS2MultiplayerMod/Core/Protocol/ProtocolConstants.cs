@@ -4,7 +4,10 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v32 sends a stamped intersection as the inputs its tool had - asset-stamp prefab,
+        /// Current v33 carries each endpoint's committed elevation on a geometry-only net placement,
+        /// so a span replayed without captured tool intent keeps the height it was built at instead
+        /// of being re-derived against the receiver's surface (over water: the lakebed).
+        /// v32 sends a stamped intersection as the inputs its tool had - asset-stamp prefab,
         /// one control point, and the tool seed - so the receiver regenerates the graph with the
         /// game's own generator. Replaying the finished definitions could not preserve the stamp's
         /// internal junctions: courses share a node only on an exact endpoint-position match.
@@ -49,7 +52,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 32;
+        public const int ProtocolVersion = 33;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

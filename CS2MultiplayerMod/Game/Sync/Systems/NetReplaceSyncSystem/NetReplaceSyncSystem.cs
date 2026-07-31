@@ -435,11 +435,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             float tMin = math.min(tA, tD);
             float tMax = math.max(tA, tD);
 
-            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(0f, tMin)));
-            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(tMax, 1f)));
+            // Each piece keeps the elevation of the merged edge end it grew from - a piece that
+            // travelled as elevation 0 would be rebuilt as a ground net and snapped to the terrain.
+            Edge ends = EntityManager.GetComponentData<Edge>(edge);
+            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(0f, tMin)),
+                NodeElevation(ends.m_Start));
+            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(tMax, 1f)),
+                NodeElevation(ends.m_End));
         }
 
-        private void TrySendExtensionPiece(MultiplayerSession session, Entity edge, Entity prefab, Bezier4x3 piece)
+        private void TrySendExtensionPiece(MultiplayerSession session, Entity edge, Entity prefab,
+            Bezier4x3 piece, float2 elevation)
         {
             float length = MathUtils.Length(piece);
             if (length < MinExtensionLength) return;
@@ -466,6 +472,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Cx = piece.c.x, Cy = piece.c.y, Cz = piece.c.z,
                 Dx = piece.d.x, Dy = piece.d.y, Dz = piece.d.z,
                 Length = length,
+                Start = { ElevationLeft = elevation.x, ElevationRight = elevation.y },
+                End = { ElevationLeft = elevation.x, ElevationRight = elevation.y },
             };
             session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
             Mod.Verbose("[MP] NetReplaceSync: captured merged continuation of '" + name + "' (" +

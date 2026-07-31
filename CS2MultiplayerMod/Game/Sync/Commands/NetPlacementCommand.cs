@@ -65,6 +65,15 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public const int MaxEncodedBytes = 4096;
         public const int MaxCoursesPerOperation = 1024;
 
+        /// <summary>
+        /// Shortest course that carries geometry rather than being a cursor marker. Capture and
+        /// realize must use the SAME value: a course the sender drops is a link the receiver never
+        /// hears about, and coincident course endpoints only become one node on an exact position
+        /// match - so a dropped link leaves two ends a fraction of a metre apart, looking continuous
+        /// and being two disconnected nets.
+        /// </summary>
+        public const float MinCourseLength = 0.1f;
+
         private const uint KnownCoursePosFlags = 0x7fffu;
         private const uint KnownCreationFlags = 0xfffffu;
 
@@ -107,7 +116,17 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             WriteCurve(w, Ax, Ay, Az, Bx, By, Bz, Cx, Cy, Cz, Dx, Dy, Dz);
             w.WriteFloat(Length);
 
-            if (!HasNativeCourse) return;
+            if (!HasNativeCourse)
+            {
+                // Elevation travels even without captured intent. An endpoint that arrives as 0 is
+                // committed as a ground net and the generator snaps its curve end to the terrain -
+                // which over water is the lakebed, not the surface the span was drawn above.
+                w.WriteFloat(Start.ElevationLeft);
+                w.WriteFloat(Start.ElevationRight);
+                w.WriteFloat(End.ElevationLeft);
+                w.WriteFloat(End.ElevationRight);
+                return;
+            }
 
             w.WriteInt(RandomSeed);
             w.WriteInt(unchecked((int)CreationFlags));
@@ -151,6 +170,13 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                     throw new ProtocolException("Implausible fixed-net index " + FixedIndex + ".");
                 Start = ReadEndpoint(r);
                 End = ReadEndpoint(r);
+            }
+            else
+            {
+                Start.ElevationLeft = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                Start.ElevationRight = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                End.ElevationLeft = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                End.ElevationRight = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
             }
 
             if (r.Remaining != 0)

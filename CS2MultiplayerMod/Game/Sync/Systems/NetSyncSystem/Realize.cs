@@ -215,11 +215,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     ownedNodeData = _ownedNodes.ToComponentDataArray<Node>(Allocator.Temp);
                     ownedEdgeEntities = _ownedEdges.ToEntityArray(Allocator.Temp);
                     ownedEdgeCurves = _ownedEdges.ToComponentDataArray<Curve>(Allocator.Temp);
-                    _terrainSystem.GetHeightData(waitForPending: true);
-                    heightData = _terrainSystem.GetHeightData(waitForPending: true);
-                    JobHandle preflightWaterDeps;
-                    waterData = _waterSystem.GetSurfaceData(out preflightWaterDeps);
-                    preflightWaterDeps.Complete();
+                    TakeSurfaceSnapshot(ref heightData, ref waterData);
                     haveSnapshot = true;
 
                     // The game resolves nearby network geometry through its quadtree. Use the same
@@ -291,10 +287,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         float measuredLength = MathUtils.Length(curve);
                         const uint pointFlags = (uint)(global::Game.Tools.CoursePosFlags.IsFirst |
                                                        global::Game.Tools.CoursePosFlags.IsLast);
-                        bool nativePoint = measuredLength < 0.1f &&
+                        bool nativePoint = measuredLength < NetPlacementCommand.MinCourseLength &&
                                            (command.Start.Flags & pointFlags) == pointFlags &&
                                            (command.End.Flags & pointFlags) == pointFlags;
-                        if (!math.isfinite(measuredLength) || (measuredLength < 0.1f && !nativePoint))
+                        if (!math.isfinite(measuredLength) ||
+                            (measuredLength < NetPlacementCommand.MinCourseLength && !nativePoint))
                         {
                             Mod.log.Warn("[MP] NetSync: native operation " + command.OperationId +
                                          " contains a degenerate course; dropping the whole operation.");
@@ -490,7 +487,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         };
                         measuredLength = MathUtils.Length(bezier);
                         nativePoint = false;
-                        if (!math.isfinite(measuredLength) || measuredLength < 0.1f)
+                        if (!math.isfinite(measuredLength) ||
+                            measuredLength < NetPlacementCommand.MinCourseLength)
                         {
                             Mod.log.Warn("[MP] NetSync realize: degenerate fallback course for '" +
                                          command.PrefabName + "'; skipping.");
@@ -514,14 +512,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         ownedNodeData = _ownedNodes.ToComponentDataArray<Node>(Allocator.Temp);
                         ownedEdgeEntities = _ownedEdges.ToEntityArray(Allocator.Temp);
                         ownedEdgeCurves = _ownedEdges.ToComponentDataArray<Curve>(Allocator.Temp);
-                        // Surface samplers for the courses' endpoint elevations (see EndElevation).
-                        // The water dependency completes here so the data is main-thread readable;
-                        // between simulation steps the handle is already complete.
-                        _terrainSystem.GetHeightData(waitForPending: true);
-                        heightData = _terrainSystem.GetHeightData(waitForPending: true);
-                        JobHandle waterDeps;
-                        waterData = _waterSystem.GetSurfaceData(out waterDeps);
-                        waterDeps.Complete();
+                        TakeSurfaceSnapshot(ref heightData, ref waterData);
                         haveSnapshot = true;
                     }
 
@@ -606,14 +597,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                             batchNewNodes, batchEdges, out endT, out endKind);
                     }
 
-                    // The elevation each course end must carry (a reused node's committed value, or
-                    // derived from the transmitted Y against the local surface — see EndElevation).
-                    float2 startElevation = command.HasNativeCourse
-                        ? new float2(command.Start.ElevationLeft, command.Start.ElevationRight)
-                        : EndElevation(prefab, startSnap, startKind, a, ref heightData, ref waterData);
-                    float2 endElevation = command.HasNativeCourse
-                        ? new float2(command.End.ElevationLeft, command.End.ElevationRight)
-                        : EndElevation(prefab, endSnap, endKind, d, ref heightData, ref waterData);
+                    // The elevation each course end must carry so it lands at the source's height on
+                    // this machine's surface (see EndElevation).
+                    float startCorrection, endCorrection;
+                    float2 startElevation = EndElevation(prefab, startSnap, startKind, a,
+                        new float2(command.Start.ElevationLeft, command.Start.ElevationRight),
+                        ref heightData, ref waterData, out startCorrection);
+                    float2 endElevation = EndElevation(prefab, endSnap, endKind, d,
+                        new float2(command.End.ElevationLeft, command.End.ElevationRight),
+                        ref heightData, ref waterData, out endCorrection);
+                    TallySurfaceCorrection(startCorrection, endCorrection);
 
                     // A captured native operation is the exact set the source applied together, so
                     // its courses stay together even when one references geometry another course in
@@ -651,7 +644,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Entity definition;
                         if (command.HasNativeCourse)
                             definition = CreateNativeCourse(prefab, command, bezier,
-                                startSnap, startT, startKind, endSnap, endT, endKind);
+                                startSnap, startT, startKind, startElevation,
+                                endSnap, endT, endKind, endElevation);
                         else
                             definition = CreateCourse(prefab, bezier, command.Length,
                                 startSnap, startT, endSnap, endT,
@@ -1253,6 +1247,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 case KindSplit: _rzMidEnds++; break;
                 default: _rzFreeEnds++; break;
             }
+        }
+
+        private void TallySurfaceCorrection(float start, float end)
+        {
+            if (start != 0f) { _rzSurfaceCorrections++; _rzSurfaceCorrectionMax = math.max(_rzSurfaceCorrectionMax, math.abs(start)); }
+            if (end != 0f) { _rzSurfaceCorrections++; _rzSurfaceCorrectionMax = math.max(_rzSurfaceCorrectionMax, math.abs(end)); }
+        }
+
+        /// <summary>
+        /// Read this frame's terrain and water surfaces once per realize cycle. The water dependency
+        /// completes here so the data is main-thread readable; between simulation steps the handle is
+        /// already complete.
+        /// </summary>
+        private void TakeSurfaceSnapshot(ref TerrainHeightData heightData,
+            ref WaterSurfaceData<SurfaceWater> waterData)
+        {
+            heightData = _terrainSystem.GetHeightData(waitForPending: true);
+            JobHandle waterDeps;
+            waterData = _waterSystem.GetSurfaceData(out waterDeps);
+            waterDeps.Complete();
         }
 
         /// <summary>

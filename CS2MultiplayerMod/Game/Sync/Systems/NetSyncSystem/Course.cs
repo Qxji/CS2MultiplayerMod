@@ -113,7 +113,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             return best;
         }
 
-        /// <summary>Cached native connection/elevation/width facts for one net prefab.</summary>
+        /// <summary>Cached native connection/width facts for one net prefab.</summary>
         private NetPrefabInfo NetInfoOf(Entity prefab)
         {
             NetPrefabInfo info;
@@ -127,14 +127,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (EntityManager.HasComponent<PlaceableNetData>(prefab))
             {
                 PlaceableNetData placeable = EntityManager.GetComponentData<PlaceableNetData>(prefab);
-                Bounds1 range = placeable.m_ElevationRange;
-                info.ElevMin = range.min;
-                info.ElevMax = range.max;
                 info.SnapDistance = math.max(placeable.m_SnapDistance, 1f);
-                info.Placeable = true;
             }
             if (EntityManager.HasComponent<NetGeometryData>(prefab))
-                info.HalfWidth = EntityManager.GetComponentData<NetGeometryData>(prefab).m_DefaultWidth * 0.5f;
+            {
+                NetGeometryData geometry = EntityManager.GetComponentData<NetGeometryData>(prefab);
+                info.HalfWidth = geometry.m_DefaultWidth * 0.5f;
+                info.ElevationLimit = geometry.m_ElevationLimit;
+            }
             _netInfoCache[prefab] = info;
             return info;
         }
@@ -165,34 +165,52 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         /// <summary>
-        /// The elevation (height above/below the local surface, the game's
-        /// <see cref="global::Game.Net.Elevation"/> convention) a course endpoint must carry. A reused
-        /// node's committed elevation is exact - a pylon or building connector keeps its height.
-        /// Otherwise it is derived from the transmitted Y against the LOCAL terrain (which is
-        /// synced, so it equals the sender's): negative = underground (pipes, ground cables);
-        /// positive is re-measured against the water surface where there is water, exactly like
-        /// the net tool (a bridge over a lake is "+5", not "lakebed + 40"). Road-like nets (their
-        /// allowed elevation range spans 0) get a dead zone: a committed ground road's Y deviates
-        /// from pre-build terrain by the game's own slope grading, which must stay elevation 0 -
-        /// fixed-elevation nets (power lines, pipes) skip it, their offset IS the placement.
+        /// The height a course endpoint's elevation is measured from, reproduced exactly as course
+        /// splitting does it: the terrain, or - where the water is deep enough to bridge - the water
+        /// surface plus the prefab's bridge clearance. A tunnel end (elevation below -1) ignores
+        /// water entirely.
         /// </summary>
-        private float2 EndElevation(Entity prefab, Entity snap, int kind, float3 p,
+        private static float SurfaceHeightAt(float3 p, float elevation, float elevationLimit,
             ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData)
         {
+            float terrain, water, depth;
+            WaterUtils.SampleHeight(ref waterData, ref heightData, p, out terrain, out water, out depth);
+            water = depth < 0.2f ? terrain : water + elevationLimit * 2f;
+            return elevation < -1f ? terrain : math.max(terrain, water);
+        }
+
+        /// <summary>
+        /// The elevation a course endpoint must carry to land at the height the source committed it
+        /// at. A reused node's own elevation wins - a pylon or building connector keeps the height it
+        /// already has.
+        /// <para>
+        /// The transmitted Y is NOT what the endpoint ends up at. Unless it is a full elevation step
+        /// up or down, course splitting recomputes the endpoint as <c>local surface + elevation</c>,
+        /// so the elevation - not the height - is what the receiver actually controls. Where the two
+        /// machines' surfaces agree the source value is used untouched (a ground net stays at exactly
+        /// 0, so the terrain still grades to it). Where they disagree the value is corrected by the
+        /// difference, which is what preserves the absolute height: over water the surface is a live,
+        /// unreplicated simulation field, and measuring against the local one lands the span metres
+        /// off - or, at elevation 0, on the lakebed.
+        /// </para>
+        /// </summary>
+        private float2 EndElevation(Entity prefab, Entity snap, int kind, float3 sourcePoint,
+            float2 sourceElevation, ref TerrainHeightData heightData,
+            ref WaterSurfaceData<SurfaceWater> waterData, out float correction)
+        {
+            correction = 0f;
             if ((kind == KindReuseNode || kind == KindReuseConnector) &&
                 EntityManager.HasComponent<global::Game.Net.Elevation>(snap))
                 return EntityManager.GetComponentData<global::Game.Net.Elevation>(snap).m_Elevation;
 
-            float e = p.y - TerrainUtils.SampleHeight(ref heightData, p);
-            if (e > 0f)
-                e = math.max(p.y - WaterUtils.SampleHeight(ref waterData, ref heightData, p), 0f);
+            float surface = SurfaceHeightAt(sourcePoint, sourceElevation.x,
+                NetInfoOf(prefab).ElevationLimit, ref heightData, ref waterData);
+            float local = sourcePoint.y - surface;
+            if (!math.isfinite(local) || math.abs(local - sourceElevation.x) <= SurfaceAgreementTol)
+                return sourceElevation;
 
-            NetPrefabInfo info = NetInfoOf(prefab);
-            bool fixedBelow = info.Placeable && info.ElevMax <= 0f && info.ElevMin < 0f;
-            bool fixedAbove = info.Placeable && info.ElevMin >= 0f && info.ElevMax > 0f;
-            if (!fixedBelow && !fixedAbove && math.abs(e) < GroundElevationDeadZone) e = 0f;
-            if (info.Placeable) e = math.clamp(e, info.ElevMin, info.ElevMax);
-            return new float2(e);
+            correction = local - sourceElevation.x;
+            return sourceElevation + correction;
         }
 
         /// <summary>
@@ -294,10 +312,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
         }
 
-        /// <summary>Create a Temp-routed definition from captured native course intent.</summary>
+        /// <summary>
+        /// Create a Temp-routed definition from captured native course intent. The endpoint
+        /// elevations are passed in rather than read from the command: they may carry this machine's
+        /// surface correction (see <see cref="EndElevation"/>).
+        /// </summary>
         private Entity CreateNativeCourse(Entity prefab, NetPlacementCommand command, Bezier4x3 bez,
-            Entity startSnap, float startT, int startKind,
-            Entity endSnap, float endT, int endKind)
+            Entity startSnap, float startT, int startKind, float2 startElevation,
+            Entity endSnap, float endT, int endKind, float2 endElevation)
         {
             if (CourseTargetIsStale(startSnap)) startSnap = Entity.Null;
             if (CourseTargetIsStale(endSnap)) endSnap = Entity.Null;
@@ -336,8 +358,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     m_Elevation = courseElevation,
                     m_Length = command.Length,
                     m_FixedIndex = command.FixedIndex,
-                    m_StartPosition = MakeNativeCoursePos(command.Start, startSnap, startT, startKind),
-                    m_EndPosition = MakeNativeCoursePos(command.End, endSnap, endT, endKind),
+                    m_StartPosition = MakeNativeCoursePos(command.Start, startSnap, startT, startKind,
+                        startElevation),
+                    m_EndPosition = MakeNativeCoursePos(command.End, endSnap, endT, endKind,
+                        endElevation),
                 });
                 EntityManager.AddComponent<Updated>(definition);
                 EntityManager.AddComponent<Deleted>(definition);
@@ -351,7 +375,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private static CoursePos MakeNativeCoursePos(NetEndpointIntent intent,
-            Entity target, float resolvedT, int resolvedKind)
+            Entity target, float resolvedT, int resolvedKind, float2 elevation)
         {
             return new CoursePos
             {
@@ -360,7 +384,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 // The wire carries the source quaternion's exact float bits. Re-normalizing here
                 // perturbs those bits and gives different node orientation input to generation.
                 m_Rotation = new quaternion(intent.RotX, intent.RotY, intent.RotZ, intent.RotW),
-                m_Elevation = new float2(intent.ElevationLeft, intent.ElevationRight),
+                m_Elevation = elevation,
                 m_CourseDelta = intent.CourseDelta,
                 m_SplitPosition = resolvedKind == KindSplit ? resolvedT : intent.SplitPosition,
                 m_Flags = (CoursePosFlags)intent.Flags,

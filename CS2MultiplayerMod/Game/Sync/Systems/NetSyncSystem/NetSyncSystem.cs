@@ -55,25 +55,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private EntityQuery _deletedEdges;
         private Observer _observer;
 
-        // Terrain/water samplers for deriving a course endpoint's elevation (Y - surface) - the
-        // course must carry it explicitly or the game commits an elevated net (power line, pipe,
-        // bridge) as a GROUND net at that Y and terraforms the ground up/down to meet it.
-        private global::Game.Simulation.TerrainSystem _terrainSystem;
-        private global::Game.Simulation.WaterSystem _waterSystem;
         private global::Game.Net.SearchSystem _netSearchSystem;
 
+        // Surface samplers. A course endpoint's committed height is NOT the Y on the wire: unless the
+        // endpoint is a full elevation step up or down, the game recomputes it as local surface +
+        // elevation. Reproducing the source height therefore means measuring this machine's surface
+        // and solving for the elevation that lands on it (see SurfaceHeightAt / EndElevation).
+        private global::Game.Simulation.TerrainSystem _terrainSystem;
+        private global::Game.Simulation.WaterSystem _waterSystem;
+
         // Per-net-prefab facts consulted for every course endpoint (connect layers for the utility
-        // connector snap, the allowed elevation range for the ground dead zone, the half-width that
-        // scales the endpoint snap radii). Prefab entities are stable for the session, so entries
-        // never invalidate.
+        // connector snap, the half-width that scales the endpoint snap radii, the elevation step at
+        // which the net becomes a bridge/tunnel). Prefab entities are stable for the session, so
+        // entries never invalidate.
         private struct NetPrefabInfo
         {
             public Layer RequiredLayers;
             public Layer ConnectLayers;
-            public float ElevMin, ElevMax;
             public float HalfWidth;
             public float SnapDistance;
-            public bool Placeable;
+            public float ElevationLimit;
         }
         private readonly Dictionary<Entity, NetPrefabInfo> _netInfoCache = new Dictionary<Entity, NetPrefabInfo>();
 
@@ -117,12 +118,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private const Layer UtilityConnectLayers = Layer.PowerlineLow | Layer.PowerlineHigh |
             Layer.WaterPipe | Layer.SewagePipe | Layer.StormwaterPipe | Layer.ResourceLine;
 
-        // Below this |curve Y - local terrain| a road-like net (one whose allowed elevation range
-        // spans 0) counts as GROUND (course elevation 0): a committed ground road's Y deviates from
-        // the pre-build terrain by the game's own grading (cut/fill on slopes), which must not be
-        // mistaken for a raised/lowered placement. Real raised segments start at a full elevation
-        // step (2.5 m); fixed-elevation nets (power lines, pipes) skip the dead zone entirely.
-        private const float GroundElevationDeadZone = 2.0f;
+        // How far this machine's surface may sit from the source's before the transmitted elevation
+        // is corrected to preserve the ABSOLUTE height instead (see EndElevation). Below it the two
+        // worlds agree and the source value is used untouched, which keeps a ground net at exactly
+        // elevation 0 - the value that lets the terrain grade to the net rather than the reverse.
+        // A ground net's committed Y deviates from the raw pre-build terrain by that grading, so the
+        // tolerance has to clear it; real elevation steps and any water crossing are far larger.
+        private const float SurfaceAgreementTol = 2.0f;
 
         // Endpoint classifications used when building a realize batch (see ClassifyEndpoint).
         private const int KindFree = 0;          // open ground → a fresh node
@@ -138,6 +140,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // existing node, merged with another new node in the same batch, split an existing edge
         // (T-junction), or was on free ground.
         private int _rzSegments, _rzSnapEnds, _rzMergeEnds, _rzMidEnds, _rzFreeEnds;
+
+        // Endpoints whose elevation had to be corrected because this machine's surface disagreed with
+        // the source's, and the largest such disagreement. A non-zero count means the two worlds'
+        // terrain or water differ under replicated geometry — the reading that tells a height report
+        // apart from a snapping one.
+        private int _rzSurfaceCorrections;
+        private float _rzSurfaceCorrectionMax;
 
         // Capture-side 5 s peak counts of net-edge lifecycle tags, to reveal how CS2 represents an
         // edge split: an in-place reuse of the original shows up as Updated (NOT Created/Deleted).
@@ -320,6 +329,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _applyBrushesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyBrushesSystem>();
             _applyRoutesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyRoutesSystem>();
             _netSearchSystem = World.GetOrCreateSystemManaged<global::Game.Net.SearchSystem>();
+            _terrainSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.TerrainSystem>();
+            _waterSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.WaterSystem>();
             // Mirror the net apply pass's structural query, including any Temp already carrying
             // Deleted. The operation-level query below expands this with native side-effect domains.
             _netTransactionTemps = GetEntityQuery(new EntityQueryDesc
@@ -492,9 +503,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     ComponentType.ReadOnly<Deleted>(),
                 },
             });
-
-            _terrainSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.TerrainSystem>();
-            _waterSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.WaterSystem>();
 
             // Diagnostic: pre-existing edges whose geometry CHANGED this frame (Updated but NOT
             // freshly Created) — exactly what an in-place split of the original edge looks like.

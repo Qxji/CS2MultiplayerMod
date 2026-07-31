@@ -5,6 +5,7 @@ using Game.Net;
 using Game.Prefabs;
 using Unity.Collections;
 using Unity.Entities;
+using Unity.Mathematics;
 using CS2MultiplayerMod.Core.Session;
 
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
@@ -61,9 +62,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                              _rzFreeEnds + " free ground.");
             }
 
+            if (_rzSurfaceCorrections > 0)
+            {
+                Mod.log.Info("[MP] NetSync: " + _rzSurfaceCorrections + " remote endpoint(s)/5s needed " +
+                             "an elevation correction (up to " +
+                             _rzSurfaceCorrectionMax.ToString("F1") + " m) because the surface under " +
+                             "them differs from the source's. The height is reproduced; a large or " +
+                             "growing figure means terrain or water is out of step.");
+                Diagnostics.FlightRecorder.Note("net surface correction ends=" + _rzSurfaceCorrections +
+                                                  " maxM=" + _rzSurfaceCorrectionMax.ToString("F1"));
+            }
+
             _diag.Clear();
             _diagTotal = 0;
             _rzSegments = _rzSnapEnds = _rzMergeEnds = _rzMidEnds = _rzFreeEnds = 0;
+            _rzSurfaceCorrections = 0;
+            _rzSurfaceCorrectionMax = 0f;
             _peakCreated = _peakUpdated = _peakDeleted = 0;
             _capFilteredHalves = 0;
             _diagStartMs = now;
@@ -198,6 +212,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
 
                     Curve curve = createdCurves[i];
+                    // The committed end nodes carry the elevation this span was built at. Without it
+                    // the receiver commits a ground net and the generator pulls the curve end down to
+                    // the terrain — over water that is the lakebed, and the span becomes a dive.
+                    float2 startElevation, endElevation;
+                    CommittedEndElevations(entity, out startElevation, out endElevation);
                     var command = new NetPlacementCommand
                     {
                         PrefabName = name,
@@ -206,6 +225,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Cx = b.c.x, Cy = b.c.y, Cz = b.c.z,
                         Dx = b.d.x, Dy = b.d.y, Dz = b.d.z,
                         Length = curve.m_Length,
+                        Start = { ElevationLeft = startElevation.x, ElevationRight = startElevation.y },
+                        End = { ElevationLeft = endElevation.x, ElevationRight = endElevation.y },
                     };
                     if (onKeptSpan)
                     {
@@ -232,6 +253,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (stubs > 0)
                 Diagnostics.FlightRecorder.Note("net per-edge fallback sent=" + stubs +
                                                   " (no native operation covered this apply)");
+        }
+
+        /// <summary>
+        /// The <see cref="global::Game.Net.Elevation"/> of a committed edge's two end nodes. A node
+        /// without the component sits on the ground and is elevation 0 - the game's own convention,
+        /// and the value a course endpoint must carry to reproduce this span.
+        /// </summary>
+        private void CommittedEndElevations(Entity edge, out float2 start, out float2 end)
+        {
+            start = default;
+            end = default;
+            if (!EntityManager.HasComponent<Edge>(edge)) return;
+            Edge ends = EntityManager.GetComponentData<Edge>(edge);
+            start = NodeElevation(ends.m_Start);
+            end = NodeElevation(ends.m_End);
+        }
+
+        private float2 NodeElevation(Entity node)
+        {
+            return node != Entity.Null && EntityManager.Exists(node) &&
+                   EntityManager.HasComponent<global::Game.Net.Elevation>(node)
+                ? EntityManager.GetComponentData<global::Game.Net.Elevation>(node).m_Elevation
+                : default;
         }
     }
 }
