@@ -86,7 +86,7 @@ namespace CS2MultiplayerMod.Game
                 OwnedAreaSnapshotCommand.Id,
                 RouteCreateCommand.Id, RouteUpdateCommand.Id, RouteDeleteCommand.Id,
                 TilePurchaseCommand.Id, EntityPolicyCommand.Id, DevTreePurchaseCommand.Id,
-                NetReplaceCommand.Id, ObjectToolOperationCommand.Id,
+                NetReplaceCommand.Id, ObjectToolOperationCommand.Id, AssetStampCommand.Id,
                 VisualCustomizationCommand.Id, ColorPaletteCommand.Id);
         }
 
@@ -186,6 +186,7 @@ namespace CS2MultiplayerMod.Game
                 case UpgradePlacementCommand.Id: return "building-upgrade";
                 case ObjectMoveCommand.Id: return "object-move";
                 case ObjectToolOperationCommand.Id: return "object-native-operation";
+                case AssetStampCommand.Id: return "asset-stamp";
                 case NetUpgradeCommand.Id: return "net-upgrade";
                 case AreaCreateCommand.Id: return "area-create";
                 case AreaDeleteCommand.Id: return "area-delete";

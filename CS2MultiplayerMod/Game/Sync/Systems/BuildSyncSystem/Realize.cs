@@ -94,11 +94,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // Our own placement coming back to us — already built locally.
                 if (message.OriginPlayerId == session.LocalPlayerId) continue;
 
-                if (message.CommandId == ObjectToolOperationCommand.Id)
+                if (message.CommandId == ObjectToolOperationCommand.Id ||
+                    message.CommandId == AssetStampCommand.Id)
                 {
                     Diagnostics.FlightRecorder.Note("object command received origin=" +
                                                       message.OriginPlayerId);
-                    NativeObjectResult result = TryRealizeNativeObject(message, now);
+                    NativeObjectResult result = TryRealizeRemoteObjectMessage(message, now);
                     if (result == NativeObjectResult.Retry)
                     {
                         BlockNativeObject(message, now);
@@ -113,7 +114,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 catch (System.Exception ex) { Mod.log.Warn("[MP] BuildSync: dropping malformed command: " + ex.Message); continue; }
 
                 Entity prefab;
-                if (!_prefabIndex.TryResolve(command.PrefabName, out prefab))
+                if (!_prefabIndex.TryResolve(command.PrefabName,
+                        candidate => EntityManager.HasComponent<ObjectData>(candidate),
+                        out prefab))
                 {
                     Mod.log.Warn("[MP] BuildSync realize: unknown prefab '" + command.PrefabName +
                                  "' from player " + message.OriginPlayerId + "; skipping.");
@@ -283,8 +286,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// <summary>The local net entity this command's object hangs off, or Null (also when unattached).</summary>
         private Entity FindAttachTarget(ObjectPlacementCommand command)
         {
-            var anchor = new float3(command.AttachX, command.AttachY, command.AttachZ);
-            switch (command.AttachKind)
+            return ResolveNetAttachment(command.AttachKind,
+                new float3(command.AttachX, command.AttachY, command.AttachZ));
+        }
+
+        /// <summary>
+        /// Resolve a portable node/edge anchor for placement and relocation commands. Keeping one
+        /// resolver ensures both paths make the same choice when roads are subdivided differently.
+        /// </summary>
+        internal Entity ResolveNetAttachment(ObjectAttachKind kind, float3 anchor)
+        {
+            switch (kind)
             {
                 case ObjectAttachKind.NetNode: return FindAttachNode(anchor);
                 case ObjectAttachKind.NetEdge: return FindAttachEdge(anchor);

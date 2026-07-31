@@ -28,8 +28,24 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
             if (!em.HasComponent<Attached>(obj)) return Entity.Null;
 
             Entity parent = em.GetComponentData<Attached>(obj).m_Parent;
+            return NormalizeNetParent(em, parent);
+        }
+
+        /// <summary>
+        /// Resolve a raycast/snap target to its road node or edge. Object-tool control points can
+        /// name either the net entity directly or an already-attached roadside object.
+        /// </summary>
+        public static Entity NormalizeNetParent(EntityManager em, Entity candidate)
+        {
+            if (candidate == Entity.Null || !em.Exists(candidate)) return Entity.Null;
+            if (em.HasComponent<Node>(candidate) || em.HasComponent<Edge>(candidate)) return candidate;
+            if (!em.HasComponent<Attached>(candidate)) return Entity.Null;
+
+            Entity parent = em.GetComponentData<Attached>(candidate).m_Parent;
             if (parent == Entity.Null || !em.Exists(parent)) return Entity.Null;
-            return em.HasComponent<Node>(parent) || em.HasComponent<Edge>(parent) ? parent : Entity.Null;
+            return em.HasComponent<Node>(parent) || em.HasComponent<Edge>(parent)
+                ? parent
+                : Entity.Null;
         }
 
         /// <summary>
@@ -58,6 +74,33 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
             if (!em.HasComponent<Curve>(parent)) return false;
             float curvePosition = em.GetComponentData<Attached>(obj).m_CurvePosition;
             anchor = MathUtils.Position(em.GetComponentData<Curve>(parent).m_Bezier, curvePosition);
+            return true;
+        }
+
+        /// <summary>
+        /// Describe a known node/edge as a portable anchor. For an edge, project the nearby object
+        /// position onto its centreline so differently subdivided peer roads still resolve it.
+        /// </summary>
+        public static bool TryDescribeParent(EntityManager em, Entity candidate, float3 nearPosition,
+            out bool isNode, out float3 anchor)
+        {
+            isNode = false;
+            anchor = default;
+            Entity parent = NormalizeNetParent(em, candidate);
+            if (parent == Entity.Null) return false;
+
+            if (em.HasComponent<Node>(parent))
+            {
+                isNode = true;
+                anchor = em.GetComponentData<Node>(parent).m_Position;
+                return true;
+            }
+
+            if (!em.HasComponent<Curve>(parent)) return false;
+            Bezier4x3 curve = em.GetComponentData<Curve>(parent).m_Bezier;
+            float curvePosition;
+            MathUtils.Distance(curve, nearPosition, out curvePosition);
+            anchor = MathUtils.Position(curve, curvePosition);
             return true;
         }
 

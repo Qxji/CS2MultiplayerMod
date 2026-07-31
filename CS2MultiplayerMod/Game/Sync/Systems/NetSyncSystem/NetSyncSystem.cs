@@ -60,6 +60,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // bridge) as a GROUND net at that Y and terraforms the ground up/down to meet it.
         private global::Game.Simulation.TerrainSystem _terrainSystem;
         private global::Game.Simulation.WaterSystem _waterSystem;
+        private global::Game.Net.SearchSystem _netSearchSystem;
 
         // Per-net-prefab facts consulted for every course endpoint (connect layers for the utility
         // connector snap, the allowed elevation range for the ground dead zone, the half-width that
@@ -180,6 +181,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // A standing interactive preview can span several domains (for example a building plus
         // owned driveway nets). It must be frozen and restored as one graph.
         private EntityQuery _standingTemps;
+        // Exact local definition graph behind the preview that is about to commit. The after-barrier
+        // cache normally describes the same graph, but sampling it again on Apply keeps a multi-course
+        // operation intact when the tool regenerated or switched modes on the click frame.
+        private EntityQuery _standingLocalDefinitions;
         private EntityQuery _localBrushTemps;
         private readonly List<Entity> _isolatedLocalTemps = new List<Entity>();
         private readonly List<Entity> _protectedRemoteNetTemps = new List<Entity>();
@@ -314,6 +319,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _applyAreasSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyAreasSystem>();
             _applyBrushesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyBrushesSystem>();
             _applyRoutesSystem = World.GetOrCreateSystemManaged<global::Game.Tools.ApplyRoutesSystem>();
+            _netSearchSystem = World.GetOrCreateSystemManaged<global::Game.Net.SearchSystem>();
             // Mirror the net apply pass's structural query, including any Temp already carrying
             // Deleted. The operation-level query below expands this with native side-effect domains.
             _netTransactionTemps = GetEntityQuery(new EntityQueryDesc
@@ -371,6 +377,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             {
                 All = new[] { ComponentType.ReadOnly<Temp>() },
                 None = new[] { ComponentType.ReadOnly<Deleted>() },
+            });
+
+            // Tool definitions lose Updated after the frame that materializes their preview. Those
+            // untagged definitions are therefore the exact graph ToolOutputSystem consumes on Apply.
+            // Sync-created definitions carry Deleted from birth and must never be recaptured.
+            _standingLocalDefinitions = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[] { ComponentType.ReadOnly<CreationDefinition>() },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Updated>(),
+                    ComponentType.ReadOnly<Deleted>(),
+                },
             });
 
             _localBrushTemps = GetEntityQuery(new EntityQueryDesc

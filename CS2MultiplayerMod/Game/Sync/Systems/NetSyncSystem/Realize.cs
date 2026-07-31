@@ -1,5 +1,7 @@
 using System.Collections.Generic;
+using Colossal.Collections;
 using Colossal.Mathematics;
+using Game.Common;
 using Game.Net;
 using Game.Simulation;
 using Game.Tools;
@@ -69,6 +71,49 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             public bool AlreadyBuilt;
         }
 
+        private struct LiveEdgeSearchSnapshot
+        {
+            public NativeQuadTree<Entity, QuadTreeBoundsXZ> Tree;
+            public ComponentLookup<Curve> Curves;
+            public ComponentLookup<global::Game.Prefabs.PrefabRef> Prefabs;
+            public ComponentLookup<global::Game.Common.Owner> Owners;
+            public ComponentLookup<Temp> Temps;
+            public ComponentLookup<global::Game.Common.Deleted> Deleted;
+        }
+
+        private struct SpanCoverageIterator :
+            INativeQuadTreeIterator<Entity, QuadTreeBoundsXZ>,
+            IUnsafeQuadTreeIterator<Entity, QuadTreeBoundsXZ>
+        {
+            public Bounds3 Bounds;
+            public float3 Point;
+            public Entity Prefab;
+            public ComponentLookup<Curve> Curves;
+            public ComponentLookup<global::Game.Prefabs.PrefabRef> Prefabs;
+            public ComponentLookup<global::Game.Common.Owner> Owners;
+            public ComponentLookup<Temp> Temps;
+            public ComponentLookup<global::Game.Common.Deleted> Deleted;
+            public bool Covered;
+
+            public bool Intersect(QuadTreeBoundsXZ bounds)
+            {
+                return !Covered && MathUtils.Intersect(bounds.m_Bounds, Bounds);
+            }
+
+            public void Iterate(QuadTreeBoundsXZ bounds, Entity entity)
+            {
+                if (Covered || !MathUtils.Intersect(bounds.m_Bounds, Bounds) ||
+                    !Curves.HasComponent(entity) || !Prefabs.HasComponent(entity) ||
+                    Owners.HasComponent(entity) || Temps.HasComponent(entity) ||
+                    Deleted.HasComponent(entity) || Prefabs[entity].m_Prefab != Prefab) return;
+
+                Bezier4x3 curve = Curves[entity].m_Bezier;
+                float t;
+                if (MathUtils.Distance(curve.xz, Point.xz, out t) > SplitMatch.TolXZ) return;
+                Covered = math.abs(MathUtils.Position(curve, t).y - Point.y) <= SplitMatch.TolY;
+            }
+        }
+
         private struct RealizedCourse
         {
             public Entity Prefab;
@@ -127,6 +172,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 ownedNodeEntities = default, ownedEdgeEntities = default;
             NativeArray<Node> nodeData = default, ownedNodeData = default;
             NativeArray<Curve> edgeCurves = default, ownedEdgeCurves = default;
+            LiveEdgeSearchSnapshot liveEdgeSearch = default(LiveEdgeSearchSnapshot);
             TerrainHeightData heightData = default;
             WaterSurfaceData<SurfaceWater> waterData = default;
             bool haveSnapshot = false;
@@ -175,6 +221,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     waterData = _waterSystem.GetSurfaceData(out preflightWaterDeps);
                     preflightWaterDeps.Complete();
                     haveSnapshot = true;
+
+                    // The game resolves nearby network geometry through its quadtree. Use the same
+                    // read-only snapshot for per-course idempotence instead of scanning every edge in
+                    // the city once for every grid cell.
+                    JobHandle searchDependencies;
+                    liveEdgeSearch = new LiveEdgeSearchSnapshot
+                    {
+                        Tree = _netSearchSystem.GetNetSearchTree(readOnly: true,
+                            out searchDependencies),
+                        Curves = GetComponentLookup<Curve>(isReadOnly: true),
+                        Prefabs = GetComponentLookup<global::Game.Prefabs.PrefabRef>(isReadOnly: true),
+                        Owners = GetComponentLookup<global::Game.Common.Owner>(isReadOnly: true),
+                        Temps = GetComponentLookup<Temp>(isReadOnly: true),
+                        Deleted = GetComponentLookup<global::Game.Common.Deleted>(isReadOnly: true),
+                    };
+                    searchDependencies.Complete();
 
                     NetPlacementCommand operationHeader = NetPlacementCommand.Decode(work[0].Body);
                     var operationRetryKey = new NetOperationKey
@@ -266,7 +328,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         // non-finite or globally implausible value, so preserve these values intact.
 
                         bool alreadyBuilt = !nativePoint &&
-                                            SpanAlreadyBuilt(prefab, curve, edgeEntities, edgeCurves);
+                                            SpanAlreadyBuilt(prefab, curve, ref liveEdgeSearch);
                         if (alreadyBuilt) alreadyBuiltCourses++;
                         preparedNative[i] = new PreparedNativeCourse
                         {
@@ -563,7 +625,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     // exactly like an endpoint tap, but ClassifyEndpoint only sees the two endpoints —
                     // probe the span interior too, or two quick drags across the same road slip into one
                     // batch and hit the stale-edge crash below.
-                    if (!defer && !splittingCourse)
+                    if (!nativeOperation && !defer && !splittingCourse)
                         splittingCourse = BodyTouchesExistingEdge(bezier, placedInfo, edgeEntities, edgeCurves);
                     // At most ONE existing-edge-splitting course per batch: two courses committed in the
                     // same ApplyTool pass that both touch an existing edge can make ApplyNetSystem
@@ -1020,6 +1082,36 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     break;
                 }
                 if (!covered) return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Native multi-course operations use the game's live network search tree for idempotence.
+        /// Only edges near each of the five coverage samples are visited, so a large grid scales with
+        /// local network density rather than with every edge in the city.
+        /// </summary>
+        private static bool SpanAlreadyBuilt(Entity prefab, Bezier4x3 span,
+            ref LiveEdgeSearchSnapshot search)
+        {
+            for (int s = 0; s <= 4; s++)
+            {
+                float3 point = MathUtils.Position(span, s / 4f);
+                var iterator = new SpanCoverageIterator
+                {
+                    Bounds = new Bounds3(
+                        point - new float3(SplitMatch.TolXZ, SplitMatch.TolY, SplitMatch.TolXZ),
+                        point + new float3(SplitMatch.TolXZ, SplitMatch.TolY, SplitMatch.TolXZ)),
+                    Point = point,
+                    Prefab = prefab,
+                    Curves = search.Curves,
+                    Prefabs = search.Prefabs,
+                    Owners = search.Owners,
+                    Temps = search.Temps,
+                    Deleted = search.Deleted,
+                };
+                search.Tree.Iterate(ref iterator);
+                if (!iterator.Covered) return false;
             }
             return true;
         }

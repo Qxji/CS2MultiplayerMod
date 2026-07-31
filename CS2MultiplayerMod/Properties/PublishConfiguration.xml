@@ -4,17 +4,28 @@
 	<!--Name of the mod to display to players-->
 	<DisplayName Value="CS2 Multiplayer Mod" />
 	<!--Short description of the mod-->
-	<ShortDescription Value="Multiplayer mod, build one shared city with a friend" />
+	<ShortDescription Value="Cities: Skylines 2 Multiplayer mod, build one shared city with a friend" />
 	<!--Long description of the mod. Single line or multi line. Supports minimal markdown subset-->
 	<LongDescription>
-Play Cities: Skylines II together. CS2 Multiplayer Mod lets you and your friends build one shared city at the same time.
-The mod is experimental, back up your saves and expect rough edges while it grows!
-Host-authoritative and friend-focused: set a password, share your IP-address, and build together. This project is not affiliated with, endorsed by, or sponsored by Colossal Order, Paradox Interactive or Iceflake Studio.
+		Play Cities: Skylines II together.
+
+		CS2 Multiplayer is a client-server multiplayer mod that allows multiple players to build and manage the same city in real time.
+
+		The mod is currently experimental. Please back up your saves and expect bugs, missing features or crashes while development continues.
+
+		To host a game, start a multiplayer world, optionally protect it with a password, and share your IP address with your friends.
+
+		If you encounter any issues or have feedback, our Discord server ( https://discord.gg/KFZTW2YSJt ) is the preferred place to get support and report bugs.
+
+		This project is not affiliated with, endorsed by, or sponsored by Colossal Order, Paradox Interactive, or Iceflake Studio.	
 	</LongDescription>
 	<!--Thumbnail-->
 	<Thumbnail Value="Properties/Thumbnail.png" />
-	<!--Screenshot, can be set1 multiple times-->
-	<Screenshot Value="" />
+	<!--Screenshot, can be set multiple times-->
+	<Screenshot Value="Properties/CS2MultiplayerMod_Main_Screen.png" />
+	<Screenshot Value="Properties/CS2MultiplayerMod_Multiplayer_Ingame_Screen.png" />
+	<Screenshot Value="Properties/CS2MultiplayerMod_Multiplayer_Main_Screen.png" />
+	<Screenshot Value="Properties/CS2MultiplayerMod_Multiplayer_Join_Screen.png" />
 	<!--Tag, can be set multiple times-->
 	<Tag Value="Code Mod" />
 	<!--Link to the forum post where the mod can be discussed-->

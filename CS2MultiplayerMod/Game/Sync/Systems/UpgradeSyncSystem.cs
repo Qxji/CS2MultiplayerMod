@@ -326,7 +326,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             UpgradePlacementCommand retained = command;
             int retainedOrigin = origin;
             BuildSyncSystem.NativeDeriveResult derived = _buildSync.TryDeriveObjectTransaction(
-                prefab, owner, Entity.Null, position, rotation, 0f, command.ToolRandomSeed,
+                prefab, owner, Entity.Null, Entity.Null, position, rotation, 0f,
+                command.ToolRandomSeed,
                 "upgrade " + command.PrefabName,
                 () => QueueOwnerRetry(retained, retainedOrigin, Mod.Service != null ? Mod.Service.NowMs : 0),
                 null);

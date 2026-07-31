@@ -66,7 +66,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _netSync.ObserveLocalNetDefinitions(default(NativeArray<Entity>));
                 if (_buildSync == null)
                     _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
-                _buildSync.ObserveLocalObjectToolOutput();
+                _buildSync.ObserveLocalObjectToolOutput(default(NativeArray<Entity>));
                 return;
             }
 
@@ -83,7 +83,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _netSync.ObserveLocalNetDefinitions(definitions);
                 if (_buildSync == null)
                     _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
-                _buildSync.ObserveLocalObjectToolOutput();
+                _buildSync.ObserveLocalObjectToolOutput(definitions);
 
                 if (!armedCommit) return;
                 for (int i = 0; i < definitions.Length; i++)

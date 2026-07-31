@@ -8,6 +8,7 @@ using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
 using CS2MultiplayerMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
@@ -53,13 +54,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             (_areaToolSystem != null && _areaToolSystem.recreate != Entity.Null);
 
         /// <summary>
-        /// Observe the object/area tool hand-off after the output barrier. Complete object graphs
-        /// are captured once from the standing definitions on the Apply frame; this phase only
-        /// advances the specialized-industry two-tool transaction.
+        /// Observe the object/area tool hand-off after the output barrier. Ordinary object graphs
+        /// are captured once from the standing definitions on Apply. Network-owned object graphs
+        /// are the exception: retain their small, exact preview batch in the recent-root set so a
+        /// one-shot network prefab remains recoverable even if it switches tools while applying.
         /// </summary>
-        public void ObserveLocalObjectToolOutput()
+        public void ObserveLocalObjectToolOutput(NativeArray<Entity> definitions)
         {
             ObserveLocalObjectToolStateAfterOutput();
+
+            global::Game.Tools.ToolBaseSystem active =
+                _toolSystem != null ? _toolSystem.activeTool : null;
+            if (!(active is global::Game.Tools.NetToolSystem) ||
+                !NativeObjectGraph.HasNewTopLevelObjectRoot(EntityManager, definitions)) return;
+
+            // Owner-linked courses are not independent net placements. Capture the heterogeneous
+            // object/net/area graph together, exactly like an intersection asset transaction. The
+            // operation is retained by RememberRecentLocalObjectOperation; do not leave it as the
+            // current object-tool cache where a later, unrelated lifecycle tool could claim it.
+            CaptureObjectToolOperation(definitions);
+            _cachedLocalObjectOperation = null;
         }
 
         /// <summary>
@@ -251,6 +265,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             int root = -1;
             int rootScore = -1;
             bool hasStampingNet = false;
+            bool hasFixedElementCut = false;
             // Root scoring asks whether a definition's owner names a live building, which searches the
             // object domain. Capture is read-only, so one snapshot serves the whole batch: without it
             // a 116-definition building preview walked the city's ~270k objects once per definition,
@@ -289,6 +304,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     if (definition.Kind == ObjectToolDefinitionKind.NetCourse &&
                         (((CreationFlags)definition.CreationFlags & CreationFlags.Stamping) != 0))
                         hasStampingNet = true;
+                    if (CourseCarriesFixedElementCut(definition)) hasFixedElementCut = true;
                     captured.Add(definition);
                     if (captured.Count > ObjectToolOperationCommand.MaxDefinitions)
                     {
@@ -337,12 +353,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 root = ObjectToolOperationCommand.AssetStampRootIndex;
             }
 
-            _cachedLocalObjectOperation = new ObjectToolOperationCommand
+            var operation = new ObjectToolOperationCommand
             {
                 RootIndex = (short)root,
                 AssetStampPrefabName = stampPrefabName,
                 Definitions = captured.ToArray(),
             };
+
+            // A net built from repeating fixed elements - a dam - reaches the standing graph already
+            // divided into those elements, one course each. Publishing that division makes the peer
+            // divide every piece a second time, so each module becomes a whole miniature dam.
+            // Prefer the undivided graph the output barrier saw a frame earlier: the receiver then
+            // divides it exactly once, as a local apply does.
+            ObjectToolOperationCommand undivided;
+            if (hasFixedElementCut && TryFindUndividedFixedNetOperation(operation, out undivided))
+            {
+                _cachedLocalObjectOperation = undivided;
+                RememberRecentLocalObjectOperation(undivided);
+                Diagnostics.FlightRecorder.Note("fixed-element net kept undivided defs=" +
+                    undivided.Definitions.Length + " divided=" + captured.Count);
+                return;
+            }
+            if (hasFixedElementCut)
+                Diagnostics.FlightRecorder.Note(
+                    "fixed-element net has no undivided graph; publishing divided defs=" +
+                    captured.Count);
+
+            _cachedLocalObjectOperation = operation;
             RememberRecentLocalObjectOperation(_cachedLocalObjectOperation);
             Diagnostics.FlightRecorder.Note(hasStampingNet
                 ? "asset stamp native definitions captured=" + captured.Count +
@@ -350,6 +387,54 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 : "object native definitions captured=" + captured.Count +
                   " root=" + captured[root].PrefabName +
                   " seed=" + unchecked((ushort)captured[root].RandomSeed));
+        }
+
+        /// <summary>
+        /// True when this course is one element of a fixed-element net that the receiver would
+        /// divide again. The network tool always emits <c>-1</c> for a course it draws; a
+        /// non-negative element index means the division has already happened. A course that names
+        /// an original is exempt on both machines, so it is not treated as divided.
+        /// </summary>
+        private static bool CourseCarriesFixedElementCut(ObjectToolDefinitionIntent definition)
+        {
+            return definition.Kind == ObjectToolDefinitionKind.NetCourse &&
+                   !definition.PrefabIsNull &&
+                   definition.NetCourse.FixedIndex >= 0 &&
+                   definition.Original.Kind == PortableEntityKind.None;
+        }
+
+        private static bool ContainsFixedElementCut(ObjectToolDefinitionIntent[] definitions)
+        {
+            if (definitions == null) return false;
+            for (int i = 0; i < definitions.Length; i++)
+                if (CourseCarriesFixedElementCut(definitions[i])) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Find the undivided graph already held for the same root. Preview frames are observed
+        /// before the division runs, so the newest held graph for a root is its own ancestor.
+        /// Returns false when there is none, in which case the caller keeps the divided graph
+        /// rather than dropping the placement.
+        /// </summary>
+        private bool TryFindUndividedFixedNetOperation(ObjectToolOperationCommand divided,
+            out ObjectToolOperationCommand result)
+        {
+            result = null;
+            ObjectToolDefinitionIntent root;
+            if (!TryGetNewCommittedObjectRoot(divided, out root)) return false;
+
+            for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+            {
+                ObjectToolOperationCommand candidate = _recentLocalObjectOperations[i].Operation;
+                ObjectToolDefinitionIntent candidateRoot;
+                if (!TryGetNewCommittedObjectRoot(candidate, out candidateRoot) ||
+                    !SameRootSignature(root, candidateRoot) ||
+                    ContainsFixedElementCut(candidate.Definitions)) continue;
+                result = candidate;
+                return true;
+            }
+            return false;
         }
 
         private int ObjectOperationRootScore(ObjectToolDefinitionIntent definition)
@@ -998,6 +1083,103 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             return true;
         }
 
+        private void RememberObjectToolControlPoint(ObjectToolSystem tool)
+        {
+            Unity.Jobs.JobHandle dependencies;
+            NativeList<ControlPoint> points = tool.GetControlPoints(out dependencies);
+            dependencies.Complete();
+            if (!points.IsCreated || points.Length == 0)
+            {
+                _hasLastObjectToolControlPoint = false;
+                return;
+            }
+
+            // Relocation is a single-point mode and CreateDefinitions consumes index zero.
+            _lastObjectToolControlPoint = points[0];
+            _hasLastObjectToolControlPoint = true;
+        }
+
+        private void RememberStampControlPoint(ObjectToolSystem tool)
+        {
+            Unity.Jobs.JobHandle dependencies;
+            NativeList<ControlPoint> points = tool.GetControlPoints(out dependencies);
+            dependencies.Complete();
+            if (!points.IsCreated || points.Length == 0)
+            {
+                _hasLastStampControlPoint = false;
+                return;
+            }
+
+            // Stamping is a single-point mode; the generator consumes index zero.
+            _lastStampControlPoint = points[0];
+            _hasLastStampControlPoint = true;
+        }
+
+        /// <summary>
+        /// Publish a stamp as the inputs its tool had, so the peer runs the game's own generator
+        /// over them instead of rebuilding the transaction from transmitted definitions.
+        ///
+        /// The stamp's internal junctions exist only because every course sharing a prefab node
+        /// index receives the identical computed endpoint position - the node generator merges on
+        /// an exact float comparison, with no tolerance. Regenerating on the peer recreates that
+        /// identity; replaying finished definitions depends on all of it surviving the round trip,
+        /// and a single endpoint that does not becomes a ramp connected to nothing.
+        /// </summary>
+        private bool TryPublishLocalAssetStamp(string prefabName)
+        {
+            if (string.IsNullOrEmpty(prefabName) || !_hasLastStampControlPoint ||
+                !CanDeriveNativeTransactions) return false;
+            MultiplayerService service = Mod.Service;
+            if (service == null || !service.GameplaySyncReady) return false;
+
+            ControlPoint point = _lastStampControlPoint;
+            var command = new AssetStampCommand
+            {
+                OperationId = _nextLocalObjectOperationId++,
+                PrefabName = prefabName,
+                PosX = point.m_Position.x,
+                PosY = point.m_Position.y,
+                PosZ = point.m_Position.z,
+                RotX = point.m_Rotation.value.x,
+                RotY = point.m_Rotation.value.y,
+                RotZ = point.m_Rotation.value.z,
+                RotW = point.m_Rotation.value.w,
+                Elevation = point.m_Elevation,
+                ToolRandomSeed = AppliedLifecycleToolSeed,
+            };
+
+            try
+            {
+                service.Session.SendCommand(0, AssetStampCommand.Id, command.Encode());
+            }
+            catch (System.Exception ex)
+            {
+                // Fall back to the definition batch rather than losing the placement entirely.
+                Mod.log.Warn("[MP] BuildSync: asset-stamp inputs were not sent: " + ex.Message);
+                Diagnostics.FlightRecorder.Note("asset stamp inputs rejected=" + ex.GetType().Name);
+                return false;
+            }
+
+            _nativeLifecycleCapturedThisFrame = true;
+            Diagnostics.FlightRecorder.Note("asset stamp inputs published op=" +
+                command.OperationId + " prefab=" + prefabName +
+                " seed=" + command.ToolRandomSeed);
+            return true;
+        }
+
+        private bool TryTakeRelocationControlPoint(float3 position, quaternion rotation,
+            out ControlPoint controlPoint)
+        {
+            controlPoint = _lastObjectToolControlPoint;
+            if (!_hasLastObjectToolControlPoint) return false;
+            _hasLastObjectToolControlPoint = false;
+
+            // Prevent a stale point from a previously selected object tool being attached to a
+            // later relocation. Quaternion sign is immaterial, hence the absolute dot product.
+            if (math.distancesq(controlPoint.m_Position, position) > 0.25f) return false;
+            return math.abs(math.dot(controlPoint.m_Rotation.value, rotation.value)) >= 0.98f;
+        }
+
         /// <summary>
         /// Publish a relocation from the definition graph the tool is applying.
         ///
@@ -1006,8 +1188,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// before <see cref="ToolOutputSystem"/> the un-tagged definitions still standing are exactly
         /// the ones the Temps now committing were generated from - the tools' own definition query.
         /// The root <see cref="CreationFlags.Relocate"/> definition names the moved entity in
-        /// <c>m_Original</c> and its destination in <see cref="ObjectDefinition"/>, which together are
-        /// the whole compact command; the receiver re-derives the owned graph from them.
+        /// <c>m_Original</c> and its destination in <see cref="ObjectDefinition"/>. The snapped
+        /// control point sampled while the preview stood supplies the destination road/node; the
+        /// receiver re-derives the owned graph from that compact input set.
         /// </summary>
         private void CaptureLocalRelocationForApply(NativeArray<Entity> definitions)
         {
@@ -1036,12 +1219,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
                 ObjectDefinition placement =
                     EntityManager.GetComponentData<ObjectDefinition>(entity);
+                ControlPoint appliedPoint;
+                if (!TryTakeRelocationControlPoint(placement.m_Position, placement.m_Rotation,
+                        out appliedPoint))
+                {
+                    // The final-entity detector remains available later in the frame. Do not send a
+                    // compact move without knowing whether the tool snapped it to a road.
+                    Diagnostics.FlightRecorder.Note("relocation control point unavailable; final-entity fallback");
+                    return;
+                }
+
+                Entity destinationParent = NetAttachment.NormalizeNetParent(
+                    EntityManager, appliedPoint.m_OriginalEntity);
                 moveSync.PublishLocalRelocation(
                     EntityManager.GetComponentData<PrefabRef>(original).m_Prefab,
+                    original,
                     EntityManager.GetComponentData<global::Game.Objects.Transform>(original)
                         .m_Position,
                     placement.m_Position, placement.m_Rotation, placement.m_Elevation,
-                    AppliedLifecycleToolSeed);
+                    AppliedLifecycleToolSeed, destinationParent,
+                    destinationAttachmentKnown: true);
                 return;
             }
         }
@@ -1061,9 +1258,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             try
             {
                 bool fromObjectLifecycleTool = _localObjectToolRanThisFrame;
+                // The structural root is authoritative. A one-shot network prefab can switch back
+                // to another tool during the same Apply frame, so active-tool identity is no longer
+                // reliable at this last pre-output hook.
                 bool fromNetOwnedObjectGraph = !fromObjectLifecycleTool &&
-                    (_localNetToolRanThisFrame ||
-                     _toolSystem.activeTool is global::Game.Tools.NetToolSystem) &&
                     NativeObjectGraph.HasNewTopLevelObjectRoot(EntityManager, definitions);
                 if (!fromObjectLifecycleTool && !fromNetOwnedObjectGraph) return;
 
@@ -1088,6 +1286,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                                            _selectedAssetStampPrefabName;
                     if (!string.Equals(selectedStamp, operation.AssetStampPrefabName,
                             System.StringComparison.Ordinal)) return;
+
+                    // Preferred path: ship the tool's inputs. The definition batch below stays as
+                    // the fallback for a game build whose generator we cannot reach.
+                    if (TryPublishLocalAssetStamp(operation.AssetStampPrefabName))
+                    {
+                        _localObjectApplyThisFrame = true;
+                        _localLifecycleApplyThisFrame = true;
+                        _cachedLocalObjectOperation = null;
+                        return;
+                    }
                 }
 
                 _localObjectApplyThisFrame = true;

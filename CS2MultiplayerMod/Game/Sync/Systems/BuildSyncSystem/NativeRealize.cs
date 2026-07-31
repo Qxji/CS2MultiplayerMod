@@ -220,7 +220,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (now < _blockedNativeObjectNextAttemptMs) return false;
             _blockedNativeObjectNextAttemptMs = now + NativeObjectRetryIntervalMs;
 
-            NativeObjectResult result = TryRealizeNativeObject(_blockedNativeObject, now);
+            NativeObjectResult result = TryRealizeRemoteObjectMessage(_blockedNativeObject, now);
             if (result == NativeObjectResult.Retry)
             {
                 if (now < _blockedNativeObjectDeadline) return false;
@@ -249,6 +249,110 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _blockedNativeObjectNextAttemptMs = now + NativeObjectRetryIntervalMs;
             _hasBlockedNativeObject = true;
             Diagnostics.FlightRecorder.Note("object operation target retrying");
+        }
+
+        /// <summary>
+        /// Route one remote object-domain message. Both shapes share the single ordered retry slot,
+        /// so a stamp waiting for its prefab cannot be overtaken by a later placement.
+        /// </summary>
+        private NativeObjectResult TryRealizeRemoteObjectMessage(SimulationCommandMessage message,
+            long now)
+        {
+            return message.CommandId == AssetStampCommand.Id
+                ? TryRealizeAssetStamp(message, now)
+                : TryRealizeNativeObject(message, now);
+        }
+
+        /// <summary>
+        /// Rebuild a remote stamp by running the game's own definition generator over the inputs
+        /// its tool had. The generator derives every shared endpoint from the prefab's own averaged
+        /// node table, so the intersection's internal junctions are bit-identical here by
+        /// construction - which is the only way the node generator will merge them.
+        /// </summary>
+        private NativeObjectResult TryRealizeAssetStamp(SimulationCommandMessage message, long now)
+        {
+            AssetStampCommand command;
+            try { command = AssetStampCommand.Decode(message.Body); }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] BuildSync: dropping malformed asset-stamp command: " + ex.Message);
+                Diagnostics.FlightRecorder.Note("asset stamp dropped malformed");
+                return NativeObjectResult.Rejected;
+            }
+
+            var key = new NativeObjectOperationKey
+            {
+                Origin = message.OriginPlayerId,
+                Operation = command.OperationId,
+            };
+            if (_recentNativeObjectOperations.Contains(key, now))
+            {
+                Diagnostics.FlightRecorder.Note("asset stamp duplicate suppressed op=" +
+                                                  command.OperationId);
+                return NativeObjectResult.Completed;
+            }
+
+            Entity prefab;
+            if (!_prefabIndex.TryResolve(command.PrefabName,
+                    candidate => EntityManager.Exists(candidate) &&
+                                 EntityManager.HasComponent<AssetStampData>(candidate),
+                    out prefab))
+            {
+                // A peer with content we lack. Nothing local will make this resolve, so do not hold
+                // the ordered queue for it.
+                RecordRefused(command.PrefabName);
+                Mod.log.Warn("[MP] BuildSync: asset stamp '" + command.PrefabName +
+                             "' is unavailable here; skipping.");
+                Diagnostics.FlightRecorder.Note("asset stamp prefab unavailable");
+                return NativeObjectResult.Rejected;
+            }
+
+            var position = new float3(command.PosX, command.PosY, command.PosZ);
+            var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
+            string prefabName = command.PrefabName;
+            NativeDeriveResult derived = TryDeriveObjectTransaction(
+                prefab, Entity.Null, Entity.Null, Entity.Null, position, rotation,
+                command.Elevation, command.ToolRandomSeed,
+                "stamp " + prefabName,
+                () => ReplayNativeObject(message),
+                () => CompleteAssetStamp(key, prefab, prefabName, now),
+                stamping: true);
+
+            switch (derived)
+            {
+                case NativeDeriveResult.Armed:
+                    Diagnostics.FlightRecorder.Note("asset stamp derived op=" +
+                        command.OperationId + " prefab=" + prefabName);
+                    return NativeObjectResult.Armed;
+                case NativeDeriveResult.Busy:
+                    return NativeObjectResult.Retry;
+                case NativeDeriveResult.Unsupported:
+                    // This build cannot reach the generator, and a stamp has no reduced form that
+                    // preserves its topology. Dropping one placement beats building a broken one.
+                    Mod.log.Warn("[MP] BuildSync: the game's definition generator is not reachable; " +
+                                 "the remote stamp '" + prefabName + "' was skipped.");
+                    Diagnostics.FlightRecorder.Note("asset stamp unsupported");
+                    return NativeObjectResult.Rejected;
+                default:
+                    return NativeObjectResult.Rejected;
+            }
+        }
+
+        private void CompleteAssetStamp(NativeObjectOperationKey key, Entity prefab,
+            string prefabName, long capturedNow)
+        {
+            long now = Mod.Service != null ? Mod.Service.NowMs : capturedNow;
+            _recentNativeObjectOperations.Remember(key, now, NativeObjectReplayRememberMs);
+            try
+            {
+                ConstructionCharger.ChargeObject(EntityManager, prefab, prefabName);
+            }
+            catch (System.Exception ex)
+            {
+                Mod.log.Warn("[MP] BuildSync: committed stamp charge failed: " + ex.Message);
+            }
+            Diagnostics.FlightRecorder.Note("asset stamp transaction committed/drained op=" +
+                                              key.Operation);
         }
 
         private NativeObjectResult TryRealizeNativeObject(SimulationCommandMessage message, long now)
@@ -767,9 +871,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (command.IsAssetStamp)
             {
                 Entity stampPrefab;
-                if (!_prefabIndex.TryResolve(command.AssetStampPrefabName, out stampPrefab) ||
-                    stampPrefab == Entity.Null || !EntityManager.Exists(stampPrefab) ||
-                    !EntityManager.HasComponent<AssetStampData>(stampPrefab))
+                if (!_prefabIndex.TryResolve(command.AssetStampPrefabName,
+                        candidate => EntityManager.Exists(candidate) &&
+                                     EntityManager.HasComponent<AssetStampData>(candidate),
+                        out stampPrefab))
                 {
                     reason = "asset-stamp prefab is unavailable or incompatible";
                     return false;
@@ -785,10 +890,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     return false;
                 }
                 if (!definition.PrefabIsNull &&
-                    (!_prefabIndex.TryResolve(definition.PrefabName, out target.Prefab) ||
-                     !ValidateDefinitionPrefab(definition.Kind, target.Prefab)))
+                    !_prefabIndex.TryResolve(definition.PrefabName,
+                        candidate => ValidateDefinitionPrefab(definition.Kind, candidate),
+                        out target.Prefab))
                 {
-                    reason = "definition prefab is unavailable or incompatible";
+                    reason = "definition " + i + " prefab '" + definition.PrefabName +
+                             "' is unavailable or incompatible with " + definition.Kind;
                     return false;
                 }
                 if (!string.IsNullOrEmpty(definition.SubPrefabName) &&
@@ -824,9 +931,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     Entity attachedPrefab;
                     if (target.Attached != Entity.Null ||
                         !_prefabIndex.TryResolve(definition.AttachedPrefabName,
-                            out attachedPrefab) ||
-                        !IsCompatiblePlaceholderAttachment(definition,
-                            target.Prefab, attachedPrefab))
+                            candidate => IsCompatiblePlaceholderAttachment(definition,
+                                target.Prefab, candidate), out attachedPrefab))
                     {
                         reason = "prefab-local attachment is unavailable or incompatible";
                         return false;
@@ -839,9 +945,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     return false;
                 }
                 if (definition.HasOwnerDefinition &&
-                    (!_prefabIndex.TryResolve(definition.OwnerDefinitionPrefabName,
-                        out target.OwnerDefinitionPrefab) ||
-                     !EntityManager.HasComponent<ObjectData>(target.OwnerDefinitionPrefab)))
+                    !_prefabIndex.TryResolve(definition.OwnerDefinitionPrefabName,
+                        candidate => EntityManager.HasComponent<ObjectData>(candidate),
+                        out target.OwnerDefinitionPrefab))
                 {
                     reason = "owner-definition prefab is unavailable";
                     return false;

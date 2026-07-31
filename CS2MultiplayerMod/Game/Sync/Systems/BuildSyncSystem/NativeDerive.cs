@@ -141,8 +141,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         /// <summary>
         /// Reproduce a remote upgrade or relocation by running the game's own definition generator
-        /// against this machine's world, with the inputs the tool had: the prefab, the building being
-        /// upgraded or moved, one control point, and the tool's random seed.
+        /// against this machine's world, with the inputs the tool had: the prefab, owner/original
+        /// object, one control point (including its snapped target), and the tool's random seed.
         ///
         /// Everything else the transaction contains - the host building's re-commit, the road it
         /// attaches to, re-commits of every existing sub-net with its end nodes preserved, the
@@ -153,8 +153,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// a road subdivided differently.
         /// </summary>
         internal NativeDeriveResult TryDeriveObjectTransaction(Entity objectPrefab, Entity owner,
-            Entity original, float3 position, quaternion rotation, float elevation, uint toolSeed,
-            string source, System.Action onCommitLost, System.Action onCommitComplete)
+            Entity original, Entity attachmentTarget, float3 position, quaternion rotation,
+            float elevation, uint toolSeed, string source, System.Action onCommitLost,
+            System.Action onCommitComplete, bool stamping = false)
         {
             if (!CanDeriveNativeTransactions) return NativeDeriveResult.Unsupported;
             if (_nativeNetCoordinator == null || _nativeNetCoordinator.IsCommitBusy ||
@@ -179,6 +180,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     m_Position = position,
                     m_HitPosition = position,
                     m_Rotation = rotation,
+                    // The snapped road/node is semantic input, not just preview state. It drives
+                    // attachment changes, route-lane movement, and old/new road re-commits.
+                    m_OriginalEntity = attachmentTarget,
                     m_Elevation = elevation,
                 });
 
@@ -196,7 +200,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     false,                                      // editorMode
                     _cityConfig != null && _cityConfig.leftHandTraffic,
                     false,                                      // removing
-                    false,                                      // stamping
+                    // Stamping makes the generator omit the asset-stamp root object and expand the
+                    // prefab's subnet/subobject/area graph directly, exactly as the local tool does.
+                    stamping,
                     0f, 0f, 0f,                                 // brush size/angle/strength
                     0f,                                         // distance (0 = single placement)
                     0f,                                         // deltaTime (creature spawning only)
@@ -243,8 +249,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return NativeDeriveResult.Failed;
             }
 
+            // A stamp graph is rootless by design - the generator omits the stamp's own object -
+            // so it must be armed as one, or transaction validation rejects it for having no
+            // top-level object and the placement is replayed until it is dropped.
             if (!_nativeNetCoordinator.ArmObjectCommit(onCommitLost, onCommitComplete,
-                    "derived " + source + " defs=" + derived))
+                    "derived " + source + " defs=" + derived, stamping))
             {
                 _nativeNetCoordinator.CancelPreparedDefinitionFrame();
                 return NativeDeriveResult.Busy;

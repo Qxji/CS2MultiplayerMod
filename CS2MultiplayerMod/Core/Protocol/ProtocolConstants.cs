@@ -4,7 +4,14 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v30 carries zoning-block geometry and portable cell-state metadata so zoning is
+        /// Current v32 sends a stamped intersection as the inputs its tool had - asset-stamp prefab,
+        /// one control point, and the tool seed - so the receiver regenerates the graph with the
+        /// game's own generator. Replaying the finished definitions could not preserve the stamp's
+        /// internal junctions: courses share a node only on an exact endpoint-position match.
+        /// v31 carries source/destination net attachment anchors and stable object identity
+        /// with relocation commands, so roadside objects and road-connected buildings re-run their
+        /// complete move lifecycle on every peer. v30 carries zoning-block geometry and portable
+        /// cell-state metadata so zoning is
         /// mapped by world position when road-generated block layouts differ between peers. v29
         /// marks a disconnect notice as graceful, so a host that simply left the game
         /// ends the session cleanly on every client instead of reporting a connection error.
@@ -42,7 +49,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 30;
+        public const int ProtocolVersion = 32;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

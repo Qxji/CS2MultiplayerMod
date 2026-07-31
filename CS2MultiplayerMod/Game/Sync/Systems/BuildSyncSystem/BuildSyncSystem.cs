@@ -70,8 +70,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool _localNetToolRanThisFrame;
         private bool _localObjectApplyThisFrame;
         // The object/upgrade tool that was active until it applied and handed activeTool back to the
-        // default tool. Valid for that one frame only - see ObserveLocalToolOutput.
+        // default tool. Valid for that one frame only - see ObserveLocalToolOutput. Owned-area
+        // handoffs have their own explicit recreate marker and do not depend on prior-frame state.
         private global::Game.Tools.ToolBaseSystem _switchedAwayObjectTool;
+        // The move tool clears its control-point list as it applies. Sample the standing snapped
+        // point on preview frames so the apply capture can still recover its destination net parent.
+        private ControlPoint _lastObjectToolControlPoint;
+        private bool _hasLastObjectToolControlPoint;
+        // The stamp placement the standing definitions were generated from. An asset stamp travels
+        // as this one point plus its prefab and tool seed, so the peer regenerates the graph rather
+        // than rebuilding it from transmitted definitions.
+        private ControlPoint _lastStampControlPoint;
+        private bool _hasLastStampControlPoint;
         private bool _partialPlacementRecoveryRequested;
         private EntityQuery _createdObjects;
         private EntityQuery _createdAppliedObjects;
@@ -218,7 +228,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (Mod.Service != null)
             {
                 _observer = new CommandObserver(_incoming,
-                    ObjectPlacementCommand.Id, ObjectToolOperationCommand.Id)
+                    ObjectPlacementCommand.Id, ObjectToolOperationCommand.Id,
+                    AssetStampCommand.Id)
                 {
                     MaxBodyBytes = ObjectToolOperationCommand.MaxEncodedBytes,
                 };
@@ -249,6 +260,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _localNetToolRanThisFrame = false;
             _localObjectApplyThisFrame = false;
             _switchedAwayObjectTool = null;
+            _hasLastObjectToolControlPoint = false;
+            _hasLastStampControlPoint = false;
             _localLifecycleApplyThisFrame = false;
             _partialPlacementRecoveryRequested = false;
             DeferForTerrain = false;
@@ -311,31 +324,78 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         ///
         /// ToolSystem drives the whole ToolUpdate phase from inside its own update, so by the time
         /// any of our systems run the active tool has already made its decision this frame. A
-        /// one-shot action - a relocation, an upgrade that forbids multiples - assigns the default
-        /// tool to <c>activeTool</c> as part of applying, so reading only <c>activeTool</c> here is
-        /// blind on exactly the frame that matters. Keep the last object-lifecycle tool for one
-        /// frame and believe its own <see cref="ApplyMode"/> instead.
+        /// one-shot action can assign the default tool, or the owned-area editor for a
+        /// non-overlapping lot, to <c>activeTool</c> as part of applying. Reading only
+        /// <c>activeTool</c> is blind on exactly that frame. Keep the last object-lifecycle tool for
+        /// one frame and accept only those two engine-owned transitions.
         /// </summary>
         public void ObserveLocalToolOutput()
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
-            bool activeIsLifecycleTool = IsObjectLifecycleTool(active);
+            ObjectToolSystem activeObjectTool = active as ObjectToolSystem;
+            if (activeObjectTool != null)
+            {
+                if (activeObjectTool.actualMode == ObjectToolSystem.Mode.Move)
+                    RememberObjectToolControlPoint(activeObjectTool);
+                else
+                    _hasLastObjectToolControlPoint = false;
+
+                // The apply frame's capture runs at ToolUpdate, before this sample, so it reads the
+                // preview point that actually produced the definitions now committing.
+                if (activeObjectTool.actualMode == ObjectToolSystem.Mode.Stamp)
+                    RememberStampControlPoint(activeObjectTool);
+                else
+                    _hasLastStampControlPoint = false;
+            }
+            Entity recreatedArea = _areaToolSystem != null
+                ? _areaToolSystem.recreate
+                : Entity.Null;
+            // A non-overlapping owned lot is one lifecycle action split across two tools. The
+            // object tool leaves an applying graph standing, assigns that lot to AreaTool.recreate,
+            // and switches activeTool before later observers run. ToolSystem.applyMode still belongs
+            // to the tool that ran this phase, so this conjunction identifies exactly the transition
+            // frame rather than every frame spent drawing the area.
+            bool objectToOwnedAreaHandoff =
+                active is AreaToolSystem &&
+                recreatedArea != Entity.Null &&
+                _toolSystem != null &&
+                _toolSystem.applyMode == ApplyMode.Apply &&
+                _objectToolSystem != null &&
+                _objectToolSystem.applyMode == ApplyMode.Apply;
+
+            // Conversely, closing or cancelling that polygon switches activeTool back before the
+            // area tool's output is consumed. The object tool is current at that point but did not
+            // run, and its old ApplyMode must not be interpreted as a second object placement.
+            bool returningFromOwnedArea =
+                active is ObjectToolSystem &&
+                recreatedArea != Entity.Null;
+            bool activeLifecycleToolRan =
+                IsObjectLifecycleTool(active) && !returningFromOwnedArea;
             _localNetToolRanThisFrame = active is global::Game.Tools.NetToolSystem;
-            // Only a hand-back to the default tool is a one-shot apply. Choosing a different build
-            // tool is a user action, and its own Apply must never be read as the object tool's.
-            global::Game.Tools.ToolBaseSystem lifecycleTool = activeIsLifecycleTool ? active
-                : active is global::Game.Tools.DefaultToolSystem ? _switchedAwayObjectTool
-                : null;
+            // Default hand-backs and recreate-area handoffs are engine-owned transitions. Any
+            // other different build tool is a user action and must not inherit the prior tool's
+            // Apply state.
+            global::Game.Tools.ToolBaseSystem lifecycleTool = null;
+            if (activeLifecycleToolRan)
+                lifecycleTool = active;
+            else if (objectToOwnedAreaHandoff)
+                lifecycleTool = _objectToolSystem;
+            else if (active is global::Game.Tools.DefaultToolSystem)
+                lifecycleTool = _switchedAwayObjectTool;
             // Consumed after one frame: only the switch-away frame still belongs to that tool.
-            _switchedAwayObjectTool = activeIsLifecycleTool ? active : null;
+            _switchedAwayObjectTool = activeLifecycleToolRan ? active : null;
 
             bool applying = lifecycleTool != null &&
                             lifecycleTool.applyMode == ApplyMode.Apply;
             RememberSelectedAssetStampPrefab(lifecycleTool);
             SampleLifecycleToolSeed(lifecycleTool);
-            _localObjectToolRanThisFrame = activeIsLifecycleTool || applying;
+            _localObjectToolRanThisFrame = activeLifecycleToolRan || applying;
             _localObjectApplyThisFrame = applying;
             _localLifecycleApplyThisFrame = _localObjectApplyThisFrame;
+
+            if (objectToOwnedAreaHandoff && applying)
+                Diagnostics.FlightRecorder.Note(
+                    "object lifecycle apply retained across owned-area handoff");
         }
 
         // Sampled at ToolUpdate and kept for the rest of the frame, unlike
@@ -585,6 +645,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool RequiresCompleteObjectLifecycle(Entity prefab)
         {
             return EntityManager.HasComponent<BuildingData>(prefab) ||
+                   EntityManager.HasComponent<TransportStopData>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubObject>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubNet>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubArea>(prefab);

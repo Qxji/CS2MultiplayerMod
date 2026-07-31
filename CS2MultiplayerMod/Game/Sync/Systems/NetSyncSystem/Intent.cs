@@ -131,8 +131,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             if (!(active is global::Game.Tools.NetToolSystem) ||
-                active.applyMode != global::Game.Tools.ApplyMode.Apply ||
-                _cachedLocalCourses.Count == 0) return;
+                active.applyMode != global::Game.Tools.ApplyMode.Apply) return;
+
+            // Re-read the graph that is actually standing behind this Apply. The after-barrier cache
+            // is intentionally retained across empty preview frames, but a grid can regenerate all of
+            // its courses on the click frame. Publishing a stale or partial cache makes the final-edge
+            // fallback replay every generated edge as a separate operation. A net-owned object graph
+            // (for example a network prefab with its own root object) clears the course cache here and
+            // is captured atomically by BuildSyncSystem instead.
+            if (!_standingLocalDefinitions.IsEmptyIgnoreFilter)
+            {
+                NativeArray<Entity> definitions =
+                    _standingLocalDefinitions.ToEntityArray(Allocator.Temp);
+                try
+                {
+                    ObserveLocalNetDefinitions(definitions);
+                }
+                finally
+                {
+                    definitions.Dispose();
+                }
+            }
+            if (_cachedLocalCourses.Count == 0) return;
 
             // When a remote batch is armed, BeginRealizeFrame has already Disabled its Temps and
             // restored the local preview for this Apply frame. The local operation therefore commits

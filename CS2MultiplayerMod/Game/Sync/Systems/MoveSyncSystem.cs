@@ -16,9 +16,9 @@ using CS2MultiplayerMod.Game.Sync.Commands;
 namespace CS2MultiplayerMod.Game.Sync.Systems
 {
     /// <summary>
-    /// Replicates relocations. A simple unowned object moves through one relocate definition;
-    /// anything with owned geometry (a building's lot, driveways, installed upgrades) is re-derived
-    /// on the receiver by the game's own definition generator from the same inputs the move tool had.
+    /// Replicates relocations. A simple free-standing object moves through one relocate definition;
+    /// anything with owned geometry, a transport lifecycle, or a net attachment is re-derived on the
+    /// receiver by the game's own definition generator from the same inputs the move tool had.
     /// </summary>
     public partial class MoveSyncSystem : GameSystemBase
     {
@@ -146,7 +146,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 for (int i = 0; i < entities.Length; i++)
                 {
                     Entity entity = entities[i];
-                    string name = _prefabSystem.GetPrefabName(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                    string name = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(name)) continue;
 
                     float3 oldPos = EntityManager.GetComponentData<MovedLocation>(entity).m_OldPosition;
@@ -160,7 +161,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     // tool carries them as explicit definitions rather than re-deriving them. The
                     // receiver reproduces that by re-running the game's own generator over the same
                     // inputs, so the whole owned graph follows from prefab + old position + new
-                    // transform - no need to ship the sender's several-hundred-definition batch.
+                    // transform + snapped parent - no need to ship the sender's several-hundred-
+                    // definition batch.
                     float elevation = EntityManager.HasComponent<Elevation>(entity)
                         ? EntityManager.GetComponentData<Elevation>(entity).m_Elevation
                         : 0f;
@@ -174,6 +176,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         Elevation = elevation,
                         ToolRandomSeed = buildSync.AppliedLifecycleToolSeed,
                     };
+                    CaptureFinalEntityIdentity(command, entity, prefab, oldPos);
+                    if (HasOwnedLifecycle(entity, prefab) &&
+                        !command.DestinationAttachmentKnown)
+                    {
+                        Mod.log.Warn("[MP] MoveSync: final-entity fallback for '" + name +
+                                     "' could not recover the applied road attachment; skipping " +
+                                     "the unsafe partial move.");
+                        Diagnostics.FlightRecorder.Note("relocation fallback lacked attachment prefab=" +
+                                                        name);
+                        continue;
+                    }
                     session.SendCommand(0, ObjectMoveCommand.Id, command.Encode());
                     Mod.Verbose("[MP] MoveSync captured relocation of '" + name + "'.");
                 }
@@ -189,8 +202,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// <c>BuildSyncSystem.CaptureLocalRelocationForApply</c>). That is the reliable signal: the
         /// apply pass records no "came from" marker on the moved entity itself.
         /// </summary>
-        public void PublishLocalRelocation(Entity prefab, float3 oldPosition, float3 newPosition,
-            quaternion rotation, float elevation, uint toolSeed)
+        public void PublishLocalRelocation(Entity prefab, Entity original, float3 oldPosition,
+            float3 newPosition, quaternion rotation, float elevation, uint toolSeed,
+            Entity destinationParent, bool destinationAttachmentKnown)
         {
             MultiplayerService service = Mod.Service;
             if (service == null || !service.GameplaySyncReady) return;
@@ -198,10 +212,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             string name = _prefabSystem.GetPrefabName(prefab);
             if (string.IsNullOrEmpty(name)) return;
-
-            long now = service.NowMs;
-            // Also stops the MovedLocation sweep below from sending this same move again.
-            _guard.Mark(MoveKey(name, newPosition), now);
 
             var command = new ObjectMoveCommand
             {
@@ -213,6 +223,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Elevation = elevation,
                 ToolRandomSeed = toolSeed,
             };
+            CaptureOriginalIdentity(command, original);
+            CaptureSourceAttachment(command, original);
+            if (!CaptureDestinationAttachment(command, destinationParent, newPosition,
+                    destinationAttachmentKnown))
+            {
+                Diagnostics.FlightRecorder.Note("relocation destination attachment could not be encoded");
+                return;
+            }
+            // Also stops the MovedLocation sweep below from sending this same move again. Mark only
+            // once encoding succeeded so the final-entity fallback remains available on failure.
+            _guard.Mark(MoveKey(name, newPosition), service.NowMs);
             service.Session.SendCommand(0, ObjectMoveCommand.Id, command.Encode());
             Mod.Verbose("[MP] MoveSync captured relocation of '" + name + "' from the tool definition.");
             Diagnostics.FlightRecorder.Note("relocation captured prefab=" + name +
@@ -230,7 +251,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     // loop the whole world through recovery (which re-failed every reload).
                     Mod.log.Warn("[MP] MoveSync: relocation target did not resolve within the retry " +
                                  "window; dropping this move (use /sync if the city drifts).");
-                    Diagnostics.FlightRecorder.Note("legacy move dropped after retry window");
+                    Diagnostics.FlightRecorder.Note("move dropped after retry window");
                     _hasBlockedMove = false;
                     _blockedMove = null;
                     return;
@@ -248,7 +269,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 _hasBlockedMove = true;
                 _blockedMove = message;
                 _blockedMoveDeadline = now + MoveRetryWindowMs;
-                Diagnostics.FlightRecorder.Note("legacy move target retrying");
+                Diagnostics.FlightRecorder.Note("move target retrying");
                 return;
             }
         }
@@ -265,44 +286,74 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
 
             Entity prefab;
-            if (!_prefabIndex.TryResolve(command.PrefabName, out prefab)) return false;
+            if (!_prefabIndex.TryResolve(command.PrefabName,
+                    candidate => EntityManager.HasComponent<ObjectData>(candidate),
+                    out prefab)) return false;
 
             var oldPos = new float3(command.OldX, command.OldY, command.OldZ);
             var newPos = new float3(command.NewX, command.NewY, command.NewZ);
-            Entity original = FindAt(prefab, oldPos);
+            BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
+            Entity sourceParent;
+            if (!TryResolveAttachment(buildSync, command.SourceAttachmentKnown,
+                    command.SourceAttachKind,
+                    new float3(command.SourceAttachX, command.SourceAttachY,
+                        command.SourceAttachZ), out sourceParent))
+                return false;
+            Entity destinationParent;
+            if (!TryResolveAttachment(buildSync, command.DestinationAttachmentKnown,
+                    command.DestinationAttachKind,
+                    new float3(command.DestinationAttachX, command.DestinationAttachY,
+                        command.DestinationAttachZ), out destinationParent))
+                return false;
+
+            Entity original = FindAt(prefab, oldPos, command.HasOriginalRandomSeed,
+                command.OriginalRandomSeed,
+                command.SourceAttachmentKnown && command.SourceAttachKind != ObjectAttachKind.None,
+                sourceParent);
             if (original == Entity.Null)
             {
                 // A reliable replay may arrive after this same move already committed.
-                if (FindAt(prefab, newPos) != Entity.Null) return true;
+                if (FindAt(prefab, newPos, command.HasOriginalRandomSeed,
+                        command.OriginalRandomSeed,
+                        command.DestinationAttachmentKnown &&
+                        command.DestinationAttachKind != ObjectAttachKind.None,
+                        destinationParent) != Entity.Null) return true;
                 return false;
             }
             var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
-            if (RequiresCompleteLifecycle(original))
+            bool requiresCompleteLifecycle = RequiresCompleteLifecycle(original, prefab, command);
+            if (requiresCompleteLifecycle && !command.DestinationAttachmentKnown)
             {
-                // Moving only the root would leave this object's owned lot, driveways and upgrades
-                // behind. Hand the same inputs the move tool had to the game's own generator: it
-                // emits the relocation of every owned element, re-commits the roads the object was
-                // and is attached to, and clears what the new footprint covers.
+                Mod.log.Warn("[MP] MoveSync: relocation of '" + command.PrefabName +
+                             "' lacks an authoritative destination attachment; dropping it instead " +
+                             "of detaching its owned/roadside graph.");
+                return true;
+            }
+
+            if (requiresCompleteLifecycle)
+            {
+                // Native derivation is required for small attached objects such as mailboxes too:
+                // their route lanes and PathTargetMoved event are part of the normal transaction.
                 SimulationCommandMessage retained = message;
-                BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
                 BuildSyncSystem.NativeDeriveResult derived = buildSync.TryDeriveObjectTransaction(
-                    prefab, Entity.Null, original, newPos, rotation, command.Elevation,
-                    command.ToolRandomSeed, "move " + command.PrefabName,
+                    prefab, Entity.Null, original, destinationParent, newPos, rotation,
+                    command.Elevation, command.ToolRandomSeed, "move " + command.PrefabName,
                     () => _incoming.Enqueue(retained), null);
                 if (derived == BuildSyncSystem.NativeDeriveResult.Busy) return false;
                 if (derived == BuildSyncSystem.NativeDeriveResult.Armed)
                 {
                     _guard.Mark(MoveKey(command.PrefabName, newPos), now);
                     Mod.Verbose("[MP] MoveSync realize: derived relocation of '" +
-                                command.PrefabName + "' from player " + message.OriginPlayerId + ".");
+                                command.PrefabName + "' from player " +
+                                message.OriginPlayerId + ".");
                     return true;
                 }
                 if (derived == BuildSyncSystem.NativeDeriveResult.Failed) return true;
 
-                // No generator on this build of the game: a root-only move is worse than none, since
-                // it would strand the owned graph at the old position.
+                // A root-only compatibility move would strand an owned graph or bypass attachment /
+                // transport-stop lifecycle events, so unsupported native derivation is a hard stop.
                 Mod.log.Warn("[MP] MoveSync: relocation of '" + command.PrefabName +
-                             "' needs the game's definition generator; dropping this move.");
+                             "' needs the game's object lifecycle generator; dropping this move.");
                 return true;
             }
 
@@ -317,15 +368,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     {
                         m_Prefab = prefab,
                         m_Original = original,
-                        m_RandomSeed = 0,
+                        m_RandomSeed = command.HasOriginalRandomSeed
+                            ? command.OriginalRandomSeed
+                            : 0,
                         m_Flags = CreationFlags.Permanent | CreationFlags.Relocate,
                     });
                     EntityManager.AddComponentData(definition, new ObjectDefinition
                     {
+                        m_ParentMesh = -1,
                         m_Position = newPos,
                         m_Rotation = rotation,
+                        m_LocalPosition = newPos,
+                        m_LocalRotation = rotation,
                         m_Scale = new float3(1f, 1f, 1f),
+                        m_Intensity = 1f,
                         m_Probability = 100,
+                        m_PrefabSubIndex = -1,
+                        m_Elevation = command.Elevation,
                     });
                     EntityManager.AddComponent<Updated>(definition);
                     EntityManager.AddComponent<Deleted>(definition);
@@ -339,37 +398,198 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // the world (the placer can /sync if the object looks out of place).
                 Mod.log.Error("[MP] MoveSync realize FAILED for '" + command.PrefabName +
                               "'; dropping this move: " + ex);
-                Diagnostics.FlightRecorder.Note("legacy move realize failed; dropped");
+                Diagnostics.FlightRecorder.Note("move realize failed; dropped");
             }
             return true;
         }
 
-        private Entity FindAt(Entity prefab, float3 position)
+        private Entity FindAt(Entity prefab, float3 position, bool hasRandomSeed,
+            int randomSeed, bool requireAttachment, Entity attachmentParent)
         {
+            Entity best = Entity.Null;
+            Entity bestSeedMatch = Entity.Null;
+            float bestDistanceSq = float.MaxValue;
+            float bestSeedDistanceSq = float.MaxValue;
             NativeArray<Entity> candidates = _liveObjects.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < candidates.Length; i++)
                 {
-                    if (EntityManager.GetComponentData<PrefabRef>(candidates[i]).m_Prefab != prefab) continue;
-                    float3 pos = EntityManager.GetComponentData<Transform>(candidates[i]).m_Position;
-                    if (math.distancesq(pos, position) <= 4f) return candidates[i];
+                    Entity candidate = candidates[i];
+                    if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab) continue;
+                    if (requireAttachment &&
+                        NetAttachment.GetNetParent(EntityManager, candidate) != attachmentParent)
+                        continue;
+
+                    float3 pos = EntityManager.GetComponentData<Transform>(candidate).m_Position;
+                    float distanceSq = math.distancesq(pos, position);
+                    if (distanceSq > 4f) continue;
+
+                    if (distanceSq < bestDistanceSq)
+                    {
+                        best = candidate;
+                        bestDistanceSq = distanceSq;
+                    }
+
+                    if (!hasRandomSeed ||
+                        !EntityManager.HasComponent<PseudoRandomSeed>(candidate) ||
+                        EntityManager.GetComponentData<PseudoRandomSeed>(candidate).m_Seed != randomSeed ||
+                        distanceSq >= bestSeedDistanceSq) continue;
+                    bestSeedMatch = candidate;
+                    bestSeedDistanceSq = distanceSq;
                 }
             }
             finally
             {
                 candidates.Dispose();
             }
-            return Entity.Null;
+            // Seed is a strong discriminator for adjacent identical props, but position remains a
+            // compatibility fallback for old/save-created entities whose seed drifted historically.
+            return bestSeedMatch != Entity.Null ? bestSeedMatch : best;
         }
 
-        private bool RequiresCompleteLifecycle(Entity entity)
+        private static bool TryResolveAttachment(BuildSyncSystem buildSync, bool known,
+            ObjectAttachKind kind, float3 anchor, out Entity parent)
+        {
+            parent = Entity.Null;
+            if (!known || kind == ObjectAttachKind.None) return true;
+            parent = buildSync.ResolveNetAttachment(kind, anchor);
+            return parent != Entity.Null;
+        }
+
+        private bool RequiresCompleteLifecycle(Entity entity, Entity prefab,
+            ObjectMoveCommand command)
+        {
+            return HasOwnedLifecycle(entity, prefab) ||
+                   (command.SourceAttachmentKnown &&
+                    command.SourceAttachKind != ObjectAttachKind.None) ||
+                   (command.DestinationAttachmentKnown &&
+                    command.DestinationAttachKind != ObjectAttachKind.None);
+        }
+
+        private bool HasOwnedLifecycle(Entity entity, Entity prefab)
         {
             return EntityManager.HasComponent<Building>(entity) ||
+                   EntityManager.HasComponent<global::Game.Objects.Attached>(entity) ||
+                   EntityManager.HasComponent<global::Game.Routes.TransportStop>(entity) ||
+                   EntityManager.HasComponent<TransportStopData>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Buildings.InstalledUpgrade>(entity) ||
                    EntityManager.HasBuffer<global::Game.Objects.SubObject>(entity) ||
                    EntityManager.HasBuffer<global::Game.Net.SubNet>(entity) ||
                    EntityManager.HasBuffer<global::Game.Areas.SubArea>(entity);
+        }
+
+        private void CaptureOriginalIdentity(ObjectMoveCommand command, Entity original)
+        {
+            if (!EntityManager.HasComponent<PseudoRandomSeed>(original)) return;
+            command.HasOriginalRandomSeed = true;
+            command.OriginalRandomSeed = EntityManager.GetComponentData<PseudoRandomSeed>(original).m_Seed;
+        }
+
+        private void CaptureSourceAttachment(ObjectMoveCommand command, Entity original)
+        {
+            if (!EntityManager.HasComponent<global::Game.Objects.Attached>(original))
+            {
+                command.SourceAttachmentKnown = true;
+                command.SourceAttachKind = ObjectAttachKind.None;
+                return;
+            }
+
+            global::Game.Objects.Attached attached =
+                EntityManager.GetComponentData<global::Game.Objects.Attached>(original);
+            if (attached.m_Parent == original)
+            {
+                command.SourceAttachmentKnown = true;
+                command.SourceAttachKind = ObjectAttachKind.None;
+                return;
+            }
+
+            bool isNode;
+            float3 anchor;
+            if (!NetAttachment.TryGetAttachment(EntityManager, original, out isNode, out anchor))
+                return;
+            SetSourceAttachment(command, isNode, anchor);
+        }
+
+        private bool CaptureDestinationAttachment(ObjectMoveCommand command, Entity parent,
+            float3 newPosition, bool known)
+        {
+            command.DestinationAttachmentKnown = known;
+            if (!known) return true;
+            if (parent == Entity.Null)
+            {
+                command.DestinationAttachKind = ObjectAttachKind.None;
+                return true;
+            }
+
+            bool isNode;
+            float3 anchor;
+            if (!NetAttachment.TryDescribeParent(EntityManager, parent, newPosition,
+                    out isNode, out anchor))
+            {
+                command.DestinationAttachmentKnown = false;
+                return false;
+            }
+            SetDestinationAttachment(command, isNode, anchor);
+            return true;
+        }
+
+        private void CaptureFinalEntityIdentity(ObjectMoveCommand command, Entity original,
+            Entity prefab, float3 oldPosition)
+        {
+            CaptureOriginalIdentity(command, original);
+            if (!EntityManager.HasComponent<global::Game.Objects.Attached>(original))
+            {
+                // For complex objects the final entity does not retain the snapped road control
+                // point, so pretending "None" would detach it. Their pre-apply capture supplies it.
+                if (!HasOwnedLifecycle(original, prefab))
+                {
+                    command.SourceAttachmentKnown = true;
+                    command.SourceAttachKind = ObjectAttachKind.None;
+                    command.DestinationAttachmentKnown = true;
+                    command.DestinationAttachKind = ObjectAttachKind.None;
+                }
+                return;
+            }
+
+            global::Game.Objects.Attached attached =
+                EntityManager.GetComponentData<global::Game.Objects.Attached>(original);
+            bool isNode;
+            float3 anchor;
+            if (attached.m_Parent == original)
+            {
+                command.DestinationAttachmentKnown = true;
+                command.DestinationAttachKind = ObjectAttachKind.None;
+            }
+            else if (NetAttachment.TryGetAttachment(EntityManager, original,
+                         out isNode, out anchor))
+            {
+                SetDestinationAttachment(command, isNode, anchor);
+            }
+
+            if (NetAttachment.TryDescribeParent(EntityManager, attached.m_OldParent, oldPosition,
+                    out isNode, out anchor))
+                SetSourceAttachment(command, isNode, anchor);
+        }
+
+        private static void SetSourceAttachment(ObjectMoveCommand command, bool isNode,
+            float3 anchor)
+        {
+            command.SourceAttachmentKnown = true;
+            command.SourceAttachKind = isNode ? ObjectAttachKind.NetNode : ObjectAttachKind.NetEdge;
+            command.SourceAttachX = anchor.x;
+            command.SourceAttachY = anchor.y;
+            command.SourceAttachZ = anchor.z;
+        }
+
+        private static void SetDestinationAttachment(ObjectMoveCommand command, bool isNode,
+            float3 anchor)
+        {
+            command.DestinationAttachmentKnown = true;
+            command.DestinationAttachKind = isNode ? ObjectAttachKind.NetNode : ObjectAttachKind.NetEdge;
+            command.DestinationAttachX = anchor.x;
+            command.DestinationAttachY = anchor.y;
+            command.DestinationAttachZ = anchor.z;
         }
 
         private static string MoveKey(string prefabName, float3 newPosition) =>
