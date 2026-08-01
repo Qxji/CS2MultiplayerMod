@@ -346,22 +346,29 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Entity resolvedTarget;
                         float resolvedT;
                         int resolvedKind;
+                        bool usedLocalSurface;
                         if (HasExternalNativeTarget(command.Start.Kind))
                         {
-                            bool ok = TryResolveNativeEndpoint(command.Start, placedInfo,
+                            bool ok = TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.Start, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out resolvedTarget, out resolvedT, out resolvedKind);
+                                ref heightData, ref waterData,
+                                out resolvedTarget, out resolvedT, out resolvedKind,
+                                out usedLocalSurface);
                             resolved &= ok;
                             if (ok && !TryClaimSplitTarget(command.Start, resolvedTarget, resolvedKind))
                                 aliasedSplitTarget = true;
                         }
                         if (HasExternalNativeTarget(command.End.Kind))
                         {
-                            bool ok = TryResolveNativeEndpoint(command.End, placedInfo,
+                            bool ok = TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.End, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out resolvedTarget, out resolvedT, out resolvedKind);
+                                ref heightData, ref waterData,
+                                out resolvedTarget, out resolvedT, out resolvedKind,
+                                out usedLocalSurface);
                             resolved &= ok;
                             if (ok && !TryClaimSplitTarget(command.End, resolvedTarget, resolvedKind))
                                 aliasedSplitTarget = true;
@@ -530,32 +537,50 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
 
                     NetPrefabInfo placedInfo = NetInfoOf(prefab);
+                    float2 sourceStartElevation = new float2(command.Start.ElevationLeft,
+                        command.Start.ElevationRight);
+                    float2 sourceEndElevation = new float2(command.End.ElevationLeft,
+                        command.End.ElevationRight);
                     int startKind, endKind;
                     float startT, endT;
                     Entity startSnap, endSnap;
                     bool nativeTargetsResolved = true;
+                    bool startUsedLocalSurface = false, endUsedLocalSurface = false;
 
                     if (command.HasNativeCourse)
                     {
                         if (command.Start.Kind == NetEndpointTargetKind.Infer)
-                            startSnap = ClassifyEndpoint(a, placedInfo, nodeEntities, nodeData,
+                            startSnap = ClassifyEndpointWithLocalSurface(prefab, a,
+                                sourceStartElevation, placedInfo, nodeEntities, nodeData,
                                 edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, out startT, out startKind);
+                                batchNewNodes, batchEdges, ref heightData, ref waterData,
+                                out startT, out startKind);
                         else
-                            nativeTargetsResolved &= TryResolveNativeEndpoint(command.Start, placedInfo,
+                            nativeTargetsResolved &= TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.Start, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out startSnap, out startT, out startKind);
+                                ref heightData, ref waterData,
+                                out startSnap, out startT, out startKind,
+                                out startUsedLocalSurface);
 
                         if (command.End.Kind == NetEndpointTargetKind.Infer)
-                            endSnap = ClassifyEndpoint(d, placedInfo, nodeEntities, nodeData,
+                            endSnap = ClassifyEndpointWithLocalSurface(prefab, d,
+                                sourceEndElevation, placedInfo, nodeEntities, nodeData,
                                 edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, out endT, out endKind);
+                                batchNewNodes, batchEdges, ref heightData, ref waterData,
+                                out endT, out endKind);
                         else
-                            nativeTargetsResolved &= TryResolveNativeEndpoint(command.End, placedInfo,
+                            nativeTargetsResolved &= TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.End, placedInfo,
                                 nodeEntities, nodeData, edgeEntities, edgeCurves,
                                 ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                out endSnap, out endT, out endKind);
+                                ref heightData, ref waterData,
+                                out endSnap, out endT, out endKind,
+                                out endUsedLocalSurface);
+
+                        if (startUsedLocalSurface) _rzLocalSurfaceMatches++;
+                        if (endUsedLocalSurface) _rzLocalSurfaceMatches++;
 
                         // Endpoints the source left for local inference never went through the
                         // operation preflight, so claim every native split target here too.
@@ -589,22 +614,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     {
                         if (command.HasNativeCourse)
                             _nativeTargetDeadlines.Remove(NativeRetryKey(message, command));
-                        startSnap = ClassifyEndpoint(a, placedInfo, nodeEntities, nodeData,
+                        startSnap = ClassifyEndpointWithLocalSurface(prefab, a,
+                            sourceStartElevation, placedInfo, nodeEntities, nodeData,
                             edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                            batchNewNodes, batchEdges, out startT, out startKind);
-                        endSnap = ClassifyEndpoint(d, placedInfo, nodeEntities, nodeData,
+                            batchNewNodes, batchEdges, ref heightData, ref waterData,
+                            out startT, out startKind);
+                        endSnap = ClassifyEndpointWithLocalSurface(prefab, d,
+                            sourceEndElevation, placedInfo, nodeEntities, nodeData,
                             edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                            batchNewNodes, batchEdges, out endT, out endKind);
+                            batchNewNodes, batchEdges, ref heightData, ref waterData,
+                            out endT, out endKind);
                     }
 
                     // The elevation each course end must carry so it lands at the source's height on
                     // this machine's surface (see EndElevation).
                     float startCorrection, endCorrection;
                     float2 startElevation = EndElevation(prefab, startSnap, startKind, a,
-                        new float2(command.Start.ElevationLeft, command.Start.ElevationRight),
+                        sourceStartElevation,
                         ref heightData, ref waterData, out startCorrection);
                     float2 endElevation = EndElevation(prefab, endSnap, endKind, d,
-                        new float2(command.End.ElevationLeft, command.End.ElevationRight),
+                        sourceEndElevation,
                         ref heightData, ref waterData, out endCorrection);
                     TallySurfaceCorrection(startCorrection, endCorrection);
 
@@ -1202,6 +1231,46 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (edge != Entity.Null) { kind = KindSplit; return edge; }
             kind = KindFree;
             return Entity.Null;
+        }
+
+        /// <summary>
+        /// Classify against the source's absolute height first. If that finds open ground and the
+        /// placed network is a utility, retry at the height produced by applying the source endpoint
+        /// elevation to this machine's surface. A successful second lookup means the endpoint is the
+        /// same visible local pipe/cable connection despite terrain or water drift; retaining the
+        /// first result for every other case preserves bridge/tunnel level separation.
+        /// </summary>
+        private Entity ClassifyEndpointWithLocalSurface(Entity prefab, float3 sourcePoint,
+            float2 sourceElevation, NetPrefabInfo placedInfo,
+            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
+            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
+            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
+            NativeList<float3> batchNewNodes, NativeList<Bezier4x3> batchEdges,
+            ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData,
+            out float t, out int kind)
+        {
+            Entity result = ClassifyEndpoint(sourcePoint, placedInfo, nodeEntities, nodeData,
+                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
+                batchNewNodes, batchEdges, out t, out kind);
+            if (kind != KindFree) return result;
+
+            float3 projected;
+            if (!TryProjectUtilityEndpointToLocalSurface(prefab, placedInfo, sourcePoint,
+                    sourceElevation, ref heightData, ref waterData, out projected))
+                return result;
+
+            float projectedT;
+            int projectedKind;
+            Entity projectedResult = ClassifyEndpoint(projected, placedInfo,
+                nodeEntities, nodeData, edgeEntities, edgeCurves,
+                ownedNodeEntities, ownedNodeData, batchNewNodes, batchEdges,
+                out projectedT, out projectedKind);
+            if (projectedKind == KindFree) return result;
+
+            t = projectedT;
+            kind = projectedKind;
+            _rzLocalSurfaceMatches++;
+            return projectedResult;
         }
 
         /// <summary>

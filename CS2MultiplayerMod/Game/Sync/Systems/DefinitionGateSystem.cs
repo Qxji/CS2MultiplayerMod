@@ -81,6 +81,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // armed: the next Apply frame publishes this preview rather than inferring from
                 // its final Created edges.
                 _netSync.ObserveLocalNetDefinitions(definitions);
+                // A newly selected net or a click-frame grid can have no usable graph at the two
+                // earlier pre-output hooks: its definitions exist only in ToolOutputBarrier's
+                // command buffer until this point. Publish the graph now while it is still the raw
+                // pre-PostTool NetCourse operation. The per-frame capture guard makes this a no-op
+                // when SyncRealizeSystem already sent the standing preview.
+                _netSync.CaptureBufferedLocalNetApply();
                 if (_buildSync == null)
                     _buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
                 _buildSync.ObserveLocalObjectToolOutput(definitions);

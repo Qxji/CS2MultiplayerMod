@@ -73,9 +73,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                                                   " maxM=" + _rzSurfaceCorrectionMax.ToString("F1"));
             }
 
+            if (_rzLocalSurfaceMatches > 0)
+            {
+                Mod.log.Info("[MP] NetSync: " + _rzLocalSurfaceMatches +
+                             " utility endpoint(s)/5s reused connectivity through local-surface " +
+                             "height projection instead of creating an overlapping free node.");
+                Diagnostics.FlightRecorder.Note("net utility local-surface matches=" +
+                                                  _rzLocalSurfaceMatches);
+            }
+
             _diag.Clear();
             _diagTotal = 0;
             _rzSegments = _rzSnapEnds = _rzMergeEnds = _rzMidEnds = _rzFreeEnds = 0;
+            _rzLocalSurfaceMatches = 0;
             _rzSurfaceCorrections = 0;
             _rzSurfaceCorrectionMax = 0f;
             _peakCreated = _peakUpdated = _peakDeleted = 0;

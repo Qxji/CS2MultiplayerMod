@@ -11,10 +11,11 @@ using CS2MultiplayerMod.Game.Sync.Commands;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 {
-    // Native tool-intent capture. DefinitionGateSystem calls ObserveLocalNetDefinitions after the
-    // tool-output barrier; SyncRealizeSystem calls CaptureLocalNetApply before ToolOutputSystem
-    // consumes an Apply frame. Keeping those two points separate lets the previous frame's exact
-    // preview definition describe the Temps that are about to commit.
+    // Native tool-intent capture. DefinitionGateSystem observes definitions after the tool-output
+    // barrier and also gets the last chance to publish an Apply whose graph was generated on that
+    // same frame. SyncRealizeSystem still captures the usual case earlier from the previous frame's
+    // exact preview. Together those two slots cover both a standing preview and a click that creates
+    // its first entity-visible course graph only at the barrier.
     public partial class NetSyncSystem
     {
         private const long CommittedSideEffectWindowMs = 5000;
@@ -129,6 +130,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         public void CaptureLocalNetApply()
         {
+            CaptureLocalNetApply(refreshStandingDefinitions: true, barrierRecovery: false);
+        }
+
+        /// <summary>
+        /// Last-chance Apply capture after <see cref="global::Game.Tools.ToolOutputBarrier"/> has made
+        /// this frame's buffered definitions entity-visible. <see cref="DefinitionGateSystem"/> has
+        /// already passed those exact definitions to <see cref="ObserveLocalNetDefinitions"/>, so do
+        /// not replace them with the older untagged standing graph here.
+        /// </summary>
+        public void CaptureBufferedLocalNetApply()
+        {
+            CaptureLocalNetApply(refreshStandingDefinitions: false, barrierRecovery: true);
+        }
+
+        private void CaptureLocalNetApply(bool refreshStandingDefinitions, bool barrierRecovery)
+        {
             MultiplayerService service = Mod.Service;
             if (service == null || !service.GameplaySyncReady || _nativeApplyCapturedFrame == _realizeFrame)
                 return;
@@ -143,7 +160,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // fallback replay every generated edge as a separate operation. A net-owned object graph
             // (for example a network prefab with its own root object) clears the course cache here and
             // is captured atomically by BuildSyncSystem instead.
-            if (!_standingLocalDefinitions.IsEmptyIgnoreFilter)
+            if (refreshStandingDefinitions && !_standingLocalDefinitions.IsEmptyIgnoreFilter)
             {
                 NativeArray<Entity> definitions =
                     _standingLocalDefinitions.ToEntityArray(Allocator.Temp);
@@ -215,7 +232,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (sent == count) _nativeApplyCapturedFrame = _realizeFrame;
             if (sent > 0)
                 Diagnostics.FlightRecorder.Note("net intent apply op=" + operationId + " courses=" +
-                                                  sent + "/" + count);
+                                                  sent + "/" + count +
+                                                  (barrierRecovery ? " source=barrier" : string.Empty));
         }
 
         /// <summary>
