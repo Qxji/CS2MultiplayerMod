@@ -46,14 +46,16 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
         /// Bounds for the paced send rate. Steam's send rate is a clamp, not an estimate -
         /// its own documentation says to set the min and the max to the same value to pick
         /// a rate - so whatever goes in here is what gets pushed at the wire, congestion or
-        /// not. <see cref="Govern"/> moves it, starting at twice Steam's 256 KiB/s default.
+        /// not. <see cref="Govern"/> moves it, opening at four times Steam's 256 KiB/s
+        /// default because no broadband uplink is troubled by 1 MiB/s and every second
+        /// spent climbing to it is a second of the transfer.
         /// </summary>
         private const int SendRateFloorBytesPerSecond = 128 * 1024;
-        private const int SendRateStartBytesPerSecond = 512 * 1024;
-        private const int SendRateCeilingBytesPerSecond = 8 * 1024 * 1024;
+        private const int SendRateStartBytesPerSecond = 1024 * 1024;
+        private const int SendRateCeilingBytesPerSecond = 16 * 1024 * 1024;
 
         /// <summary>Additive probe above the rate already known to hold, per second.</summary>
-        private const int SendRateStepBytesPerSecond = 64 * 1024;
+        private const int SendRateStepBytesPerSecond = 192 * 1024;
 
         /// <summary>How often the rate is revisited, and how often a backlog reports itself.</summary>
         private const int GovernIntervalMs = 1000;
@@ -66,21 +68,43 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
         /// </summary>
         private const int CongestedPingExcessMs = 40;
 
-        /// <summary>Below this the peer is dropping enough of what we send to act on.</summary>
-        private const float HealthyRemoteQuality = 0.97f;
+        /// <summary>
+        /// Below this the peer is dropping enough of what we send to act on. A saturated
+        /// path loses a percent or two as a matter of course and the reliable layer just
+        /// resends it, so a threshold set near perfect fires on healthy traffic and spends
+        /// the whole transfer backing away from a wire that was never the problem.
+        /// </summary>
+        private const float HealthyRemoteQuality = 0.90f;
 
         /// <summary>
-        /// Floor on a single loss-driven cut. A quality reading describes a window several
-        /// seconds old, so one stale sample must not be able to gut the rate.
+        /// Floor on a single congestion-driven cut. A quality reading describes a window
+        /// several seconds old, so one sample must not be able to gut the rate - but it is
+        /// paired with <see cref="StrikesBeforeBackoff"/>, and a complaint confirmed twice
+        /// deserves a decisive answer rather than a timid one.
         /// </summary>
-        private const float MaxSingleBackoff = 0.4f;
+        private const float MaxSingleBackoff = 0.5f;
 
         /// <summary>
-        /// Seconds to hold a rate after cutting it. Long enough that the peer's quality
-        /// window has refreshed before the next judgement, or the same congestion gets
-        /// punished several times over.
+        /// Consecutive seconds a path must complain before the rate moves. One reading is
+        /// as likely to be the tail of a cut already made as it is fresh congestion.
         /// </summary>
-        private const int BackoffHoldTicks = 6;
+        private const int StrikesBeforeBackoff = 2;
+
+        /// <summary>
+        /// Seconds to hold a rate after cutting it, so the peer's quality window has
+        /// refreshed before the next judgement and the same congestion is not punished
+        /// several times over. That window has been observed lagging its own event by
+        /// 6-9 s, and this plus <see cref="StrikesBeforeBackoff"/> is what has to cover it:
+        /// the strikes are counted after the hold expires, so cuts stay 7 s apart.
+        /// </summary>
+        private const int BackoffHoldTicks = 5;
+
+        /// <summary>
+        /// Share of the rate that was flowing when the path complained which still counts
+        /// as "known to carry". See <see cref="Backoff"/> - this is what decays a repeatedly
+        /// congested estimate downwards without letting one bad second become permanent.
+        /// </summary>
+        private const float SafeRateShare = 0.9f;
 
         /// <summary>
         /// A backlog under this is ordinary gameplay traffic. Nothing that small says
@@ -169,7 +193,9 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
             var transport = new SteamRelayTransport(log, true);
             transport.Begin();
 
-            transport._listenSocket = SteamNetworkingSockets.CreateListenSocketP2P(virtualPort, 0, null);
+            SteamNetworkingConfigValue_t[] options = CreationOptions();
+            transport._listenSocket = SteamNetworkingSockets.CreateListenSocketP2P(
+                virtualPort, options.Length, options);
             if (transport._listenSocket == HSteamListenSocket.Invalid)
             {
                 transport.Shutdown();
@@ -206,8 +232,9 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
             var identity = new SteamNetworkingIdentity();
             identity.SetSteamID64(steamId);
 
+            SteamNetworkingConfigValue_t[] options = CreationOptions();
             HSteamNetConnection connection =
-                SteamNetworkingSockets.ConnectP2P(ref identity, virtualPort, 0, null);
+                SteamNetworkingSockets.ConnectP2P(ref identity, virtualPort, options.Length, options);
             if (connection == HSteamNetConnection.Invalid)
             {
                 transport.Shutdown();
@@ -254,6 +281,49 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
                      ConnectedTimeoutMs, "connected timeout");
         }
 
+        /// <summary>
+        /// Options applied to a connection as it is created. Route negotiation begins with
+        /// the connection, so this has to be asked for here rather than set afterwards.
+        ///
+        /// A direct peer-to-peer route is limited by the two players' own uplinks; a Valve
+        /// relay is a shared hop that polices what crosses it, and on a 50 MB world the
+        /// difference is minutes. Steam still chooses the route and still falls back to the
+        /// relay when no direct path forms - this only puts the direct candidate on the
+        /// ballot, which it is not by default. Peers on a direct route learn each other's
+        /// addresses, exactly as they already do on this mod's direct-connection mode.
+        /// </summary>
+        private static SteamNetworkingConfigValue_t[] CreationOptions()
+        {
+            var ice = new SteamNetworkingConfigValue_t
+            {
+                m_eValue = ESteamNetworkingConfigValue.k_ESteamNetworkingConfig_P2P_Transport_ICE_Enable,
+                m_eDataType = ESteamNetworkingConfigDataType.k_ESteamNetworkingConfig_Int32,
+            };
+            ice.m_val.m_int32 = Constants.k_nSteamNetworkingConfig_P2P_Transport_ICE_Enable_All;
+            return new[] { ice };
+        }
+
+        /// <summary>
+        /// Which path the traffic is taking. The first thing to read when a transfer
+        /// disappoints: a relayed route explains a rate the uplink could beat on its own.
+        /// </summary>
+        private static string RouteOf(Endpoint endpoint)
+        {
+            try
+            {
+                SteamNetConnectionInfo_t info;
+                if (!SteamNetworkingSockets.GetConnectionInfo(endpoint.Handle, out info))
+                    return "unknown";
+                return (info.m_nFlags & Constants.k_nSteamNetworkConnectionInfoFlags_Relayed) != 0
+                    ? "relayed"
+                    : "direct";
+            }
+            catch (Exception)
+            {
+                return "unknown";
+            }
+        }
+
         private bool SetInt32(ESteamNetworkingConfigValue setting, ESteamNetworkingConfigScope scope,
                               IntPtr scopeObject, int value, string description)
         {
@@ -293,8 +363,18 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
         {
             int least = (int)(endpoint.SendRate * MaxSingleBackoff);
             int rate = Math.Max(SendRateFloorBytesPerSecond, Math.Max(least, Math.Min(endpoint.SendRate, target)));
-            endpoint.SafeRate = rate;
+
+            // The rate known to hold is the one that was flowing when the path complained,
+            // shaded down - not the one just cut to. Setting it to the cut made every
+            // backoff permanent: the fast climb only runs below SafeRate, so a connection
+            // that backed off once crawled upward in single steps for the rest of the
+            // session, and the idle clamp then handed that crawl to the next transfer as
+            // its starting rate. Shading is what still walks a repeatedly congested
+            // estimate downwards instead of oscillating around a level it never carried.
+            endpoint.SafeRate = Math.Max(
+                rate, (int)(Math.Min(endpoint.SafeRate, endpoint.SendRate) * SafeRateShare));
             endpoint.HoldTicks = BackoffHoldTicks;
+            endpoint.Strikes = 0;
             if (rate != endpoint.SendRate) ApplySendRate(endpoint, rate);
         }
 
@@ -317,10 +397,11 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
 
         /// <summary>
         /// Congestion control for the rate Steam will not work out on its own: climb while
-        /// the path is quiet, fall back to three quarters of the rate that broke it, and
-        /// probe upwards from there a step at a time. <see cref="Endpoint.SafeRate"/>
-        /// remembers what held, so the expensive overshoot happens once per session rather
-        /// than once per cycle.
+        /// the path is quiet, fall back when it complains twice running, and probe upwards
+        /// from there a step at a time. <see cref="Endpoint.SafeRate"/> remembers what held,
+        /// so the expensive overshoot happens once per session rather than once per cycle -
+        /// and recovering to it is the fast climb, which is why <see cref="Backoff"/> must
+        /// not collapse the two together.
         ///
         /// Two different things throttle this path and only one of them shows up as delay.
         /// A queue that fills raises the ping within a second. A rate limiter - Valve's
@@ -359,13 +440,21 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
 
                     long outstanding = endpoint.QueuedBytes +
                                        status.m_cbPendingReliable + status.m_cbSentUnackedReliable;
+                    bool bulk = outstanding >= BulkBacklogBytes;
+                    if (bulk) endpoint.BeginBulk();
                     long goodput = endpoint.MeasureGoodput(outstanding, GovernIntervalMs);
 
-                    if (outstanding < BulkBacklogBytes)
+                    if (!bulk)
                     {
+                        string finished = endpoint.FinishBulk();
+                        if (finished != null)
+                            _log.Info("[relay] " + endpoint.Id + " " + finished + " over a " +
+                                      RouteOf(endpoint) + " route.");
+
                         int idle = Math.Min(SendRateStartBytesPerSecond, endpoint.SafeRate);
                         if (endpoint.SendRate != idle) ApplySendRate(endpoint, idle);
                         endpoint.HoldTicks = 0;
+                        endpoint.Strikes = 0;
                         continue;
                     }
 
@@ -385,29 +474,37 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
                                      Math.Max(CongestedPingExcessMs, endpoint.PingFloorMs / 2);
                     float quality = status.m_flConnectionQualityRemote; // negative until the peer reports
 
+                    bool queueing = pingKnown && status.m_nPing > pingBudget;
+                    bool losing = quality >= 0f && quality < HealthyRemoteQuality;
+
                     if (endpoint.HoldTicks > 0)
                     {
                         endpoint.HoldTicks--;
                     }
-                    else if (pingKnown && status.m_nPing > pingBudget)
+                    else if (queueing || losing)
                     {
-                        Backoff(endpoint, (int)(endpoint.SendRate * 0.75f));
-                    }
-                    else if (quality >= 0f && quality < HealthyRemoteQuality)
-                    {
-                        // What the peer actually received is what the path will carry. Fall
-                        // straight to it rather than stepping down and overshooting.
-                        float wire = status.m_flOutBytesPerSec;
-                        float carried = (wire > 0f ? wire : endpoint.SendRate) * quality;
-                        Backoff(endpoint, (int)(carried * 0.95f));
+                        if (++endpoint.Strikes >= StrikesBeforeBackoff)
+                        {
+                            // What the peer actually received is what the path will carry,
+                            // so fall straight to it rather than stepping down and
+                            // overshooting. A queue that fills has no such measurement
+                            // behind it and only says "less than this".
+                            float wire = status.m_flOutBytesPerSec;
+                            float carrying = wire > 0f ? wire : endpoint.SendRate;
+                            Backoff(endpoint, losing
+                                ? (int)(carrying * quality * 0.95f)
+                                : (int)(endpoint.SendRate * 0.75f));
+                        }
                     }
                     else
                     {
+                        endpoint.Strikes = 0;
+
                         // Below what already held, climb back to it; above it, feel the way
                         // up one step at a time.
                         int rate = endpoint.SendRate;
                         int next = rate < endpoint.SafeRate
-                            ? Math.Min(endpoint.SafeRate, rate + Math.Max(rate / 7, SendRateStepBytesPerSecond))
+                            ? Math.Min(endpoint.SafeRate, rate + Math.Max(rate / 6, SendRateStepBytesPerSecond))
                             : Math.Min(SendRateCeilingBytesPerSecond, rate + SendRateStepBytesPerSecond);
                         if (next != rate) ApplySendRate(endpoint, next);
                     }
@@ -419,7 +516,8 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
                               (endpoint.SafeRate / 1024) + " KB/s, wire " +
                               ((int)status.m_flOutBytesPerSec / 1024) + " KB/s), ping " +
                               status.m_nPing + " of " + pingBudget + " ms, peer received " +
-                              (quality < 0f ? "?" : ((int)(quality * 100)).ToString()) + "%.");
+                              (quality < 0f ? "?" : ((int)(quality * 100)).ToString()) + "%, " +
+                              RouteOf(endpoint) + " route.");
                 }
             }
         }
@@ -989,10 +1087,15 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
             /// <summary>Seconds left holding the current rate after a cut.</summary>
             public int HoldTicks;
 
+            /// <summary>Consecutive seconds this path has reported congestion.</summary>
+            public int Strikes;
+
             /// <summary>Best ping seen on this connection - the baseline congestion is measured against.</summary>
             public int PingFloorMs = int.MaxValue;
 
             private long _lastOutstanding = -1;
+            private readonly System.Diagnostics.Stopwatch _bulk = new System.Diagnostics.Stopwatch();
+            private long _bulkMoved;
 
             // Written and drained on the game thread only (Send and Poll both run there).
             private readonly ConcurrentQueue<byte[]> _outbox = new ConcurrentQueue<byte[]>();
@@ -1023,7 +1126,35 @@ namespace CS2MultiplayerMod.Core.Networking.Steam
                 long previous = _lastOutstanding;
                 _lastOutstanding = outstanding;
                 if (previous < 0 || outstanding > previous) return 0;
-                return (previous - outstanding) * 1000L / intervalMs;
+
+                long moved = previous - outstanding;
+                if (_bulk.IsRunning) _bulkMoved += moved;
+                return moved * 1000L / intervalMs;
+            }
+
+            /// <summary>Start timing a bulk transfer, or let one already running continue.</summary>
+            public void BeginBulk()
+            {
+                if (!_bulk.IsRunning) { _bulkMoved = 0; _bulk.Restart(); }
+            }
+
+            /// <summary>
+            /// Close out a finished bulk transfer and describe what it cost, or null when
+            /// none was running. This average is the number to compare against the uplink
+            /// when judging whether a world sync was as fast as the connection allows.
+            /// </summary>
+            public string FinishBulk()
+            {
+                if (!_bulk.IsRunning) return null;
+
+                long seconds = Math.Max(1L, _bulk.ElapsedMilliseconds / 1000L);
+                long moved = _bulkMoved;
+                _bulk.Reset();
+                _bulkMoved = 0;
+
+                if (moved < BulkBacklogBytes) return null;
+                return "transfer finished: " + (moved >> 20) + " MB in " + seconds + " s, " +
+                       (moved / seconds / 1024) + " KB/s average,";
             }
 
             public void Enqueue(byte[] frame)
