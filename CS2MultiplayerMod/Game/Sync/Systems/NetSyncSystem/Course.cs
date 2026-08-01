@@ -180,6 +180,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         /// <summary>
+        /// Project a utility endpoint's source-relative elevation onto this machine's surface for
+        /// connection lookup only. The committed geometry still uses <see cref="EndElevation"/> and
+        /// therefore preserves the source height unless an existing node is actually reused.
+        /// Trying raw source Y first remains important for already-synchronised geometry; this
+        /// alternate catches a locally-created pipe/cable node whose terrain or water reference
+        /// differs from the sender's by more than the vertical snap tolerance.
+        /// </summary>
+        private bool TryProjectUtilityEndpointToLocalSurface(Entity prefab, NetPrefabInfo placedInfo,
+            float3 sourcePoint, float2 sourceElevation,
+            ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData,
+            out float3 projected)
+        {
+            projected = sourcePoint;
+            Layer utilityLayers = placedInfo.RequiredLayers | placedInfo.ConnectLayers;
+            if ((utilityLayers & UtilityConnectLayers) == Layer.None) return false;
+
+            float surface = SurfaceHeightAt(sourcePoint, sourceElevation.x,
+                NetInfoOf(prefab).ElevationLimit, ref heightData, ref waterData);
+            float localY = surface + sourceElevation.x;
+            if (!math.isfinite(localY) || math.abs(localY - sourcePoint.y) <= VerticalSnapTol)
+                return false;
+
+            projected.y = localY;
+            return true;
+        }
+
+        /// <summary>
         /// The elevation a course endpoint must carry to land at the height the source committed it
         /// at. A reused node's own elevation wins - a pylon or building connector keeps the height it
         /// already has.

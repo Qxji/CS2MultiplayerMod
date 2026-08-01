@@ -141,6 +141,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // (T-junction), or was on free ground.
         private int _rzSegments, _rzSnapEnds, _rzMergeEnds, _rzMidEnds, _rzFreeEnds;
 
+        // Utility endpoints that found their intended local node/edge only after projecting the
+        // source's relative underground/overhead elevation onto this machine's surface. These are
+        // connections that the old raw-Y-only classifier would have emitted as overlapping free
+        // nodes when terrain or water simulation differed between peers.
+        private int _rzLocalSurfaceMatches;
+
         // Endpoints whose elevation had to be corrected because this machine's surface disagreed with
         // the source's, and the largest such disagreement. A non-zero count means the two worlds'
         // terrain or water differ under replicated geometry — the reading that tells a height report

@@ -2,6 +2,7 @@ using Colossal.Mathematics;
 using Game.Common;
 using Game.Net;
 using Game.Prefabs;
+using Game.Simulation;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
@@ -60,6 +61,59 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     kind = KindFree;
                     return false;
             }
+        }
+
+        /// <summary>
+        /// Resolve a captured target at its source-world height, then (for owner-less utility
+        /// nodes/edges only) at the corresponding local-surface height. Explicit target identity,
+        /// prefab/layer contracts and curve direction are still required by the second pass; only
+        /// the Y reference changes. This prevents terrain/water drift from turning a valid captured
+        /// pipe or cable snap into an unresolved operation.
+        /// </summary>
+        private bool TryResolveNativeEndpointWithLocalSurface(Entity prefab,
+            NetEndpointIntent intent, NetPrefabInfo placedInfo,
+            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
+            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
+            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
+            NativeArray<Entity> ownedEdgeEntities, NativeArray<Curve> ownedEdgeCurves,
+            ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData,
+            out Entity target, out float splitT, out int kind, out bool usedLocalSurface)
+        {
+            usedLocalSurface = false;
+            if (TryResolveNativeEndpoint(intent, placedInfo,
+                    nodeEntities, nodeData, edgeEntities, edgeCurves,
+                    ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                    out target, out splitT, out kind))
+                return true;
+
+            if (intent.Kind != NetEndpointTargetKind.Node &&
+                intent.Kind != NetEndpointTargetKind.Edge)
+                return false;
+
+            float3 sourcePoint = new float3(intent.PosX, intent.PosY, intent.PosZ);
+            float2 sourceElevation = new float2(intent.ElevationLeft, intent.ElevationRight);
+            float3 projected;
+            if (!TryProjectUtilityEndpointToLocalSurface(prefab, placedInfo, sourcePoint,
+                    sourceElevation, ref heightData, ref waterData, out projected))
+                return false;
+
+            float deltaY = projected.y - intent.PosY;
+            intent.PosY = projected.y;
+            intent.AnchorY += deltaY;
+            if (intent.Kind == NetEndpointTargetKind.Edge)
+            {
+                intent.TargetAy += deltaY;
+                intent.TargetBy += deltaY;
+                intent.TargetCy += deltaY;
+                intent.TargetDy += deltaY;
+            }
+
+            bool resolved = TryResolveNativeEndpoint(intent, placedInfo,
+                nodeEntities, nodeData, edgeEntities, edgeCurves,
+                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                out target, out splitT, out kind);
+            usedLocalSurface = resolved;
+            return resolved;
         }
 
         private Entity FindCoincidentNode(NetEndpointIntent intent, NetPrefabInfo placedInfo,
