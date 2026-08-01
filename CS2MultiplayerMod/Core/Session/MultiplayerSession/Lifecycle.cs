@@ -90,6 +90,13 @@ namespace CS2MultiplayerMod.Core.Session
             try
             {
                 server.Start(config.Port, config.LanOnly, _certificate);
+
+                // A LAN-only session is reachable without the router's help, so there is
+                // nothing to ask for. Hosting never waits on the answer: the listener is
+                // already accepting, and a forward only adds reach from outside.
+                if (!config.LanOnly)
+                    _portForward = PortForward.Begin(_log, config.Port);
+
                 SetStatus(SessionStatus.Connected, "Hosting on port " + config.Port +
                           (config.LanOnly ? " (LAN-only" : " (PUBLIC") +
                           (EncryptionActive ? ", TLS)" : ", PLAINTEXT)"));
@@ -261,6 +268,12 @@ namespace CS2MultiplayerMod.Core.Session
             {
                 try { _certificate.Dispose(); } catch { /* ignore */ }
                 _certificate = null;
+            }
+
+            if (_portForward != null)
+            {
+                try { _portForward.Dispose(); } catch { /* the router can expire it instead */ }
+                _portForward = null;
             }
 
             _peers.Clear();

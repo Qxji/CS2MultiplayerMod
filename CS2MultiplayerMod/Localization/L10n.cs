@@ -103,6 +103,10 @@ namespace CS2MultiplayerMod.Localization
             public const string ExposureLan = "CS2MP.Status.ExposureLan";
             public const string ExposureRelay = "CS2MP.Status.ExposureRelay";
             public const string ExposureRelayClient = "CS2MP.Status.ExposureRelayClient";
+            public const string ExposureForwarding = "CS2MP.Status.ExposureForwarding";
+            public const string ExposureForwarded = "CS2MP.Status.ExposureForwarded";
+            public const string ExposureForwardedAt = "CS2MP.Status.ExposureForwardedAt";
+            public const string ExposureForwardManually = "CS2MP.Status.ExposureForwardManually";
             public const string WorldNone = "CS2MP.Status.WorldNone";
             public const string WorldHosting = "CS2MP.Status.WorldHosting";
             public const string WorldMapProgress = "CS2MP.Status.WorldMapProgress";
