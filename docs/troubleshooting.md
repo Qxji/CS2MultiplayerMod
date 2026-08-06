@@ -30,10 +30,6 @@ Make sure that you have set up port forwarding. [Learn how to set up port forwar
 
 [Issues with Port Forwarding?](./docs/forwarding_troubleshoot.md)
 
-If you still have issues, even though you have port forwarding enabled, check that your firewall/anti-virus allows opening ports on your local machine. 
-
-If you still cannot connect, check that you are not under Carrier-Grade NAT (CGNAT). Open your router settings, check the displayed public IP address (WAN IP) and compare to the IP shown [here](https://api.ipify.org/). If they are different, you are likely behind CGNAT. You might have luck by letting someone else host.
-
 ### People connecting to the host (Clients)
 
 Check that your connection is not blocked by antivirus or your local firewall. Check that you are connected to the Internet. 
