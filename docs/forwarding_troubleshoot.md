@@ -10,4 +10,6 @@ If you still cannot connect, check that you are not under Carrier-Grade NAT (CGN
 
 Some people have had success in using a local VPN to get their friends onto their local network. **This is not recommended.** People have been using Radmin. Many routers also support hosting a VPN into your local network.
 
+---
+
 **[Back to troubleshooting.](/docs/troubleshooting.md)**
