@@ -24,3 +24,7 @@ Updated `2026-08-06` for version `v0.1.3`. [Current mod version](./CS2Multiplaye
 
 - Road Builder
 - Traffic
+
+---
+
+**[Back to troubleshooting.](/docs/troubleshooting.md)**
