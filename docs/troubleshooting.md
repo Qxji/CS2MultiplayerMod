@@ -13,11 +13,11 @@ Having Issues? This is a comprehensive troubleshooting guide for the CS2Multipla
 
 --- 
 
-- [Disable DLC](./docs/disable_dlc.md)
-- [Mod Support](./docs/mods.md)
-- [Port Forwarding](./docs/forwarding.md)
-- [Troubleshoot Port Forwarding](./docs/forwarding_troubleshoot.md)
-- [Verify Game Files](./docs/verify_files.md)
+- [Disable DLC](/docs/disable_dlc.md)
+- [Mod Support](/docs/mods.md)
+- [Port Forwarding](/docs/forwarding.md)
+- [Troubleshoot Port Forwarding](/docs/forwarding_troubleshoot.md)
+- [Verify Game Files](/docs/verify_files.md)
 - [What is my IP?](https://api.ipify.org/)
 
 ---
