@@ -21,3 +21,7 @@ Set up port forwarding on these popular routers (third-party sites):
 - [Huawei](https://consumer.huawei.com/en/support/content/en-us15806329/)
 
 Your router not among them? Search your router model on google and add "port forwarding", you will find a tutorial.
+
+---
+
+[Issues? Troubleshooting](/docs/forwarding_troubleshooting.md)
