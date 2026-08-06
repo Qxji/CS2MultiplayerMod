@@ -1,6 +1,6 @@
 # Diagnose issues with port forwarding
 
-[Set up port forwarding.](./docs/forwarding.md)
+[Set up port forwarding.](/docs/forwarding.md)
 
 If you still experience issues, even though you have port forwarding enabled, check that your firewall/anti-virus allows opening ports on your local machine. 
 
