@@ -1,16 +1,8 @@
 # CS2 Multiplayer Mod
 
 ## Introduction
-<<<<<<< HEAD
 
-CS2 Multiplayer Mod brings cooperative multiplayer to Cities: Skylines II. One player hosts a city, friends join, and everyone builds the same city together.
-
-The mod is **experimental**. Back up your saves before hosting or joining, and expect bugs while development continues. The host is authoritative, and clients download the host's world when they join.
-
-Feel free to join the development Discord server [here](https://discord.gg/NHKShnB5G9).
-=======
 Feel free to join the development Discord server [here](https://discord.gg/KFZTW2YSJt).
->>>>>>> c67df31 (Update README.md)
 
 This is a **multiplayer mod** for Cities: Skylines II. Join your friends and build a city together!
 
