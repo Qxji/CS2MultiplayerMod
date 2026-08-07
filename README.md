@@ -13,12 +13,12 @@ The mod is **experimental**. Back up your saves before hosting or joining, and e
 - Cities: Skylines II (PC Version: Steam, XBox, Gamepass)
 - **All players must run the same version of the mod.** Players will not be able to connect with mismatched versions. 
 - Players should also have **matching gameplay DLC**. Radio Station DLC are unaffected. Learn how to disable DLC: [Disabling DLC](docs/disable_dlc.md)
-- Most mods do not work currently ([List of working mods](docs/mods.md)).
+- There are **no** mods currently working ([more information](docs/mods.md)).
 - (Internet play only: Set up TCP Port Forwarding)
 
 ## Installation
 
-The easiest way is through **Paradox Mods**: find the mod, add it to an empty playset, enable it, and restart the game if Cities: Skylines II asks you to.
+The easiest way is through **Paradox Mods**: find the mod, add it to an **empty** playset, enable it, and restart the game if Cities: Skylines II asks you to.
 
 [**PDXMods**](https://mods.paradoxplaza.com/mods/150432/Windows)
 
