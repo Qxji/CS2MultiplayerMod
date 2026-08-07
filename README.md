@@ -13,7 +13,7 @@ The mod is **experimental**. Back up your saves before hosting or joining, and e
 - Cities: Skylines II (PC Version: Steam, XBox, Gamepass)
 - **All players must run the same version of the mod.** Players will not be able to connect with mismatched versions. 
 - Players should also have **matching gameplay DLC**. Radio Station DLC are unaffected. Learn how to disable DLC: [Disabling DLC](help/disable_dlc.md)
-- There are **no** mods currently working ([more information](help/mods.md)).
+- There are **no** mods currently working.
 - (Internet play only: Set up TCP Port Forwarding)
 
 ## Installation
