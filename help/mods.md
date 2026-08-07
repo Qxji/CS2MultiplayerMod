@@ -2,7 +2,7 @@
 
 ## Official Mod Support
 
-**No Mods are officially supported. Playing with mods is experimental. Any mods adding functionality will NOT work. You might experience crashes and corruption.**
+**No Mods are officially supported. Playing with mods is experimental. Any mods adding gameplay functionality will NOT work. You might experience crashes and corruption.**
 
 It is planned to add proper mod compatibility with SOME mods in future versions of the multiplayer mod. To support mods both multiplayer mod and the prospective mod need to work together to expose the functionality.
 
