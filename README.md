@@ -12,8 +12,8 @@ The mod is **experimental**. Back up your saves before hosting or joining, and e
 
 - Cities: Skylines II (PC Version: Steam, XBox, Gamepass)
 - **All players must run the same version of the mod.** Players will not be able to connect with mismatched versions. 
-- Players should also have **matching gameplay DLC**. Radio Station DLC are unaffected. Learn how to disable DLC: [Disabling DLC](docs/disable_dlc.md)
-- There are **no** mods currently working ([more information](docs/mods.md)).
+- Players should also have **matching gameplay DLC**. Radio Station DLC are unaffected. Learn how to disable DLC: [Disabling DLC](help/disable_dlc.md)
+- There are **no** mods currently working ([more information](help/mods.md)).
 - (Internet play only: Set up TCP Port Forwarding)
 
 ## Installation
@@ -33,7 +33,7 @@ The easiest way is through **Paradox Mods**: find the mod, add it to an **empty*
 ### Playing through the Internet
 For playing with friends that are not connected to your local network, you need to setup TCP port forwarding. Only do this with people you **absolutely trust**.
 
-- [Written Tutorial](docs/forwarding.md) (recommended)
+- [Written Tutorial](help/forwarding.md) (recommended)
 - [Video Tutorial](https://www.youtube.com/watch?v=WOZQppVNGvA)
 
 ---
@@ -43,7 +43,7 @@ For playing with friends that are not connected to your local network, you need 
 3. Share the IP Address and the port you forwarded with your friends.
 
 
-**Issues? Check [Troubleshooting](docs/forwarding_troubleshoot.md).**
+**Issues? Check [Troubleshooting](help/forwarding_troubleshoot.md).**
 
 ## Joining a game
 
@@ -57,7 +57,7 @@ For playing with friends that are not connected to your local network, you need 
 - **City looks out of sync?** Run `/sync` in chat, or click **Sync World Now** in the mod settings. Clients pull a fresh save from the host; the host refreshes every connected player.
 - **Can't join (protocol mismatch)?** You and the host are on different mod versions. Update to the same build.
 
-Check out **[Troubleshooting](docs/troubleshooting.md)** for more issues.
+Check out **[Troubleshooting](help/troubleshooting.md)** for more issues.
 
 ## Technical Details
 
