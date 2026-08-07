@@ -2,13 +2,15 @@
 
 ## Official Mod Support
 
-**No Mods are officially supported. Playing with mods is experimental and you might experience crashes and corruption.**
+**No Mods are officially supported. Playing with mods is experimental. Any mods adding functionality will NOT work. You might experience crashes and corruption.**
+
+It is planned to add proper mod compatibility with SOME mods in future versions of the multiplayer mod. To support mods both multiplayer mod and the prospective mod need to work together to expose the functionality.
 
 ---
 
 ## Mod Compatibility
 
-Nonetheless, some mods might work with CS2MultiplayerMod. This is a non-comprehensive list of mod compatibility.
+Nonetheless, some mods that only show  might work with CS2MultiplayerMod. This is a non-comprehensive list of mod compatibility.
 
 Updated `2026-08-06` for version `v0.1.3`. [Current mod version](./CS2MultiplayerMod/Properties/PublishConfiguration.xml#L23). Contributions & testing welcome.
 
@@ -22,6 +24,7 @@ Updated `2026-08-06` for version `v0.1.3`. [Current mod version](./CS2Multiplaye
 
 ### Incompatible Mods
 
+**ALL MODS ADDING FUNCTIONALITY SUCH AS:**
 - Road Builder
 - Traffic
 
