@@ -24,4 +24,4 @@ Your router not among them? Search your router model on google and add "port for
 
 ---
 
-[Issues? Troubleshooting](/docs/forwarding_troubleshooting.md)
+[Issues? Troubleshooting](/help/forwarding_troubleshooting.md)

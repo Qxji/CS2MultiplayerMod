@@ -27,4 +27,4 @@ Updated `2026-08-06` for version `v0.1.3`. [Current mod version](./CS2Multiplaye
 
 ---
 
-**[Back to troubleshooting.](/docs/troubleshooting.md)**
+**[Back to troubleshooting.](/help/troubleshooting.md)**

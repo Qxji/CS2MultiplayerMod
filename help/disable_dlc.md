@@ -29,4 +29,4 @@ CS1TreasureHunt DLC cannot be disabled. This is a known issue.
 
 ---
 
-**[Back to troubleshooting.](/docs/troubleshooting.md)**
+**[Back to troubleshooting.](/help/troubleshooting.md)**

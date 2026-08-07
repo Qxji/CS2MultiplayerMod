@@ -19,4 +19,4 @@ This guide will show you how to check your game files for corruption on Steam an
 
 ---
 
-**[Back to troubleshooting.](/docs/troubleshooting.md)**
+**[Back to troubleshooting.](/help/troubleshooting.md)**

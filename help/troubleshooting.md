@@ -13,11 +13,11 @@ Having Issues? This is a comprehensive troubleshooting guide for the CS2Multipla
 
 --- 
 
-- [Disable DLC](/docs/disable_dlc.md)
-- [Mod Support](/docs/mods.md)
-- [Port Forwarding](/docs/forwarding.md)
-- [Troubleshoot Port Forwarding](/docs/forwarding_troubleshoot.md)
-- [Verify Game Files](/docs/verify_files.md)
+- [Disable DLC](/help/disable_dlc.md)
+- [Mod Support](/help/mods.md)
+- [Port Forwarding](/help/forwarding.md)
+- [Troubleshoot Port Forwarding](/help/forwarding_troubleshoot.md)
+- [Verify Game Files](/help/verify_files.md)
 - [What is my IP?](https://api.ipify.org/)
 
 ---
@@ -26,9 +26,9 @@ Having Issues? This is a comprehensive troubleshooting guide for the CS2Multipla
 
 ### Host
 
-Make sure that you have set up port forwarding. [Learn how to set up port forwarding.](./docs/forwarding.md).
+Make sure that you have set up port forwarding. [Learn how to set up port forwarding.](/help/forwarding.md).
 
-[Issues with Port Forwarding?](./docs/forwarding_troubleshoot.md)
+[Issues with Port Forwarding?](/help/forwarding_troubleshoot.md)
 
 ### People connecting to the host (Clients)
 
@@ -44,11 +44,11 @@ Still having issues? Remove the mod on PDXMods. Restart the game. Reinstall the 
 
 Check that you have the same game version as the people you are trying to play with. You can find the game version in the bottom left of the Main Menu when you start the game. The beginning should look similar to this: `1.6.0f1`. If not, update your game through Steam or XBox/Gamepass.
 
-Still having issues? [Verify Game Files](./docs/verify_files.md) (Steam: Right-click Game => Properties => Installed Files => Verify Integrity of game files; [XBox/Gamepass (click)](./docs/verify_files.md)).
+Still having issues? [Verify Game Files](/help/verify_files.md) (Steam: Right-click Game => Properties => Installed Files => Verify Integrity of game files; [XBox/Gamepass (click)](/help/verify_files.md)).
 
 ## DLC Mismatch Issues
 
-Check that you have the same DLC enabled as the people you are trying to play with. [Learn how to disable DLC.](./docs/disable_dlc.md)
+Check that you have the same DLC enabled as the people you are trying to play with. [Learn how to disable DLC.](/help/disable_dlc.md)
 
 Cannot disable CS1TreasureHunt DLC? This is a known issue. 
 
