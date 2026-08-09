@@ -10,7 +10,7 @@ This guide will show you how to set up port forwarding on your router.
 
 You will learn below on how to set up troubleshooting on popular router brands. 
 
-You will need to add a port forward for the `TCP` protocol (if the router asks for protocol). The default port for the mod is `25001`.
+You will need to add a port forward for the `TCP` protocol (if the router asks for protocol). The default port for the mod is `25001`. The port forward should be for your computer running the mod.
 
 
 - Protocol/Type: `TCP`
