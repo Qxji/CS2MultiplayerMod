@@ -213,6 +213,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 ToolRandomSeed = toolSeed,
             };
             CaptureOriginalIdentity(command, original);
+            if (!CaptureOwnerIdentity(command, original))
+            {
+                // An owned upgrade is found on the peer through its host. Without that identity the
+                // move would name an object the peer cannot look up, so drop it here instead.
+                Mod.log.Warn("[MP] MoveSync: relocation of owned '" + name +
+                             "' could not describe its host building; skipping this move.");
+                Diagnostics.FlightRecorder.Note("relocation host identity unavailable prefab=" + name);
+                return;
+            }
             CaptureSourceAttachment(command, original);
             if (!CaptureDestinationAttachment(command, destinationParent, newPosition,
                     destinationAttachmentKnown))
@@ -279,6 +288,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     candidate => EntityManager.HasComponent<ObjectData>(candidate),
                     out prefab)) return false;
 
+            // An owned relocation is anchored on its host: the upgrade may not have realized here
+            // yet, and once it has, its host is what tells two identical upgrades apart.
+            Entity host = Entity.Null;
+            if (command.HasOwnerIdentity && !TryResolveOwner(command, out host)) return false;
+
             var oldPos = new float3(command.OldX, command.OldY, command.OldZ);
             var newPos = new float3(command.NewX, command.NewY, command.NewZ);
             BuildSyncSystem buildSync = World.GetOrCreateSystemManaged<BuildSyncSystem>();
@@ -298,7 +312,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             Entity original = FindAt(prefab, oldPos, command.HasOriginalRandomSeed,
                 command.OriginalRandomSeed,
                 command.SourceAttachmentKnown && command.SourceAttachKind != ObjectAttachKind.None,
-                sourceParent);
+                sourceParent, host);
             if (original == Entity.Null)
             {
                 // A reliable replay may arrive after this same move already committed.
@@ -306,7 +320,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         command.OriginalRandomSeed,
                         command.DestinationAttachmentKnown &&
                         command.DestinationAttachKind != ObjectAttachKind.None,
-                        destinationParent) != Entity.Null) return true;
+                        destinationParent, host) != Entity.Null) return true;
                 return false;
             }
             var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
@@ -393,7 +407,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         }
 
         private Entity FindAt(Entity prefab, float3 position, bool hasRandomSeed,
-            int randomSeed, bool requireAttachment, Entity attachmentParent)
+            int randomSeed, bool requireAttachment, Entity attachmentParent, Entity expectedOwner)
         {
             Entity best = Entity.Null;
             Entity bestSeedMatch = Entity.Null;
@@ -409,7 +423,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 for (int i = 0; i < candidates.Length; i++)
                 {
                     Entity candidate = candidates[i];
-                    if (!IsMoveCandidate(candidate)) continue;
+                    if (!IsMoveCandidate(candidate, expectedOwner)) continue;
                     if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab) continue;
                     if (requireAttachment &&
                         NetAttachment.GetNetParent(EntityManager, candidate) != attachmentParent)
@@ -445,16 +459,72 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// <summary>How far a relocation's endpoint may sit from the entity it names (metres).</summary>
         private const float FindRadius = 2f;
 
-        /// <summary>The live top-level objects the old candidate query selected.</summary>
-        private bool IsMoveCandidate(Entity entity)
+        /// <summary>
+        /// The live objects a relocation may name. Free-standing moves accept top-level objects
+        /// only; an owned move accepts exactly the objects the named host owns, which is what keeps
+        /// a neighbouring building's identical upgrade out of the candidate set.
+        /// </summary>
+        private bool IsMoveCandidate(Entity entity, Entity expectedOwner)
         {
             if (!EntityManager.Exists(entity)) return false;
             if (EntityManager.HasComponent<Temp>(entity) ||
-                EntityManager.HasComponent<Owner>(entity) ||
                 EntityManager.HasComponent<Deleted>(entity) ||
                 EntityManager.HasComponent<global::Game.Net.Edge>(entity)) return false;
+            if (expectedOwner == Entity.Null)
+            {
+                if (EntityManager.HasComponent<Owner>(entity)) return false;
+            }
+            else if (!EntityManager.HasComponent<Owner>(entity) ||
+                     EntityManager.GetComponentData<Owner>(entity).m_Owner != expectedOwner)
+            {
+                return false;
+            }
             return EntityManager.HasComponent<PrefabRef>(entity) &&
                    EntityManager.HasComponent<Transform>(entity);
+        }
+
+        /// <summary>
+        /// Find the host named by an owned relocation. False means it is not here (yet), which the
+        /// caller treats as "retry", not as a bad command.
+        /// </summary>
+        private bool TryResolveOwner(ObjectMoveCommand command, out Entity owner)
+        {
+            owner = Entity.Null;
+            Entity ownerPrefab;
+            if (!_prefabIndex.TryResolve(command.OwnerPrefabName,
+                    candidate => EntityManager.HasComponent<ObjectData>(candidate),
+                    out ownerPrefab)) return false;
+
+            var ownerPosition = new float3(command.OwnerX, command.OwnerY, command.OwnerZ);
+            var candidates = new NativeList<Entity>(16, Allocator.Temp);
+            try
+            {
+                _objectSearch.CollectNear(ownerPosition, FindRadius, candidates);
+                float bestDistanceSq = FindRadius * FindRadius;
+                for (int i = 0; i < candidates.Length; i++)
+                {
+                    Entity candidate = candidates[i];
+                    if (!EntityManager.Exists(candidate) ||
+                        EntityManager.HasComponent<Temp>(candidate) ||
+                        EntityManager.HasComponent<Deleted>(candidate) ||
+                        !EntityManager.HasComponent<PrefabRef>(candidate) ||
+                        !EntityManager.HasComponent<Transform>(candidate)) continue;
+                    if (EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab != ownerPrefab)
+                        continue;
+
+                    float distanceSq = math.distancesq(
+                        EntityManager.GetComponentData<Transform>(candidate).m_Position,
+                        ownerPosition);
+                    if (distanceSq > bestDistanceSq) continue;
+                    bestDistanceSq = distanceSq;
+                    owner = candidate;
+                }
+            }
+            finally
+            {
+                candidates.Dispose();
+            }
+            return owner != Entity.Null;
         }
 
         private static bool TryResolveAttachment(BuildSyncSystem buildSync, bool known,
@@ -469,7 +539,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private bool RequiresCompleteLifecycle(Entity entity, Entity prefab,
             ObjectMoveCommand command)
         {
-            return HasOwnedLifecycle(entity, prefab) ||
+            // Moving an installed upgrade re-commits its host, re-lays the host's sub-nets around
+            // the vacated and newly covered ground, and re-derives the host's road junction. A
+            // root-only move would slide the upgrade off its driveways.
+            return command.HasOwnerIdentity ||
+                   HasOwnedLifecycle(entity, prefab) ||
                    (command.SourceAttachmentKnown &&
                     command.SourceAttachKind != ObjectAttachKind.None) ||
                    (command.DestinationAttachmentKnown &&
@@ -493,6 +567,35 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (!EntityManager.HasComponent<PseudoRandomSeed>(original)) return;
             command.HasOriginalRandomSeed = true;
             command.OriginalRandomSeed = EntityManager.GetComponentData<PseudoRandomSeed>(original).m_Seed;
+        }
+
+        /// <summary>
+        /// Describe the host of an owned relocation. Relocating an installed upgrade or sub-building
+        /// from a building's upgrade list is the base game's only relocation, and it moves an owned
+        /// entity: the peer finds it through its host, since a free-standing lookup by position can
+        /// answer with a neighbouring building's identical upgrade. False means the object is owned
+        /// but its host cannot be described - the caller must not publish a move nobody can resolve.
+        /// </summary>
+        private bool CaptureOwnerIdentity(ObjectMoveCommand command, Entity original)
+        {
+            if (!EntityManager.HasComponent<Owner>(original)) return true;
+
+            Entity owner = EntityManager.GetComponentData<Owner>(original).m_Owner;
+            if (owner == Entity.Null || !EntityManager.Exists(owner) ||
+                !EntityManager.HasComponent<PrefabRef>(owner) ||
+                !EntityManager.HasComponent<Transform>(owner)) return false;
+
+            string ownerName = _prefabSystem.GetPrefabName(
+                EntityManager.GetComponentData<PrefabRef>(owner).m_Prefab);
+            if (string.IsNullOrEmpty(ownerName)) return false;
+
+            float3 ownerPosition = EntityManager.GetComponentData<Transform>(owner).m_Position;
+            command.HasOwnerIdentity = true;
+            command.OwnerPrefabName = ownerName;
+            command.OwnerX = ownerPosition.x;
+            command.OwnerY = ownerPosition.y;
+            command.OwnerZ = ownerPosition.z;
+            return true;
         }
 
         private void CaptureSourceAttachment(ObjectMoveCommand command, Entity original)

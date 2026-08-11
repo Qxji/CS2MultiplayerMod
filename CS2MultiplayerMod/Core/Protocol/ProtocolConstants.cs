@@ -4,7 +4,10 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v34 normalizes the sender-local Permanent creation flag out of native object
+        /// Current v35 carries the host of an owned relocation. Relocating an installed upgrade or
+        /// sub-building from a building's upgrade list moves an owned entity, which no peer can
+        /// look up as a free-standing object; the host's prefab and position identify it the same
+        /// way an upgrade placement does. v34 normalizes the sender-local Permanent creation flag out of native object
         /// transactions, so every peer commits the batch through the same isolated apply lifecycle
         /// instead of retrying an impossible condition and dropping the edit. It also treats an
         /// empty DLC set as "owns no DLC", not as a compatibility wildcard. v33 carries each
@@ -56,7 +59,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 34;
+        public const int ProtocolVersion = 35;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

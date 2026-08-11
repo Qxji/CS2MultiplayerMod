@@ -7,6 +7,7 @@ using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
 using CS2MultiplayerMod.Game.Sync.Commands;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 {
@@ -21,10 +22,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private const float ExistingSplitNodeDistance = 1f;
 
         private bool TryResolveNativeEndpoint(NetEndpointIntent intent, NetPrefabInfo placedInfo,
-            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
-            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
-            NativeArray<Entity> ownedEdgeEntities, NativeArray<Curve> ownedEdgeCurves,
+            ref NodePool nodes, ref EdgePool edges,
+            ref NodePool ownedNodes, ref EdgePool ownedEdges,
             out Entity target, out float splitT, out int kind)
         {
             target = Entity.Null;
@@ -34,7 +33,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 case NetEndpointTargetKind.Free:
                     if ((intent.Flags & (uint)global::Game.Tools.CoursePosFlags.DisableMerge) == 0)
                     {
-                        target = FindCoincidentNode(intent, placedInfo, nodeEntities, nodeData);
+                        target = FindCoincidentNode(intent, placedInfo, ref nodes);
                         if (target != Entity.Null)
                         {
                             kind = KindReuseNode;
@@ -44,18 +43,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     kind = KindFree;
                     return true;
                 case NetEndpointTargetKind.Node:
-                    target = FindNativeNode(intent, placedInfo, nodeEntities, nodeData);
+                    target = FindNativeNode(intent, placedInfo, ref nodes);
                     kind = KindReuseNode;
                     return target != Entity.Null;
                 case NetEndpointTargetKind.OwnedNode:
-                    target = FindNativeNode(intent, placedInfo, ownedNodeEntities, ownedNodeData);
+                    target = FindNativeNode(intent, placedInfo, ref ownedNodes);
                     kind = KindReuseConnector;
                     return target != Entity.Null;
                 case NetEndpointTargetKind.Edge:
-                    return TryFindNativeEdge(intent, placedInfo, edgeEntities, edgeCurves,
+                    return TryFindNativeEdge(intent, placedInfo, ref edges,
                         out target, out splitT, out kind);
                 case NetEndpointTargetKind.OwnedEdge:
-                    return TryFindNativeEdge(intent, placedInfo, ownedEdgeEntities, ownedEdgeCurves,
+                    return TryFindNativeEdge(intent, placedInfo, ref ownedEdges,
                         out target, out splitT, out kind);
                 default:
                     kind = KindFree;
@@ -72,17 +71,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         private bool TryResolveNativeEndpointWithLocalSurface(Entity prefab,
             NetEndpointIntent intent, NetPrefabInfo placedInfo,
-            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
-            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
-            NativeArray<Entity> ownedEdgeEntities, NativeArray<Curve> ownedEdgeCurves,
+            ref NodePool nodes, ref EdgePool edges,
+            ref NodePool ownedNodes, ref EdgePool ownedEdges,
             ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData,
             out Entity target, out float splitT, out int kind, out bool usedLocalSurface)
         {
             usedLocalSurface = false;
             if (TryResolveNativeEndpoint(intent, placedInfo,
-                    nodeEntities, nodeData, edgeEntities, edgeCurves,
-                    ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                    ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                     out target, out splitT, out kind))
                 return true;
 
@@ -109,26 +105,34 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
 
             bool resolved = TryResolveNativeEndpoint(intent, placedInfo,
-                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                 out target, out splitT, out kind);
             usedLocalSurface = resolved;
             return resolved;
         }
 
+        private const float CoincidentNodeXZ = 0.25f;
+
         private Entity FindCoincidentNode(NetEndpointIntent intent, NetPrefabInfo placedInfo,
-            NativeArray<Entity> entities, NativeArray<Node> nodes)
+            ref NodePool nodes)
         {
             float3 position = new float3(intent.PosX, intent.PosY, intent.PosZ);
-            float best = 0.25f * 0.25f;
+            float best = CoincidentNodeXZ * CoincidentNodeXZ;
             Entity result = Entity.Null;
-            for (int i = 0; i < nodes.Length; i++)
+            NetCellIndex.Enumerator candidates =
+                nodes.Index.Near(position.xz, CoincidentNodeXZ);
+            while (candidates.MoveNext())
             {
-                Entity entity = entities[i];
-                if (!EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity) ||
-                    IsNodeBeingDeleted(entity) || math.abs(nodes[i].m_Position.y - position.y) > 1f) continue;
-                float distance = math.distancesq(nodes[i].m_Position.xz, position.xz);
+                int i = candidates.Current;
+                // Geometry first: the per-candidate liveness and layer lookups are main-thread
+                // component reads, and running them ahead of the range test made one endpoint cost
+                // the whole city.
+                if (math.abs(nodes.Data[i].m_Position.y - position.y) > 1f) continue;
+                float distance = math.distancesq(nodes.Data[i].m_Position.xz, position.xz);
                 if (distance >= best) continue;
+                Entity entity = nodes.Entities[i];
+                if (!EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity) ||
+                    IsNodeBeingDeleted(entity)) continue;
                 if (EntityManager.HasComponent<PrefabRef>(entity))
                 {
                     NetPrefabInfo targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
@@ -141,20 +145,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private Entity FindNativeNode(NetEndpointIntent intent, NetPrefabInfo placedInfo,
-            NativeArray<Entity> entities, NativeArray<Node> nodes)
+            ref NodePool nodes)
         {
             float3 anchor = new float3(intent.AnchorX, intent.AnchorY, intent.AnchorZ);
             float best = float.MaxValue;
             Entity result = Entity.Null;
-            for (int i = 0; i < nodes.Length; i++)
+            NetCellIndex.Enumerator candidates =
+                nodes.Index.Near(anchor.xz, NativeNodeResolveXZ);
+            while (candidates.MoveNext())
             {
-                Entity entity = entities[i];
+                int i = candidates.Current;
+                float xz = math.distance(nodes.Data[i].m_Position.xz, anchor.xz);
+                float dy = math.abs(nodes.Data[i].m_Position.y - anchor.y);
+                if (xz > NativeNodeResolveXZ || dy > NativeTargetResolveY) continue;
+                float score = xz * xz + dy * dy * 0.25f;
+                if (score >= best) continue;
+
+                Entity entity = nodes.Entities[i];
                 if (!EntityManager.Exists(entity) || EntityManager.HasComponent<Deleted>(entity) ||
                     IsNodeBeingDeleted(entity)) continue;
-
-                float xz = math.distance(nodes[i].m_Position.xz, anchor.xz);
-                float dy = math.abs(nodes[i].m_Position.y - anchor.y);
-                if (xz > NativeNodeResolveXZ || dy > NativeTargetResolveY) continue;
 
                 bool prefabMatch = TargetPrefabMatches(entity, intent.TargetPrefabName);
                 if (!prefabMatch || !TargetContractMatches(entity, intent) ||
@@ -165,8 +174,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     if (!LayersCanConnect(placedInfo, targetInfo)) continue;
                 }
 
-                float score = xz * xz + dy * dy * 0.25f;
-                if (score >= best) continue;
                 best = score;
                 result = entity;
             }
@@ -174,7 +181,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         }
 
         private bool TryFindNativeEdge(NetEndpointIntent intent, NetPrefabInfo placedInfo,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
+            ref EdgePool edges,
             out Entity target, out float splitT, out int kind)
         {
             float3 anchor = new float3(intent.AnchorX, intent.AnchorY, intent.AnchorZ);
@@ -185,9 +192,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             float best = float.MaxValue;
             Entity bestEdge = Entity.Null;
             float bestT = 0f;
-            for (int i = 0; i < edgeCurves.Length; i++)
+            NetCellIndex.Enumerator candidates =
+                edges.Index.Near(anchor.xz, NativeEdgeResolveXZ);
+            while (candidates.MoveNext())
             {
-                Entity edge = edgeEntities[i];
+                int i = candidates.Current;
+                float t;
+                float xz = MathUtils.Distance(edges.Curves[i].m_Bezier.xz, anchor.xz, out t);
+                if (xz > NativeEdgeResolveXZ) continue;
+                float3 projected = MathUtils.Position(edges.Curves[i].m_Bezier, t);
+                float dy = math.abs(projected.y - anchor.y);
+                if (dy > NativeTargetResolveY) continue;
+
+                Entity edge = edges.Entities[i];
                 if (!EntityManager.Exists(edge) || EntityManager.HasComponent<Deleted>(edge)) continue;
 
                 Entity targetPrefab = Entity.Null;
@@ -199,14 +216,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     if (!LayersCanConnect(placedInfo, targetInfo)) continue;
                 }
 
-                float t;
-                float xz = MathUtils.Distance(edgeCurves[i].m_Bezier.xz, anchor.xz, out t);
-                if (xz > NativeEdgeResolveXZ) continue;
-                float3 projected = MathUtils.Position(edgeCurves[i].m_Bezier, t);
-                float dy = math.abs(projected.y - anchor.y);
-                if (dy > NativeTargetResolveY) continue;
-
-                float2 tangent = math.normalizesafe(MathUtils.Tangent(edgeCurves[i].m_Bezier, t).xz);
+                float2 tangent = math.normalizesafe(MathUtils.Tangent(edges.Curves[i].m_Bezier, t).xz);
                 float alignment = math.lengthsq(sourceTangent) < 0.001f || math.lengthsq(tangent) < 0.001f
                     ? 1f
                     : math.abs(math.dot(sourceTangent, tangent));
@@ -226,7 +236,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 bestEdge = edge;
                 // When the receiver still has the exact source curve, preserve the captured split
                 // parameter instead of projecting the anchor and introducing solver-rounding drift.
-                Bezier4x3 localCurve = edgeCurves[i].m_Bezier;
+                Bezier4x3 localCurve = edges.Curves[i].m_Bezier;
                 if (SameCurveBits(localCurve, source)) bestT = sourceT;
                 else if (SameCurveBitsReversed(localCurve, source)) bestT = 1f - sourceT;
                 else bestT = t;

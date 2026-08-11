@@ -34,6 +34,17 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public int OriginalRandomSeed;
 
         /// <summary>
+        /// Set when the moved object is owned by another object - an installed upgrade or
+        /// sub-building relocated from the building's upgrade list, which is the only relocation the
+        /// base game offers. The host travels as prefab + position, the same identity
+        /// <see cref="UpgradePlacementCommand"/> uses, because the moved entity is not a top-level
+        /// object and cannot be found by position alone without risking a neighbour's upgrade.
+        /// </summary>
+        public bool HasOwnerIdentity;
+        public string OwnerPrefabName;
+        public float OwnerX, OwnerY, OwnerZ;
+
+        /// <summary>
         /// Whether the sender could authoritatively classify the old/new attachment. "Known + None"
         /// is deliberately different from unknown: the former means the object is free-standing.
         /// </summary>
@@ -59,8 +70,14 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             if (HasOriginalRandomSeed) identityFlags |= 1;
             if (SourceAttachmentKnown) identityFlags |= 2;
             if (DestinationAttachmentKnown) identityFlags |= 4;
+            if (HasOwnerIdentity) identityFlags |= 8;
             writer.WriteByte(identityFlags);
             if (HasOriginalRandomSeed) writer.WriteInt(OriginalRandomSeed);
+            if (HasOwnerIdentity)
+            {
+                writer.WriteString(OwnerPrefabName);
+                writer.WriteFloat(OwnerX); writer.WriteFloat(OwnerY); writer.WriteFloat(OwnerZ);
+            }
             if (SourceAttachmentKnown)
                 WriteAttachment(writer, SourceAttachKind,
                     SourceAttachX, SourceAttachY, SourceAttachZ);
@@ -83,12 +100,20 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             ToolRandomSeed = unchecked((uint)reader.ReadInt());
 
             byte identityFlags = reader.ReadByte();
-            if ((identityFlags & ~7) != 0)
+            if ((identityFlags & ~15) != 0)
                 throw new ProtocolException("Unknown object-move identity flags " + identityFlags + ".");
             HasOriginalRandomSeed = (identityFlags & 1) != 0;
             SourceAttachmentKnown = (identityFlags & 2) != 0;
             DestinationAttachmentKnown = (identityFlags & 4) != 0;
+            HasOwnerIdentity = (identityFlags & 8) != 0;
             if (HasOriginalRandomSeed) OriginalRandomSeed = reader.ReadInt();
+            if (HasOwnerIdentity)
+            {
+                OwnerPrefabName = WireGuard.ReadName(reader);
+                OwnerX = WireGuard.ReadCoordinate(reader);
+                OwnerY = WireGuard.ReadCoordinate(reader);
+                OwnerZ = WireGuard.ReadCoordinate(reader);
+            }
             if (SourceAttachmentKnown)
                 ReadAttachment(reader, out SourceAttachKind,
                     out SourceAttachX, out SourceAttachY, out SourceAttachZ);

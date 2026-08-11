@@ -167,11 +167,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
 
             int maxBatch = work.Count;
+            _rzCycleCourses = work.Count;
 
-            NativeArray<Entity> nodeEntities = default, edgeEntities = default,
-                ownedNodeEntities = default, ownedEdgeEntities = default;
-            NativeArray<Node> nodeData = default, ownedNodeData = default;
-            NativeArray<Curve> edgeCurves = default, ownedEdgeCurves = default;
+            NodePool nodes = default(NodePool), ownedNodes = default(NodePool);
+            EdgePool edges = default(EdgePool), ownedEdges = default(EdgePool);
             LiveEdgeSearchSnapshot liveEdgeSearch = default(LiveEdgeSearchSnapshot);
             TerrainHeightData heightData = default;
             WaterSurfaceData<SurfaceWater> waterData = default;
@@ -207,14 +206,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     // Resolve every external target before creating the first definition. If course
                     // N depends on geometry that has not arrived yet, committing courses 0..N-1 and
                     // retrying only the suffix would destroy the source operation's junction shape.
-                    nodeEntities = _existingNodes.ToEntityArray(Allocator.Temp);
-                    nodeData = _existingNodes.ToComponentDataArray<Node>(Allocator.Temp);
-                    edgeEntities = _existingEdges.ToEntityArray(Allocator.Temp);
-                    edgeCurves = _existingEdges.ToComponentDataArray<Curve>(Allocator.Temp);
-                    ownedNodeEntities = _ownedNodes.ToEntityArray(Allocator.Temp);
-                    ownedNodeData = _ownedNodes.ToComponentDataArray<Node>(Allocator.Temp);
-                    ownedEdgeEntities = _ownedEdges.ToEntityArray(Allocator.Temp);
-                    ownedEdgeCurves = _ownedEdges.ToComponentDataArray<Curve>(Allocator.Temp);
+                    TakeNetSnapshot(out nodes, out edges, out ownedNodes, out ownedEdges);
                     TakeSurfaceSnapshot(ref heightData, ref waterData);
                     haveSnapshot = true;
 
@@ -336,8 +328,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         {
                             startResolved = TryResolveNativeEndpointWithLocalSurface(prefab,
                                 command.Start, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                                 ref heightData, ref waterData,
                                 out startTarget, out startT, out startKind,
                                 out usedLocalSurface);
@@ -346,8 +337,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         {
                             endResolved = TryResolveNativeEndpointWithLocalSurface(prefab,
                                 command.End, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                                 ref heightData, ref waterData,
                                 out endTarget, out endT, out endKind,
                                 out usedLocalSurface);
@@ -534,15 +524,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
                     if (!haveSnapshot)
                     {
-                        nodeEntities = _existingNodes.ToEntityArray(Allocator.Temp);
-                        nodeData = _existingNodes.ToComponentDataArray<Node>(Allocator.Temp);
-                        edgeEntities = _existingEdges.ToEntityArray(Allocator.Temp);
-                        edgeCurves = _existingEdges.ToComponentDataArray<Curve>(Allocator.Temp);
-                        // Building sub-net stubs a utility endpoint may connect to (FindUtilityNodeAt).
-                        ownedNodeEntities = _ownedNodes.ToEntityArray(Allocator.Temp);
-                        ownedNodeData = _ownedNodes.ToComponentDataArray<Node>(Allocator.Temp);
-                        ownedEdgeEntities = _ownedEdges.ToEntityArray(Allocator.Temp);
-                        ownedEdgeCurves = _ownedEdges.ToComponentDataArray<Curve>(Allocator.Temp);
+                        TakeNetSnapshot(out nodes, out edges, out ownedNodes, out ownedEdges);
                         TakeSurfaceSnapshot(ref heightData, ref waterData);
                         haveSnapshot = true;
                     }
@@ -553,7 +535,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     // echo would stack a duplicate road on top of the existing one (and ping-pong).
                     // The tolerances are SplitMatch-tight (~1 m), far below a parallel lane, and a
                     // span rebuilt at another elevation fails the height match — never wrongly skipped.
-                    if (!nativeOperation && SpanAlreadyBuilt(prefab, bezier, edgeEntities, edgeCurves))
+                    if (!nativeOperation && SpanAlreadyBuilt(prefab, bezier, ref edges))
                     {
                         if (command.HasNativeCourse)
                             _nativeTargetDeadlines.Remove(NativeRetryKey(message, command));
@@ -575,30 +557,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     {
                         if (command.Start.Kind == NetEndpointTargetKind.Infer)
                             startSnap = ClassifyEndpointWithLocalSurface(prefab, a,
-                                sourceStartElevation, placedInfo, nodeEntities, nodeData,
-                                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, ref heightData, ref waterData,
+                                sourceStartElevation, placedInfo, ref nodes, ref edges,
+                                ref ownedNodes, batchNewNodes, batchEdges,
+                                ref heightData, ref waterData,
                                 out startT, out startKind);
                         else
                             nativeTargetsResolved &= TryResolveNativeEndpointWithLocalSurface(prefab,
                                 command.Start, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                                 ref heightData, ref waterData,
                                 out startSnap, out startT, out startKind,
                                 out startUsedLocalSurface);
 
                         if (command.End.Kind == NetEndpointTargetKind.Infer)
                             endSnap = ClassifyEndpointWithLocalSurface(prefab, d,
-                                sourceEndElevation, placedInfo, nodeEntities, nodeData,
-                                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                                batchNewNodes, batchEdges, ref heightData, ref waterData,
+                                sourceEndElevation, placedInfo, ref nodes, ref edges,
+                                ref ownedNodes, batchNewNodes, batchEdges,
+                                ref heightData, ref waterData,
                                 out endT, out endKind);
                         else
                             nativeTargetsResolved &= TryResolveNativeEndpointWithLocalSurface(prefab,
                                 command.End, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref nodes, ref edges, ref ownedNodes, ref ownedEdges,
                                 ref heightData, ref waterData,
                                 out endSnap, out endT, out endKind,
                                 out endUsedLocalSurface);
@@ -639,14 +619,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         if (command.HasNativeCourse)
                             _nativeTargetDeadlines.Remove(NativeRetryKey(message, command));
                         startSnap = ClassifyEndpointWithLocalSurface(prefab, a,
-                            sourceStartElevation, placedInfo, nodeEntities, nodeData,
-                            edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                            batchNewNodes, batchEdges, ref heightData, ref waterData,
+                            sourceStartElevation, placedInfo, ref nodes, ref edges,
+                            ref ownedNodes, batchNewNodes, batchEdges,
+                            ref heightData, ref waterData,
                             out startT, out startKind);
                         endSnap = ClassifyEndpointWithLocalSurface(prefab, d,
-                            sourceEndElevation, placedInfo, nodeEntities, nodeData,
-                            edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                            batchNewNodes, batchEdges, ref heightData, ref waterData,
+                            sourceEndElevation, placedInfo, ref nodes, ref edges,
+                            ref ownedNodes, batchNewNodes, batchEdges,
+                            ref heightData, ref waterData,
                             out endT, out endKind);
                     }
 
@@ -672,7 +652,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     // probe the span interior too, or two quick drags across the same road slip into one
                     // batch and hit the stale-edge crash below.
                     if (!nativeOperation && !defer && !splittingCourse)
-                        splittingCourse = BodyTouchesExistingEdge(bezier, placedInfo, edgeEntities, edgeCurves);
+                        splittingCourse = BodyTouchesExistingEdge(bezier, placedInfo, ref edges);
                     // At most ONE existing-edge-splitting course per batch: two courses committed in the
                     // same ApplyTool pass that both touch an existing edge can make ApplyNetSystem
                     // dereference a stale (already-split/deleted) edge and crash the process natively.
@@ -836,9 +816,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             {
                 if (haveSnapshot)
                 {
-                    nodeEntities.Dispose(); nodeData.Dispose(); edgeEntities.Dispose(); edgeCurves.Dispose();
-                    ownedNodeEntities.Dispose(); ownedNodeData.Dispose();
-                    ownedEdgeEntities.Dispose(); ownedEdgeCurves.Dispose();
+                    nodes.Dispose();
+                    edges.Dispose();
+                    ownedNodes.Dispose();
+                    ownedEdges.Dispose();
                 }
                 batchNewNodes.Dispose();
                 batchEdges.Dispose();
@@ -1113,20 +1094,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// parallel road or a span rebuilt at another elevation is never wrongly treated as a
         /// duplicate.
         /// </summary>
-        private bool SpanAlreadyBuilt(Entity prefab, Bezier4x3 span,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves)
+        private bool SpanAlreadyBuilt(Entity prefab, Bezier4x3 span, ref EdgePool edges)
         {
             for (int s = 0; s <= 4; s++)
             {
                 float3 p = MathUtils.Position(span, s / 4f);
                 bool covered = false;
-                for (int i = 0; i < edgeCurves.Length; i++)
+                NetCellIndex.Enumerator candidates = edges.Index.Near(p.xz, SplitMatch.TolXZ);
+                while (candidates.MoveNext())
                 {
-                    Bezier4x3 bez = edgeCurves[i].m_Bezier;
+                    int i = candidates.Current;
+                    Bezier4x3 bez = edges.Curves[i].m_Bezier;
                     float t;
                     if (MathUtils.Distance(bez.xz, p.xz, out t) > SplitMatch.TolXZ) continue;
                     if (math.abs(MathUtils.Position(bez, t).y - p.y) > SplitMatch.TolY) continue;
-                    if (EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(edgeEntities[i]).m_Prefab
+                    if (EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(edges.Entities[i]).m_Prefab
                         != prefab) continue;
                     covered = true;
                     break;
@@ -1176,7 +1158,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// while a false negative could place two conflicting split courses in one commit.
         /// </summary>
         private bool BodyTouchesExistingEdge(Bezier4x3 course, NetPrefabInfo placedInfo,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves)
+            ref EdgePool edges)
         {
             // The control hull contains the curve, so an expanded-AABB miss is an exact reject.
             float3 lo = math.min(math.min(course.a, course.b), math.min(course.c, course.d))
@@ -1190,19 +1172,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 + math.distance(course.c, course.d);
             int samples = math.clamp((int)(approxLen / EdgeSnapDistance), 8, 128);
 
-            for (int i = 0; i < edgeCurves.Length; i++)
+            NetCellIndex.Enumerator candidates = edges.Index.Overlapping(lo.xz, hi.xz);
+            while (candidates.MoveNext())
             {
-                Bezier4x3 bez = edgeCurves[i].m_Bezier;
-                NetPrefabInfo targetInfo = default(NetPrefabInfo);
-                if (EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(edgeEntities[i]))
-                    targetInfo = NetInfoOf(EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(edgeEntities[i]).m_Prefab);
-                if (!LayersCanConnect(placedInfo, targetInfo)) continue;
-                float touchDistance = math.max(EdgeSnapDistance,
-                    placedInfo.HalfWidth + EdgeHalfWidth(edgeEntities[i], targetInfo.HalfWidth) +
-                    placedInfo.SnapDistance);
+                int i = candidates.Current;
+                Bezier4x3 bez = edges.Curves[i].m_Bezier;
                 float3 elo = math.min(math.min(bez.a, bez.b), math.min(bez.c, bez.d));
                 float3 ehi = math.max(math.max(bez.a, bez.b), math.max(bez.c, bez.d));
                 if (math.any(elo > hi) || math.any(ehi < lo)) continue;
+
+                Entity candidate = edges.Entities[i];
+                NetPrefabInfo targetInfo = default(NetPrefabInfo);
+                if (EntityManager.HasComponent<global::Game.Prefabs.PrefabRef>(candidate))
+                    targetInfo = NetInfoOf(EntityManager.GetComponentData<global::Game.Prefabs.PrefabRef>(candidate).m_Prefab);
+                if (!LayersCanConnect(placedInfo, targetInfo)) continue;
+                float touchDistance = math.max(EdgeSnapDistance,
+                    placedInfo.HalfWidth + EdgeHalfWidth(candidate, targetInfo.HalfWidth) +
+                    placedInfo.SnapDistance);
 
                 for (int s = 1; s < samples; s++)
                 {
@@ -1229,20 +1215,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// <c>Kind*</c> classification.
         /// </summary>
         private Entity ClassifyEndpoint(float3 p, NetPrefabInfo placedInfo,
-            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
-            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
+            ref NodePool nodes, ref EdgePool edges, ref NodePool ownedNodes,
             NativeList<float3> batchNewNodes, NativeList<Bezier4x3> batchEdges,
             out float t, out int kind)
         {
             t = 0f;
-            Entity node = FindNodeAt(p, placedInfo, nodeEntities, nodeData);
+            Entity node = FindNodeAt(p, placedInfo, ref nodes);
             if (node != Entity.Null) { kind = KindReuseNode; return node; }
             // A power line / pipe endpoint lying on a building's connector stub connects to it —
             // the sender drew it onto that stub, so the committed segment ends exactly there.
             if ((placedInfo.ConnectLayers & UtilityConnectLayers) != Layer.None)
             {
-                node = FindUtilityNodeAt(p, ownedNodeEntities, ownedNodeData, placedInfo);
+                node = FindUtilityNodeAt(p, ref ownedNodes, placedInfo);
                 if (node != Entity.Null) { kind = KindReuseConnector; return node; }
             }
             // Coincides with a new node another course in this batch creates -> leave it as a fresh node
@@ -1252,7 +1236,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // defer the whole course to the next cycle, where that edge is real and this becomes a split.
             if (MidSpanOfAnyBatch(p, batchEdges)) { kind = KindDeferBatchEdge; return Entity.Null; }
             Entity edge, endNode;
-            FindEdgeAt(p, placedInfo, edgeEntities, edgeCurves, out edge, out t, out endNode);
+            FindEdgeAt(p, placedInfo, ref edges, out edge, out t, out endNode);
             // A tap inside an existing edge's end zone reuses that end's node (see FindEdgeAt).
             if (endNode != Entity.Null) { kind = KindReuseNode; return endNode; }
             if (edge != Entity.Null) { kind = KindSplit; return edge; }
@@ -1269,16 +1253,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         private Entity ClassifyEndpointWithLocalSurface(Entity prefab, float3 sourcePoint,
             float2 sourceElevation, NetPrefabInfo placedInfo,
-            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
-            NativeArray<Entity> ownedNodeEntities, NativeArray<Node> ownedNodeData,
+            ref NodePool nodes, ref EdgePool edges, ref NodePool ownedNodes,
             NativeList<float3> batchNewNodes, NativeList<Bezier4x3> batchEdges,
             ref TerrainHeightData heightData, ref WaterSurfaceData<SurfaceWater> waterData,
             out float t, out int kind)
         {
-            Entity result = ClassifyEndpoint(sourcePoint, placedInfo, nodeEntities, nodeData,
-                edgeEntities, edgeCurves, ownedNodeEntities, ownedNodeData,
-                batchNewNodes, batchEdges, out t, out kind);
+            Entity result = ClassifyEndpoint(sourcePoint, placedInfo, ref nodes, ref edges,
+                ref ownedNodes, batchNewNodes, batchEdges, out t, out kind);
             if (kind != KindFree) return result;
 
             float3 projected;
@@ -1289,8 +1270,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             float projectedT;
             int projectedKind;
             Entity projectedResult = ClassifyEndpoint(projected, placedInfo,
-                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                ownedNodeEntities, ownedNodeData, batchNewNodes, batchEdges,
+                ref nodes, ref edges, ref ownedNodes, batchNewNodes, batchEdges,
                 out projectedT, out projectedKind);
             if (projectedKind == KindFree) return result;
 

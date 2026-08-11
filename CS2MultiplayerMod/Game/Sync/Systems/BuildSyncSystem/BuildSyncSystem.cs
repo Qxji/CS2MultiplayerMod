@@ -557,7 +557,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                             _partialPlacementRecoveryRequested = true;
                             Mod.log.Error("[MP] BuildSync: complete lifecycle capture was missed for '" +
                                           name + "'; requesting (debounced) world recovery instead of " +
-                                          "sending a partial object graph.");
+                                          "sending a partial object graph. " +
+                                          (_lastObjectGraphMissDetail ?? "no correlation detail"));
                             Mod.Service.RequestAutomaticWorldRecovery("building placement capture missed");
                         }
                         continue;
@@ -644,11 +645,26 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// </summary>
         private bool RequiresCompleteObjectLifecycle(Entity prefab)
         {
+            if (IsNetObjectPlacement(prefab)) return false;
+
             return EntityManager.HasComponent<BuildingData>(prefab) ||
                    EntityManager.HasComponent<TransportStopData>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubObject>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubNet>(prefab) ||
                    EntityManager.HasBuffer<global::Game.Prefabs.SubArea>(prefab);
+        }
+
+        /// <summary>
+        /// A net object (roundabout island, turn-restriction sign) is described completely by prefab,
+        /// transform and attach anchor: the receiver regenerates its owned elements from the prefab
+        /// and tags the parent itself. Decorated variants carry sub-objects, which would otherwise
+        /// pin them to the native path where a capture miss escalates to a whole-world reload.
+        /// </summary>
+        private bool IsNetObjectPlacement(Entity prefab)
+        {
+            return EntityManager.HasComponent<global::Game.Prefabs.NetObjectData>(prefab) &&
+                   !EntityManager.HasComponent<BuildingData>(prefab) &&
+                   !EntityManager.HasComponent<TransportStopData>(prefab);
         }
 
 

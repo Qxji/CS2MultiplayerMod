@@ -23,19 +23,19 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
         public const byte Id = 16;
         public byte ChannelId => Id;
 
-        private const float MatchCellSize = 1f;
-        private const float MatchDistanceSq = 0.25f;
+        private const float MatchRadius = 0.5f;
+        private const float MatchDistanceSq = MatchRadius * MatchRadius;
         private const int MaxPriority = TreeStateBatch.MaxRecords * 2;
 
         private readonly List<Entity> _priority = new List<Entity>();
         private readonly HashSet<Entity> _prioritySet = new HashSet<Entity>();
-        private readonly Dictionary<TreeCellKey, Entity> _cells =
-            new Dictionary<TreeCellKey, Entity>();
+        private readonly HashSet<Entity> _redrawSet = new HashSet<Entity>();
 
         private EntityQuery _trees;
         private EntityQuery _prefabs;
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
+        private ObjectSearch _objectSearch;
         private bool _ready;
         private bool _warnedCapture;
         private int _cursor;
@@ -120,20 +120,14 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             TreeStateBatch batch = TreeStateBatch.Decode(reader.ReadBytes(reader.Remaining));
             if (batch.Records.Length == 0) return;
 
-            _cells.Clear();
-            NativeArray<Entity> trees = _trees.ToEntityArray(Allocator.Temp);
+            // One search-tree query per record. Indexing every tree in the city to serve a batch
+            // capped at MaxRecords cost the receiver a whole-map walk per snapshot — on a forested
+            // map that was the dominant main-thread cost of being a client.
+            var candidates = new NativeList<Entity>(16, Allocator.Temp);
+            var redraw = new NativeList<Entity>(64, Allocator.Temp);
+            _redrawSet.Clear();
             try
             {
-                for (int i = 0; i < trees.Length; i++)
-                {
-                    Entity entity = trees[i];
-                    Entity prefab = em.GetComponentData<PrefabRef>(entity).m_Prefab;
-                    float3 position = em.GetComponentData<Transform>(entity).m_Position;
-                    int seed = em.GetComponentData<PseudoRandomSeed>(entity).m_Seed;
-                    IndexTree(TreeCellKey.From(prefab, position, seed), entity);
-                    IndexTree(TreeCellKey.From(prefab, position, -1), entity);
-                }
-
                 for (int i = 0; i < batch.Records.Length; i++)
                 {
                     TreeStateRecord record = batch.Records[i];
@@ -144,7 +138,7 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
                         continue;
                     }
 
-                    Entity entity = FindTree(em, prefab, record);
+                    Entity entity = FindTree(em, prefab, record, candidates);
                     if (entity == Entity.Null)
                     {
                         _unmatched++;
@@ -163,13 +157,20 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
                     seed.m_Seed = record.RandomSeed;
                     em.SetComponentData(entity, tree);
                     em.SetComponentData(entity, seed);
-                    if (!em.HasComponent<BatchesUpdated>(entity)) em.AddComponent<BatchesUpdated>(entity);
+                    // Deferred: tagging inline made every correction its own structural change.
+                    // Two records within the match radius can land on one tree, and the batched
+                    // add coalesces by chunk — it must not be handed the same entity twice.
+                    if (!em.HasComponent<BatchesUpdated>(entity) && _redrawSet.Add(entity))
+                        redraw.Add(entity);
                     _corrected++;
                 }
+
+                if (redraw.Length > 0) em.AddComponent<BatchesUpdated>(redraw.AsArray());
             }
             finally
             {
-                trees.Dispose();
+                candidates.Dispose();
+                redraw.Dispose();
             }
 
             _snapshots++;
@@ -192,7 +193,7 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             _ready = false;
             _priority.Clear();
             _prioritySet.Clear();
-            _cells.Clear();
+            _redrawSet.Clear();
         }
 
         private void Ensure(EntityManager em)
@@ -201,6 +202,9 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             _prefabSystem = em.World.GetOrCreateSystemManaged<PrefabSystem>();
             _prefabs = em.CreateEntityQuery(ComponentType.ReadOnly<PrefabData>());
             _prefabIndex = new PrefabIndex(_prefabSystem, _prefabs);
+            _objectSearch = new ObjectSearch(
+                em.World.GetOrCreateSystemManaged<global::Game.Objects.SearchSystem>());
+            // Host-side rolling capture only; Apply resolves through the search tree instead.
             _trees = em.CreateEntityQuery(new EntityQueryDesc
             {
                 All = new[]
@@ -246,37 +250,45 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             });
         }
 
-        private void IndexTree(TreeCellKey key, Entity entity)
-        {
-            Entity existing;
-            if (_cells.TryGetValue(key, out existing))
-                _cells[key] = Entity.Null; // ambiguous cell: exact-seed lookup usually still wins
-            else
-                _cells.Add(key, entity);
-        }
-
-        private Entity FindTree(EntityManager em, Entity prefab, TreeStateRecord record)
-        {
-            Entity exact = FindTree(em, prefab, record, record.RandomSeed);
-            return exact != Entity.Null ? exact : FindTree(em, prefab, record, -1);
-        }
-
-        private Entity FindTree(EntityManager em, Entity prefab, TreeStateRecord record, int seed)
+        /// <summary>
+        /// Nearest same-prefab tree within <see cref="MatchRadius"/>, preferring an exact seed
+        /// match. Trees are indexed under their geometry bounds, so a canopy-sized box reaches the
+        /// query point long before the pivot does and the distance gate below does the real work.
+        /// </summary>
+        private Entity FindTree(EntityManager em, Entity prefab, TreeStateRecord record,
+            NativeList<Entity> candidates)
         {
             float3 wanted = new float3(record.PosX, record.PosY, record.PosZ);
-            TreeCellKey centre = TreeCellKey.From(prefab, wanted, seed);
+            _objectSearch.CollectNear(wanted, MatchRadius, candidates);
+
             Entity best = Entity.Null;
             float bestDistance = MatchDistanceSq;
+            bool bestSeedMatch = false;
 
-            for (int dx = -1; dx <= 1; dx++)
-            for (int dy = -1; dy <= 1; dy++)
-            for (int dz = -1; dz <= 1; dz++)
+            for (int i = 0; i < candidates.Length; i++)
             {
-                Entity candidate;
-                if (!_cells.TryGetValue(centre.Offset(dx, dy, dz), out candidate) ||
-                    candidate == Entity.Null) continue;
-                float3 position = em.GetComponentData<Transform>(candidate).m_Position;
-                float distance = math.distancesq(position, wanted);
+                Entity candidate = candidates[i];
+
+                // Range gate before the identity checks: bounds are canopy-sized, so most of what
+                // the tree reports is standing metres from the pivot we are matching.
+                if (!em.Exists(candidate) || !em.HasComponent<Transform>(candidate)) continue;
+                float distance = math.distancesq(
+                    em.GetComponentData<Transform>(candidate).m_Position, wanted);
+                if (distance > MatchDistanceSq) continue;
+
+                if (!IsTreeCandidate(em, candidate)) continue;
+                if (em.GetComponentData<PrefabRef>(candidate).m_Prefab != prefab) continue;
+
+                bool seedMatch = em.GetComponentData<PseudoRandomSeed>(candidate).m_Seed ==
+                                 record.RandomSeed;
+                if (bestSeedMatch && !seedMatch) continue;
+                if (seedMatch && !bestSeedMatch)
+                {
+                    best = candidate;
+                    bestDistance = distance;
+                    bestSeedMatch = true;
+                    continue;
+                }
                 if (distance > bestDistance) continue;
                 best = candidate;
                 bestDistance = distance;
@@ -284,46 +296,18 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             return best;
         }
 
-        private struct TreeCellKey : IEquatable<TreeCellKey>
-        {
-            private Entity _prefab;
-            private int _x, _y, _z;
-            private int _seed;
-
-            public static TreeCellKey From(Entity prefab, float3 position, int seed) => new TreeCellKey
-            {
-                _prefab = prefab,
-                _x = (int)math.floor(position.x / MatchCellSize),
-                _y = (int)math.floor(position.y / MatchCellSize),
-                _z = (int)math.floor(position.z / MatchCellSize),
-                _seed = seed,
-            };
-
-            public TreeCellKey Offset(int x, int y, int z) => new TreeCellKey
-            {
-                _prefab = _prefab,
-                _x = _x + x,
-                _y = _y + y,
-                _z = _z + z,
-                _seed = this._seed,
-            };
-
-            public bool Equals(TreeCellKey other) => _prefab.Equals(other._prefab) &&
-                _x == other._x && _y == other._y && _z == other._z && _seed == other._seed;
-
-            public override bool Equals(object obj) => obj is TreeCellKey && Equals((TreeCellKey)obj);
-
-            public override int GetHashCode()
-            {
-                unchecked
-                {
-                    int hash = _prefab.GetHashCode();
-                    hash = hash * 397 ^ _x;
-                    hash = hash * 397 ^ _y;
-                    hash = hash * 397 ^ _z;
-                    return hash * 397 ^ _seed;
-                }
-            }
-        }
+        /// <summary>
+        /// The search tree carries owned sub-objects and everything else static, and its entries are
+        /// only as fresh as the last tree update — so the filtering <see cref="_trees"/> expresses as
+        /// a query has to be repeated per candidate here. Liveness and <c>Transform</c> are the
+        /// caller's, checked ahead of the range gate.
+        /// </summary>
+        private static bool IsTreeCandidate(EntityManager em, Entity entity) =>
+            em.HasComponent<Tree>(entity) &&
+            em.HasComponent<PrefabRef>(entity) &&
+            em.HasComponent<PseudoRandomSeed>(entity) &&
+            !em.HasComponent<Temp>(entity) &&
+            !em.HasComponent<Deleted>(entity) &&
+            !em.HasComponent<Owner>(entity);
     }
 }

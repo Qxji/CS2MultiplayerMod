@@ -51,28 +51,30 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// "DELETED edge ... -> REUSE node #... -> commit ... -> [log ends]"). Treating a dying node as absent
         /// lands the endpoint on fresh ground instead - disconnected at worst, never a crash.
         /// </summary>
-        private Entity FindNodeAt(float3 position, NetPrefabInfo placedInfo,
-            NativeArray<Entity> nodeEntities, NativeArray<Node> nodeData)
+        private Entity FindNodeAt(float3 position, NetPrefabInfo placedInfo, ref NodePool nodes)
         {
             float2 p = position.xz;
             float bestSq = MaxEndpointSearch * MaxEndpointSearch;
             Entity best = Entity.Null;
-            for (int i = 0; i < nodeData.Length; i++)
+            NetCellIndex.Enumerator candidates = nodes.Index.Near(p, MaxEndpointSearch);
+            while (candidates.MoveNext())
             {
-                float dSq = math.distancesq(p, nodeData[i].m_Position.xz);
+                int i = candidates.Current;
+                float dSq = math.distancesq(p, nodes.Data[i].m_Position.xz);
                 // Only nodes inside the radius cap AND nearer than the current best reach the
                 // per-candidate lookups, so those run for a handful of candidates at most.
                 if (dSq >= bestSq) continue;
-                if (math.abs(nodeData[i].m_Position.y - position.y) > VerticalSnapTol) continue; // other level
+                if (math.abs(nodes.Data[i].m_Position.y - position.y) > VerticalSnapTol) continue; // other level
+                Entity entity = nodes.Entities[i];
                 NetPrefabInfo targetInfo = default;
-                if (EntityManager.HasComponent<PrefabRef>(nodeEntities[i]))
-                    targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(nodeEntities[i]).m_Prefab);
-                float radius = SnapRadius(placedInfo, NodeHalfWidth(nodeEntities[i], targetInfo.HalfWidth), NodeSnapDistance);
+                if (EntityManager.HasComponent<PrefabRef>(entity))
+                    targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                float radius = SnapRadius(placedInfo, NodeHalfWidth(entity, targetInfo.HalfWidth), NodeSnapDistance);
                 if (dSq >= radius * radius) continue;
                 if (!LayersCanConnect(placedInfo, targetInfo)) continue;
-                if (IsNodeBeingDeleted(nodeEntities[i])) continue;
+                if (IsNodeBeingDeleted(entity)) continue;
                 bestSq = dSq;
-                best = nodeEntities[i];
+                best = entity;
             }
             return best;
         }
@@ -86,29 +88,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// building never powers/feeds the line. Roads never come here (their layers aren't in
         /// <see cref="UtilityConnectLayers"/>), so driveways and hidden lane sub-nets stay untouchable.
         /// </summary>
-        private Entity FindUtilityNodeAt(float3 position, NativeArray<Entity> ownedEntities,
-            NativeArray<Node> ownedData, NetPrefabInfo placedInfo)
+        private Entity FindUtilityNodeAt(float3 position, ref NodePool owned,
+            NetPrefabInfo placedInfo)
         {
             float2 p = position.xz;
             float bestSq = MaxEndpointSearch * MaxEndpointSearch;
             Entity best = Entity.Null;
-            for (int i = 0; i < ownedData.Length; i++)
+            NetCellIndex.Enumerator candidates = owned.Index.Near(p, MaxEndpointSearch);
+            while (candidates.MoveNext())
             {
-                float dSq = math.distancesq(p, ownedData[i].m_Position.xz);
+                int i = candidates.Current;
+                float dSq = math.distancesq(p, owned.Data[i].m_Position.xz);
                 if (dSq >= bestSq) continue;
-                if (math.abs(ownedData[i].m_Position.y - position.y) > VerticalSnapTol) continue;
+                if (math.abs(owned.Data[i].m_Position.y - position.y) > VerticalSnapTol) continue;
+                Entity entity = owned.Entities[i];
                 NetPrefabInfo info = NetInfoOf(
-                    EntityManager.GetComponentData<PrefabRef>(ownedEntities[i]).m_Prefab);
+                    EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
                 float radius = SnapRadius(placedInfo,
-                    NodeHalfWidth(ownedEntities[i], info.HalfWidth), NodeSnapDistance);
+                    NodeHalfWidth(entity, info.HalfWidth), NodeSnapDistance);
                 if (dSq >= radius * radius) continue;
                 if (!LayersCanConnect(placedInfo, info) ||
                     ((info.ConnectLayers | info.RequiredLayers) &
                      (placedInfo.ConnectLayers | placedInfo.RequiredLayers) & UtilityConnectLayers) == Layer.None)
                     continue;
-                if (IsNodeBeingDeleted(ownedEntities[i])) continue;
+                if (IsNodeBeingDeleted(entity)) continue;
                 bestSq = dSq;
-                best = ownedEntities[i];
+                best = entity;
             }
             return best;
         }
@@ -435,8 +440,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// that end's node instead (via <paramref name="endNode"/>) - the native curve-position
         /// saturation - never planting a second junction node inside the existing one's footprint.
         /// </summary>
-        private void FindEdgeAt(float3 point, NetPrefabInfo placedInfo,
-            NativeArray<Entity> edgeEntities, NativeArray<Curve> edgeCurves,
+        private void FindEdgeAt(float3 point, NetPrefabInfo placedInfo, ref EdgePool edges,
             out Entity edge, out float t, out Entity endNode)
         {
             float2 p = point.xz;
@@ -444,16 +448,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             edge = Entity.Null;
             t = 0f;
             endNode = Entity.Null;
-            for (int i = 0; i < edgeCurves.Length; i++)
+            NetCellIndex.Enumerator candidates = edges.Index.Near(p, MaxEndpointSearch);
+            while (candidates.MoveNext())
             {
-                Bezier4x3 bez = edgeCurves[i].m_Bezier;
+                int i = candidates.Current;
+                Bezier4x3 bez = edges.Curves[i].m_Bezier;
                 float tt;
                 float dist = MathUtils.Distance(bez.xz, p, out tt);
                 if (dist >= best) continue;
+                Entity candidate = edges.Entities[i];
                 NetPrefabInfo targetInfo = default;
-                if (EntityManager.HasComponent<PrefabRef>(edgeEntities[i]))
-                    targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(edgeEntities[i]).m_Prefab);
-                float targetHalf = EdgeHalfWidth(edgeEntities[i], targetInfo.HalfWidth);
+                if (EntityManager.HasComponent<PrefabRef>(candidate))
+                    targetInfo = NetInfoOf(EntityManager.GetComponentData<PrefabRef>(candidate).m_Prefab);
+                float targetHalf = EdgeHalfWidth(candidate, targetInfo.HalfWidth);
                 if (dist >= SnapRadius(placedInfo, targetHalf, EdgeSnapDistance)) continue;
                 if (!LayersCanConnect(placedInfo, targetInfo)) continue;
                 float3 sp = MathUtils.Position(bez, tt);
@@ -462,9 +469,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 float endZone = math.max(MinSplitOffset, placedInfo.SnapDistance);
                 Entity reuse = Entity.Null;
                 if (math.distance(sp.xz, bez.a.xz) < endZone)
-                    reuse = EntityManager.GetComponentData<Edge>(edgeEntities[i]).m_Start;
+                    reuse = EntityManager.GetComponentData<Edge>(candidate).m_Start;
                 else if (math.distance(sp.xz, bez.d.xz) < endZone)
-                    reuse = EntityManager.GetComponentData<Edge>(edgeEntities[i]).m_End;
+                    reuse = EntityManager.GetComponentData<Edge>(candidate).m_End;
 
                 if (reuse != Entity.Null)
                 {
@@ -479,7 +486,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 }
 
                 best = dist;
-                edge = edgeEntities[i];
+                edge = candidate;
                 t = tt;
                 endNode = Entity.Null;
             }

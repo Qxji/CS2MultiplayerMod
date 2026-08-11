@@ -33,6 +33,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             // Fresh, entity-visible definitions that are not a sync feeder's own (those carry
             // Deleted from birth) - i.e. the active tool's buffered preview definitions.
+            // Zoning definitions are spared: they materialise into Block/Cell Temps, which no
+            // isolated commit reads, and killing one leaves the marquee with no preview to commit
+            // on the frame the player releases (see NetSyncSystem's standing-Temp query).
             _foreignDefinitions = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[]
@@ -40,7 +43,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     ComponentType.ReadOnly<CreationDefinition>(),
                     ComponentType.ReadOnly<Updated>(),
                 },
-                None = new[] { ComponentType.ReadOnly<Deleted>() },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Deleted>(),
+                    ComponentType.ReadOnly<Zoning>(),
+                },
             });
         }
 

@@ -154,6 +154,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private int _rzSurfaceCorrections;
         private float _rzSurfaceCorrectionMax;
 
+        // What the current realize cycle worked on, for the slow-cycle report only.
+        private int _rzCycleCourses;
+        private int _rzCyclePool;
+
         // Capture-side 5 s peak counts of net-edge lifecycle tags, to reveal how CS2 represents an
         // edge split: an in-place reuse of the original shows up as Updated (NOT Created/Deleted).
         private int _peakCreated, _peakUpdated, _peakDeleted;
@@ -397,10 +401,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 },
             });
 
+            // Zone cell blocks are excluded: an isolated commit only ever drives the object, net,
+            // area and route apply passes, none of which read Block/Cell, so a zoning preview can
+            // never ride along. It is also the one preview a player builds across many frames and
+            // commits in a single one (the marquee), so isolating it discards the whole gesture.
             _standingTemps = GetEntityQuery(new EntityQueryDesc
             {
                 All = new[] { ComponentType.ReadOnly<Temp>() },
-                None = new[] { ComponentType.ReadOnly<Deleted>() },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Deleted>(),
+                    ComponentType.ReadOnly<global::Game.Zones.Block>(),
+                },
             });
 
             // Tool definitions lose Updated after the frame that materializes their preview. Those

@@ -28,6 +28,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private const float StrictCommittedRootRotationDot = 0.99999f;
 
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
+        // Why the last committed root failed to bind to a preview graph; read by the escalation path.
+        private string _lastObjectGraphMissDetail;
         private readonly List<RecentLocalObjectOperation> _recentLocalObjectOperations =
             new List<RecentLocalObjectOperation>(MaxRecentLocalObjectOperations);
         // Sampled before ToolOutputSystem runs. A one-shot stamp can switch active tools while its
@@ -789,9 +791,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     }
                 }
             }
-            Diagnostics.FlightRecorder.Note("object graph match missed prefab=" + prefabName +
-                " seed=" + seed + " recent=" + _recentLocalObjectOperations.Count +
-                " newest=" + newest + matchingIdentity);
+            _lastObjectGraphMissDetail = "prefab=" + prefabName + " seed=" + seed +
+                " recent=" + _recentLocalObjectOperations.Count + " newest=" + newest +
+                matchingIdentity;
+            Diagnostics.FlightRecorder.Note("object graph match missed " + _lastObjectGraphMissDetail);
         }
 
         private bool TryBeginSpecializedAreaCapture(Entity recreate)
@@ -1261,10 +1264,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 CreationDefinition creation =
                     EntityManager.GetComponentData<CreationDefinition>(entity);
                 if ((creation.m_Flags & CreationFlags.Relocate) == 0) continue;
-                // Owned elements of the moved building carry their own Relocate definitions; the
-                // root is the one the tool was given, which has no owner above it.
-                if (creation.m_Owner != Entity.Null ||
-                    EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
+                // Owned elements carried along by a relocation - the moved building's own installed
+                // upgrades - are emitted without a prefab, taking it from the entity they name. Only
+                // the definition the tool was given carries the selected prefab, so that test finds
+                // the root whether or not this relocation has a host: an upgrade relocated from the
+                // building's upgrade list is itself owned, and its root definition therefore carries
+                // an OwnerDefinition naming that host.
+                if (creation.m_Owner != Entity.Null || creation.m_Prefab == Entity.Null) continue;
 
                 Entity original = creation.m_Original;
                 if (original == Entity.Null || !EntityManager.Exists(original) ||

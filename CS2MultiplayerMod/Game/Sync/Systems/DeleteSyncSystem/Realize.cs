@@ -390,6 +390,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             {
                 Bezier4x3 curve = EntityManager.GetComponentData<Curve>(edge).m_Bezier;
                 Edge ends = EntityManager.GetComponentData<Edge>(edge);
+                // A net of repeating fixed elements (dam, fixed roundabout piece) identifies which
+                // piece an edge is by this index. Reporting -1 for one names no piece.
+                int fixedIndex = EntityManager.HasComponent<global::Game.Net.Fixed>(edge)
+                    ? EntityManager.GetComponentData<global::Game.Net.Fixed>(edge).m_Index
+                    : -1;
                 Entity def = EntityManager.CreateEntity();
                 EntityManager.AddComponentData(def, new CreationDefinition
                 {
@@ -400,7 +405,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 {
                     m_Curve = curve,
                     m_Length = MathUtils.Length(curve),
-                    m_FixedIndex = -1,
+                    m_FixedIndex = fixedIndex,
                     m_StartPosition = new CoursePos
                     {
                         m_Entity = ends.m_Start,

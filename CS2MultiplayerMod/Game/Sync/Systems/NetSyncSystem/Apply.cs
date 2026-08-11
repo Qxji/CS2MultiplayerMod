@@ -166,7 +166,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (_invalidatedBatchDraining) return;
 
             MultiplayerSession session = service.Session;
+            long startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            _rzCycleCourses = 0;
+            _rzCyclePool = 0;
             RealizeIncoming(session, service.NowMs);
+            ReportSlowRealizeCycle(startTicks);
+        }
+
+        /// <summary>How long one realize cycle may take before it is worth a log line.</summary>
+        private const double SlowRealizeCycleMs = 25d;
+
+        /// <summary>
+        /// A remote operation is resolved and armed inside a single frame, so a slow cycle is a
+        /// visible stutter for the player who did not draw it. Report it with the two numbers that
+        /// explain the cost - how many courses the operation carried and how much of the city the
+        /// snapshot held - instead of leaving it to be inferred from a frame-rate complaint.
+        /// </summary>
+        private void ReportSlowRealizeCycle(long startTicks)
+        {
+            double elapsedMs = (System.Diagnostics.Stopwatch.GetTimestamp() - startTicks) * 1000d /
+                               System.Diagnostics.Stopwatch.Frequency;
+            if (elapsedMs < SlowRealizeCycleMs) return;
+            Mod.log.Info("[MP] NetSync realize cycle took " + elapsedMs.ToString("F0") + " ms (" +
+                         _rzCycleCourses + " course(s), " + _rzCyclePool + " indexed net entities).");
+            Diagnostics.FlightRecorder.Note("net realize cycle ms=" + elapsedMs.ToString("F0") +
+                                              " courses=" + _rzCycleCourses +
+                                              " pool=" + _rzCyclePool);
         }
 
         /// <summary>
@@ -420,6 +445,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 remoteTemps.Dispose();
             }
 
+            NoteTransactionComposition(_pendingTransactionKind, _committingRemoteNetTemps);
+
             try
             {
                 if (IsObjectGraphTransaction(_pendingTransactionKind))
@@ -490,6 +517,69 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 _committingTransactionKind.ToString().ToLowerInvariant() +
                 " commit isolated (temps=" + count + ") validateMS=" + validateMs +
                 " applyMS=" + (System.Environment.TickCount - applyStartTick));
+        }
+
+        /// <summary>Members named individually before the composition line is truncated.</summary>
+        private const int MaxNotedTransactionMembers = 64;
+
+        /// <summary>
+        /// Record what an isolated apply pass is about to consume - shape, <see cref="TempFlags"/>
+        /// and original per member - immediately before the native call. That call can end the
+        /// process without unwinding, so this line is the only surviving description of the batch.
+        /// </summary>
+        private void NoteTransactionComposition(RemoteToolTransactionKind kind, List<Entity> members)
+        {
+            if (!Diagnostics.FlightRecorder.Enabled) return;
+
+            int edges = 0, nodes = 0, lanes = 0, aggregates = 0, objects = 0, areas = 0;
+            int deletedTagged = 0, missing = 0, sharedOriginals = 0;
+            var originals = new HashSet<Entity>();
+            var detail = new System.Text.StringBuilder();
+            for (int i = 0; i < members.Count; i++)
+            {
+                Entity entity = members[i];
+                if (!EntityManager.Exists(entity)) { missing++; continue; }
+                if (EntityManager.HasComponent<Deleted>(entity)) deletedTagged++;
+
+                string shape;
+                if (EntityManager.HasComponent<Edge>(entity)) { edges++; shape = "edge"; }
+                else if (EntityManager.HasComponent<Node>(entity)) { nodes++; shape = "node"; }
+                else if (EntityManager.HasComponent<Lane>(entity)) { lanes++; shape = "lane"; }
+                else if (EntityManager.HasComponent<Aggregate>(entity)) { aggregates++; shape = "aggr"; }
+                else if (EntityManager.HasComponent<global::Game.Objects.Object>(entity))
+                { objects++; shape = "obj"; }
+                else if (EntityManager.HasComponent<global::Game.Areas.Area>(entity))
+                { areas++; shape = "area"; }
+                else shape = "other";
+
+                Entity original = Entity.Null;
+                TempFlags flags = default(TempFlags);
+                if (EntityManager.HasComponent<Temp>(entity))
+                {
+                    Temp temp = EntityManager.GetComponentData<Temp>(entity);
+                    original = temp.m_Original;
+                    flags = temp.m_Flags;
+                }
+                // Two members naming one original is the shape the apply passes dereference without
+                // a liveness check. Nothing rejects the batch for it yet - count it so a crash here
+                // can be read off the log instead of reconstructed.
+                if (original != Entity.Null && !originals.Add(original)) sharedOriginals++;
+
+                if (i >= MaxNotedTransactionMembers) continue;
+                if (detail.Length > 0) detail.Append(' ');
+                detail.Append(shape).Append('#').Append(entity.Index)
+                      .Append('[').Append(flags.ToString().Replace(", ", "|")).Append(']');
+                if (original != Entity.Null) detail.Append(">#").Append(original.Index);
+            }
+            if (members.Count > MaxNotedTransactionMembers)
+                detail.Append(" +").Append(members.Count - MaxNotedTransactionMembers).Append(" more");
+
+            Diagnostics.FlightRecorder.Note("commit composition kind=" +
+                kind.ToString().ToLowerInvariant() + " temps=" + members.Count +
+                " edge=" + edges + " node=" + nodes + " lane=" + lanes +
+                " aggr=" + aggregates + " obj=" + objects + " area=" + areas +
+                " deletedTag=" + deletedTagged + " missing=" + missing +
+                " sharedOriginal=" + sharedOriginals + " members=[" + detail + "]");
         }
 
         private bool CommittedRemoteTempsRemain()
