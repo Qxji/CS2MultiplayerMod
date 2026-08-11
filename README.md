@@ -27,7 +27,7 @@ The easiest way is through **Paradox Mods**: find the mod, add it to an **empty*
 1. In the mod settings, set your player name and choose the host port, password, max players, LAN-only mode, and world re-sync interval.
 2. Click **Multiplayer** on the main menu, then **Host Game**.
 
-There is two ways to host: **Steam Relay**, which is suited for everyone - and **Direct Connection**, which offers faster Sync times at the cost of setup time. 
+There is two ways to host: **Steam Relay**, which is suited for everyone who owns the game on Steam - and **Direct Connection**, which offers faster Sync times at the cost of setup time and can be used on XBox App, Microsoft Store and Game Pass versions of the game.
 
 3. If you selected **Steam Relay**, copy the join code and send it to your friends. [Instructions for using **Direct Connection**](help/direct_connection.md).
 3. Choose **Load World** for an existing city or **Create World** for a new one. If you use an existing save, **make a backup first**.
