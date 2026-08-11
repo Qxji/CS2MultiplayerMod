@@ -18,6 +18,12 @@ namespace CS2MultiplayerMod.Core.Session
         private const int HeartbeatIntervalMs = 2000;
         private const int PeerTimeoutMs = 10000;
         private const int HandshakeTimeoutMs = 10000;
+
+        /// <summary>A join awaiting the host's manual approval is auto-declined after this
+        /// long, so an absent host never leaves the would-be player waiting forever and a
+        /// pre-handshake socket is never held open indefinitely.</summary>
+        private const int JoinApprovalTimeoutMs = 120000;
+
         private const int HostPlayerId = 1;
 
         /// <summary>Reassembling blobs allowed at once on a client.</summary>
@@ -35,19 +41,26 @@ namespace CS2MultiplayerMod.Core.Session
         private readonly List<TransportEvent> _eventBuffer = new List<TransportEvent>();
         private readonly Dictionary<int, Peer> _peers = new Dictionary<int, Peer>();
         private readonly Dictionary<string, BlobReassembler> _blobs = new Dictionary<string, BlobReassembler>();
+        private readonly Dictionary<string, long> _blobTransferIds = new Dictionary<string, long>();
         private readonly Dictionary<string, int> _allowedBlobChannels = new Dictionary<string, int>();
         private readonly HashSet<ushort> _allowedCommandIds = new HashSet<ushort>();
+        private readonly HashSet<int> _administrativeRemovals = new HashSet<int>();
+        private readonly HashSet<string> _hostBannedAddresses = new HashSet<string>();
         private readonly FailedAuthTracker _failedAuth = new FailedAuthTracker();
 
         private ITransport _transport;
         private MultiplayerConfig _config;
         private X509Certificate2 _certificate;
+        private PortForward _portForward;
         private int _nextPlayerId = HostPlayerId + 1;
         private long _lastHeartbeatMs;
         private long _lastBlobSweepMs;
         private long _lastAuthSweepMs;
         private long _lastResyncAcceptedUnixMs;
         private bool _challengeAnswered;
+        private bool _awaitingHostApproval;
+        private bool _worldSyncSuspended;
+        private long _worldSyncEpoch;
 
         public MultiplayerSession(IModLogger log, MessageCodec codec = null)
         {
@@ -69,8 +82,24 @@ namespace CS2MultiplayerMod.Core.Session
         /// <summary>True when hosting beyond the local network (LAN filter off).</summary>
         public bool PublicExposure => Role == SessionRole.Host && _config != null && !_config.LanOnly;
 
+        /// <summary>How the active session reaches its peers (Direct before the first session).</summary>
+        public TransportMode Transport => _config != null ? _config.Transport : TransportMode.Direct;
+
+        /// <summary>True when the active session runs over a relay rather than a direct socket.</summary>
+        public bool UsesRelay => _config != null && _config.Transport == TransportMode.SteamRelay;
+
         /// <summary>TCP port of the active session's config (0 before the first session).</summary>
         public int Port => _config != null ? _config.Port : 0;
+
+        /// <summary>
+        /// What the router made of opening this host's port. Null whenever nothing was
+        /// asked: a client, a relay session, or a LAN-only host, none of which need one.
+        /// </summary>
+        public PortForwardState? PortForwardStatus =>
+            _portForward != null ? _portForward.State : (PortForwardState?)null;
+
+        /// <summary>The public address the router reported, or null if it never told us.</summary>
+        public string PortForwardAddress => _portForward != null ? _portForward.ExternalAddress : null;
 
         /// <summary>Bytes queued in the transport but not yet on the wire (0 when idle).</summary>
         public long PendingSendBytes => _transport != null ? _transport.PendingSendBytes : 0;
@@ -79,6 +108,14 @@ namespace CS2MultiplayerMod.Core.Session
         public string IncomingBlobChannel { get; private set; }
         public int IncomingBlobReceived { get; private set; }
         public int IncomingBlobTotal { get; private set; }
+        public long IncomingBlobTransferId { get; private set; }
+
+        /// <summary>
+        /// True between a world-sync Begin and its matching Resume/Abort. Gameplay traffic is
+        /// rejected at the session boundary during this interval, in addition to game-layer gates.
+        /// </summary>
+        public bool WorldSyncSuspended => _worldSyncSuspended;
+        public long WorldSyncEpoch => _worldSyncEpoch;
 
         // Host-side "Sending world %": a streamed blob is queued instantly (the send is
         // non-blocking) and then drains off the transport's send thread; these track that
@@ -91,6 +128,25 @@ namespace CS2MultiplayerMod.Core.Session
         public long OutgoingBlobSent => _outgoingBlobSent;
 
         public IReadOnlyCollection<Peer> Peers => _peers.Values;
+
+        /// <summary>
+        /// Client-only: the host acknowledged the join and it is waiting for the host to
+        /// approve it by hand. True between the host's HandshakePending and its accept/reject.
+        /// </summary>
+        public bool AwaitingHostApproval => _awaitingHostApproval;
+
+        /// <summary>
+        /// Host-only: joins that passed every automatic check and are waiting for the host
+        /// to approve or decline them. Enumerated on the game thread alongside the pump.
+        /// </summary>
+        public IEnumerable<Peer> PendingJoins
+        {
+            get
+            {
+                foreach (var pair in _peers)
+                    if (pair.Value.AwaitingApproval) yield return pair.Value;
+            }
+        }
 
         public void AddObserver(ISessionObserver observer)
         {

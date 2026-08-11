@@ -3,6 +3,7 @@ using Colossal.Mathematics;
 using Game.Net;
 using Game.Objects;
 using Game.Prefabs;
+using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
 using Unity.Mathematics;
@@ -16,18 +17,53 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
     {
         private void CaptureDeletedObjects(MultiplayerSession session, long now)
         {
-            if (_deletedObjects.IsEmptyIgnoreFilter) return;
+            // A native object-tool transaction already contains every explicit delete in the
+            // object/sub-net/area graph, and the receiver's generator reproduces its implicit
+            // clear/split side effects. Do not turn that transaction output into a second command.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && (buildSync.NativeLifecycleCapturedThisFrame ||
+                                       buildSync.LocalObjectLifecycleAppliedThisFrame)) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame)) return;
 
-            NativeArray<Entity> entities = _deletedObjects.ToEntityArray(Allocator.Temp);
+            CollectToolDeleteOriginals();
+            SendObjectDeletes(session, now, _deletedObjects, ownedUpgrades: false);
+            // Removing a single upgrade is not a bulldoze: the building's properties panel tags that
+            // one owned entity Deleted. The query above excludes Owner (a root delete already carries
+            // its owned graph), so a standalone upgrade removal was never captured at all.
+            SendObjectDeletes(session, now, _deletedOwnedUpgrades, ownedUpgrades: true);
+        }
+
+        private void SendObjectDeletes(MultiplayerSession session, long now, EntityQuery query,
+            bool ownedUpgrades)
+        {
+            if (query.IsEmptyIgnoreFilter) return;
+
+            NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < entities.Length; i++)
                 {
-                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entities[i]).m_Prefab;
+                    Entity entity = entities[i];
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
                     string name = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(name)) continue;
 
-                    float3 pos = EntityManager.GetComponentData<Transform>(entities[i]).m_Position;
+                    // Each city grows and retires its own growables; BuildSync refuses to place
+                    // them for the same reason, and a world resync is what reconciles the two.
+                    // Sending these produced a delete the peer could never match (its lot holds a
+                    // different building, or none), and when one did match it tore down a building
+                    // the peer's own simulation considered healthy.
+                    if (!ownedUpgrades && IsSimulationOwnedLifecycle(prefab) &&
+                        !_toolDeleteOriginals.Contains(entity))
+                    {
+                        Mod.Verbose("[MP] DeleteSync: not replicating simulation-owned removal of '" +
+                                    name + "'.");
+                        continue;
+                    }
+
+                    if (ownedUpgrades && !IsStandaloneUpgradeRemoval(entity, prefab)) continue;
+
+                    float3 pos = EntityManager.GetComponentData<Transform>(entity).m_Position;
                     if (_guard.Consume(DeleteKey(name, pos), now)) continue;
 
                     var command = new ObjectDeleteCommand
@@ -44,8 +80,73 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        /// <summary>
+        /// Records the entities a tool is removing this frame. Read at ModificationEnd, where the
+        /// apply pass has already tagged the victim <see cref="global::Game.Common.Deleted"/> while
+        /// its <see cref="Temp"/> is still standing (cleanup runs later).
+        /// </summary>
+        private void CollectToolDeleteOriginals()
+        {
+            _toolDeleteOriginals.Clear();
+            if (_toolDeleteTemps.IsEmptyIgnoreFilter) return;
+
+            NativeArray<Entity> temps = _toolDeleteTemps.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < temps.Length; i++)
+                {
+                    Temp temp = EntityManager.GetComponentData<Temp>(temps[i]);
+                    if ((temp.m_Flags & TempFlags.Delete) == 0) continue;
+                    if (temp.m_Original != Entity.Null) _toolDeleteOriginals.Add(temp.m_Original);
+                }
+            }
+            finally
+            {
+                temps.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// True for objects the simulation creates and retires on its own. Mirrors
+        /// BuildSyncSystem's placement rule so creation and removal stay symmetric: neither
+        /// direction of a growable's lifecycle travels on the wire.
+        /// </summary>
+        private bool IsSimulationOwnedLifecycle(Entity prefab)
+        {
+            if (prefab == Entity.Null || !EntityManager.Exists(prefab)) return true;
+            if (EntityManager.HasComponent<MovingObjectData>(prefab)) return true;
+            return EntityManager.HasComponent<SpawnableBuildingData>(prefab) &&
+                   !EntityManager.HasComponent<SignatureBuildingData>(prefab);
+        }
+
+        /// <summary>
+        /// True when this owned upgrade is being removed on its own, rather than disappearing with its
+        /// host. A host delete already replicates as one root command whose realization walks the
+        /// owned graph, so re-sending the children would fight that. Requiring
+        /// <see cref="ServiceUpgradeData"/> also keeps simulation-owned lot content (a storage yard's
+        /// container piles, which despawn constantly) off the wire.
+        /// </summary>
+        private bool IsStandaloneUpgradeRemoval(Entity entity, Entity prefab)
+        {
+            if (!EntityManager.HasComponent<ServiceUpgradeData>(prefab)) return false;
+            Entity owner = EntityManager
+                .GetComponentData<global::Game.Common.Owner>(entity).m_Owner;
+            return owner != Entity.Null && EntityManager.Exists(owner) &&
+                   !EntityManager.HasComponent<global::Game.Common.Deleted>(owner) &&
+                   !EntityManager.HasComponent<global::Game.Tools.Temp>(owner);
+        }
+
         private void CaptureDeletedEdges(MultiplayerSession session, long now)
         {
+            // Asset-stamp intersections and other object prefabs apply their whole owned network in
+            // one native graph. A follow-up edge delete can otherwise tear down the freshly connected
+            // receiver graph after its atomic commit. The same holds for an upgrade or relocation
+            // whose footprint clears the host building's existing driveways: the receiver derives
+            // those removals from the same action.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && (buildSync.NativeLifecycleCapturedThisFrame ||
+                                       buildSync.LocalObjectLifecycleAppliedThisFrame)) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame)) return;
             if (_deletedEdges.IsEmptyIgnoreFilter) return;
 
             // Snapshot this frame's Created edges so we can distinguish a mid-span SPLIT from a real

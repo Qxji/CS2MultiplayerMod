@@ -106,8 +106,8 @@ namespace CS2MultiplayerMod.Core.Session
             // DLC preconditions (idea from CS2M): differing DLC ownership means
             // differing prefab catalogues — a placement of a DLC building would desync
             // or crash the other side. Both lists are canonical (sorted, client-side
-            // content excluded); either side sending an empty list means "unknown",
-            // and the check is skipped rather than locking such a build out.
+            // content excluded). Empty is a valid set (no content DLC), not a wildcard:
+            // accepting a client with six DLCs into a zero-DLC host still desynchronizes.
             string dlcMismatch = DescribeDlcMismatch(_config.DlcList, request.DlcList);
             if (dlcMismatch != null)
             {
@@ -125,11 +125,41 @@ namespace CS2MultiplayerMod.Core.Session
                 return;
             }
 
-            peer.PlayerId = _nextPlayerId++;
-            // Names key chat lines and join/leave notices, so two players with the
-            // same name would be indistinguishable everywhere (CS2M solves this by
-            // rejecting; suffixing keeps the join frictionless instead).
-            peer.Name = UniquePlayerName(WireGuard.SanitizePlayerName(request.PlayerName));
+            // Names key chat lines and join/leave notices, so two players with the same
+            // name would be indistinguishable everywhere; FinalizeJoin de-duplicates by
+            // suffixing "(2)" rather than rejecting, keeping the join frictionless.
+            peer.Name = WireGuard.SanitizePlayerName(request.PlayerName);
+
+            // Optional manual gate: hold the join and let the host admit it by hand. The
+            // player is given an id now so the host UI can reference this exact request,
+            // but stays un-Handshaked (no seat, no traffic) until FinalizeJoin runs.
+            if (_config.RequireJoinApproval)
+            {
+                peer.PlayerId = _nextPlayerId++;
+                peer.AwaitingApproval = true;
+                SendTo(connection, new HandshakePendingMessage());
+                _log.Info("Join from " + peer + " passed the checks; awaiting host approval.");
+                return;
+            }
+
+            FinalizeJoin(connection, peer, nowUnixMs);
+        }
+
+        /// <summary>
+        /// Complete a join: reserve an id if one was not already assigned, make the name
+        /// unique, mark the peer authenticated, and announce the arrival to everyone. Shared
+        /// by the immediate-accept path and the host's manual approval.
+        /// </summary>
+        private void FinalizeJoin(ConnectionId connection, Peer peer, long nowUnixMs)
+        {
+            if (peer.PlayerId == 0) peer.PlayerId = _nextPlayerId++;
+            peer.Name = UniquePlayerName(peer.Name);
+            // A manually approved peer may have been silent for longer than the normal
+            // post-handshake timeout while waiting at the approval gate. Start its live
+            // liveness window at admission, before the next reaper pass can classify the
+            // old handshake timestamp as an immediate timeout.
+            peer.LastSeenUnixMs = nowUnixMs;
+            peer.AwaitingApproval = false;
             peer.Handshaked = true;
 
             SendTo(connection, HandshakeResponse.Accept(peer.PlayerId));
@@ -145,15 +175,77 @@ namespace CS2MultiplayerMod.Core.Session
         }
 
         /// <summary>
-        /// Compare host and client DLC sets. Returns null when compatible (or when
-        /// either side could not produce a list), otherwise a human-readable summary
+        /// Host-only: admit a join that is waiting for manual approval. The seat cap is
+        /// re-checked at admit time (players may have joined since the request arrived); if
+        /// the session filled up in between, the waiting player is declined with that reason
+        /// instead. Returns false when no pending join carries this id.
+        /// </summary>
+        public bool ApproveJoin(int playerId, long nowUnixMs)
+        {
+            if (Role != SessionRole.Host) return false;
+            Peer peer = FindPendingJoin(playerId);
+            if (peer == null) return false;
+
+            int seated = 1;
+            foreach (var pair in _peers)
+                if (pair.Value.Handshaked) seated++;
+            if (seated >= _config.MaxPlayers)
+            {
+                Reject(peer.Connection, "Server is full (" + _config.MaxPlayers + " players).");
+                return true;
+            }
+
+            FinalizeJoin(peer.Connection, peer, nowUnixMs);
+            return true;
+        }
+
+        /// <summary>
+        /// Host-only: refuse a join that is waiting for manual approval, delivering a clear
+        /// reason before the socket closes. Returns false when no pending join carries this id.
+        /// </summary>
+        public bool DeclineJoin(int playerId)
+        {
+            if (Role != SessionRole.Host) return false;
+            Peer peer = FindPendingJoin(playerId);
+            if (peer == null) return false;
+            Reject(peer.Connection, "The host declined your request to join.");
+            return true;
+        }
+
+        private Peer FindPendingJoin(int playerId)
+        {
+            foreach (var pair in _peers)
+            {
+                Peer peer = pair.Value;
+                if (peer.AwaitingApproval && peer.PlayerId == playerId) return peer;
+            }
+            return null;
+        }
+
+        private void HandleHandshakePending(ConnectionId connection, Peer peer)
+        {
+            // Host -> client only. Anyone else sending it (a client to the host) is speaking
+            // out of turn and is disconnected.
+            if (Role != SessionRole.Client)
+            {
+                Punt(connection, peer, "sent a host-only handshake-pending", "HandshakePending");
+                return;
+            }
+            if (_awaitingHostApproval) return;
+            _awaitingHostApproval = true;
+            _log.Info("The host received the join request; waiting for the host to approve it.");
+        }
+
+        /// <summary>
+        /// Compare host and client DLC sets. Returns null when compatible; otherwise
+        /// returns a human-readable summary
         /// naming exactly what differs - so the rejected player knows what to change
         /// instead of staring at a generic "incompatible" error.
         /// </summary>
         internal static string DescribeDlcMismatch(string[] hostDlcs, string[] clientDlcs)
         {
-            if (hostDlcs == null || hostDlcs.Length == 0 || clientDlcs == null || clientDlcs.Length == 0)
-                return null; // one side has no data — don't lock it out
+            if (hostDlcs == null) hostDlcs = Array.Empty<string>();
+            if (clientDlcs == null) clientDlcs = Array.Empty<string>();
 
             var host = new HashSet<string>(hostDlcs, StringComparer.Ordinal);
             var client = new HashSet<string>(clientDlcs, StringComparer.Ordinal);
@@ -217,6 +309,10 @@ namespace CS2MultiplayerMod.Core.Session
         private void HandleHandshakeResponse(Peer peer, HandshakeResponse response)
         {
             if (Role != SessionRole.Client) return;
+
+            // The wait is over either way — accepted below, or rejected (which includes a
+            // manual decline) into a fault.
+            _awaitingHostApproval = false;
 
             if (!response.Accepted)
             {

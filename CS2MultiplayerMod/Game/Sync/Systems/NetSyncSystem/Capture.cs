@@ -5,6 +5,7 @@ using Game.Net;
 using Game.Prefabs;
 using Unity.Collections;
 using Unity.Entities;
+using Unity.Mathematics;
 using CS2MultiplayerMod.Core.Session;
 
 using CS2MultiplayerMod.Game.Sync.Infrastructure;
@@ -61,9 +62,32 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                              _rzFreeEnds + " free ground.");
             }
 
+            if (_rzSurfaceCorrections > 0)
+            {
+                Mod.log.Info("[MP] NetSync: " + _rzSurfaceCorrections + " remote endpoint(s)/5s needed " +
+                             "an elevation correction (up to " +
+                             _rzSurfaceCorrectionMax.ToString("F1") + " m) because the surface under " +
+                             "them differs from the source's. The height is reproduced; a large or " +
+                             "growing figure means terrain or water is out of step.");
+                Diagnostics.FlightRecorder.Note("net surface correction ends=" + _rzSurfaceCorrections +
+                                                  " maxM=" + _rzSurfaceCorrectionMax.ToString("F1"));
+            }
+
+            if (_rzLocalSurfaceMatches > 0)
+            {
+                Mod.log.Info("[MP] NetSync: " + _rzLocalSurfaceMatches +
+                             " utility endpoint(s)/5s reused connectivity through local-surface " +
+                             "height projection instead of creating an overlapping free node.");
+                Diagnostics.FlightRecorder.Note("net utility local-surface matches=" +
+                                                  _rzLocalSurfaceMatches);
+            }
+
             _diag.Clear();
             _diagTotal = 0;
             _rzSegments = _rzSnapEnds = _rzMergeEnds = _rzMidEnds = _rzFreeEnds = 0;
+            _rzLocalSurfaceMatches = 0;
+            _rzSurfaceCorrections = 0;
+            _rzSurfaceCorrectionMax = 0f;
             _peakCreated = _peakUpdated = _peakDeleted = 0;
             _capFilteredHalves = 0;
             _diagStartMs = now;
@@ -90,6 +114,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // ToolUpdate. Every Created edge in that operation (drawn courses, split halves and
             // reductions) is output, not another placement command.
             if (_nativeApplyCapturedFrame == _realizeFrame) return;
+
+            // Object-prefab networks (asset-stamp intersections, building driveways/connectors,
+            // etc.) are already carried inside one atomic ObjectToolOperationCommand. Replaying the
+            // resulting Created edges here discarded their shared graph and rebuilt them as many
+            // independent clicks: slow for large stamps and unreliable at tightly-spaced nodes.
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if (buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) return;
 
             // On the frame a self-driven ApplyTool pass commits a remote batch, every Created edge
             // here is that batch's output - skip exactly this frame (never a wall-clock window,
@@ -146,6 +177,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     delPartial[dI] = !SplitMatch.CoverWholeSpan(pieces, delCurves[dI].m_Bezier);
             }
 
+            // Per-edge commands emitted because no native operation covered this apply. Each one is
+            // replayed as its own serialized batch with both endpoints re-derived geometrically, so
+            // the receiver rebuilds the shape segment by segment instead of in one pass. Counted so a
+            // degraded replay is visible in the flight log rather than being inferred from symptoms.
+            int stubs = 0;
             try
             {
                 for (int i = 0; i < entities.Length; i++)
@@ -186,6 +222,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     }
 
                     Curve curve = createdCurves[i];
+                    // The committed end nodes carry the elevation this span was built at. Without it
+                    // the receiver commits a ground net and the generator pulls the curve end down to
+                    // the terrain — over water that is the lakebed, and the span becomes a dive.
+                    float2 startElevation, endElevation;
+                    CommittedEndElevations(entity, out startElevation, out endElevation);
                     var command = new NetPlacementCommand
                     {
                         PrefabName = name,
@@ -194,15 +235,19 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         Cx = b.c.x, Cy = b.c.y, Cz = b.c.z,
                         Dx = b.d.x, Dy = b.d.y, Dz = b.d.z,
                         Length = curve.m_Length,
+                        Start = { ElevationLeft = startElevation.x, ElevationRight = startElevation.y },
+                        End = { ElevationLeft = endElevation.x, ElevationRight = endElevation.y },
                     };
                     if (onKeptSpan)
                     {
                         _deferredSpanPieces.Add(command);
                         RecordDiagnostic(name);
+                        stubs++;
                         continue;
                     }
                     session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
                     RecordDiagnostic(name);
+                    stubs++;
                 }
             }
             finally
@@ -214,6 +259,33 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 delCurves.Dispose();
                 delPrefabs.Dispose();
             }
+
+            if (stubs > 0)
+                Diagnostics.FlightRecorder.Note("net per-edge fallback sent=" + stubs +
+                                                  " (no native operation covered this apply)");
+        }
+
+        /// <summary>
+        /// The <see cref="global::Game.Net.Elevation"/> of a committed edge's two end nodes. A node
+        /// without the component sits on the ground and is elevation 0 - the game's own convention,
+        /// and the value a course endpoint must carry to reproduce this span.
+        /// </summary>
+        private void CommittedEndElevations(Entity edge, out float2 start, out float2 end)
+        {
+            start = default;
+            end = default;
+            if (!EntityManager.HasComponent<Edge>(edge)) return;
+            Edge ends = EntityManager.GetComponentData<Edge>(edge);
+            start = NodeElevation(ends.m_Start);
+            end = NodeElevation(ends.m_End);
+        }
+
+        private float2 NodeElevation(Entity node)
+        {
+            return node != Entity.Null && EntityManager.Exists(node) &&
+                   EntityManager.HasComponent<global::Game.Net.Elevation>(node)
+                ? EntityManager.GetComponentData<global::Game.Net.Elevation>(node).m_Elevation
+                : default;
         }
     }
 }

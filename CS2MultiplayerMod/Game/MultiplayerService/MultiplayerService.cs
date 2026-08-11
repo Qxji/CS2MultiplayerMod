@@ -20,6 +20,7 @@ namespace CS2MultiplayerMod.Game
         Connecting,
         WaitingForMap,
         LoadingMap,
+        WaitingForResume,
         InSession,
     }
 
@@ -49,7 +50,6 @@ namespace CS2MultiplayerMod.Game
         private readonly Stopwatch _clock = Stopwatch.StartNew();
         private readonly ConcurrentDictionary<int, RemotePlayer> _remotePlayers =
             new ConcurrentDictionary<int, RemotePlayer>();
-
         private ClientWorldPhase _phase = ClientWorldPhase.None;
         private long _phaseChangedMs;
         private bool _sawLoading;
@@ -83,9 +83,11 @@ namespace CS2MultiplayerMod.Game
                 ZonePaintCommand.Id, TerrainBrushCommand.Id,
                 UpgradePlacementCommand.Id, ObjectMoveCommand.Id, NetUpgradeCommand.Id,
                 AreaCreateCommand.Id, AreaUpdateCommand.Id, AreaDeleteCommand.Id,
+                OwnedAreaSnapshotCommand.Id,
                 RouteCreateCommand.Id, RouteUpdateCommand.Id, RouteDeleteCommand.Id,
                 TilePurchaseCommand.Id, EntityPolicyCommand.Id, DevTreePurchaseCommand.Id,
-                NetReplaceCommand.Id);
+                NetReplaceCommand.Id, ObjectToolOperationCommand.Id, AssetStampCommand.Id,
+                VisualCustomizationCommand.Id, ColorPaletteCommand.Id);
         }
 
         public MultiplayerSession Session => _session;
@@ -110,6 +112,7 @@ namespace CS2MultiplayerMod.Game
         public bool GameplaySyncReady =>
             ModEnabled &&
             _session.Status == SessionStatus.Connected &&
+            !_worldSyncBarrierActive &&
             (_session.Role == SessionRole.Host || _phase == ClientWorldPhase.InSession);
 
         internal string CommandDiagnosticSnapshot(long nowMs)
@@ -182,6 +185,8 @@ namespace CS2MultiplayerMod.Game
                 case TerrainBrushCommand.Id: return "terrain-brush";
                 case UpgradePlacementCommand.Id: return "building-upgrade";
                 case ObjectMoveCommand.Id: return "object-move";
+                case ObjectToolOperationCommand.Id: return "object-native-operation";
+                case AssetStampCommand.Id: return "asset-stamp";
                 case NetUpgradeCommand.Id: return "net-upgrade";
                 case AreaCreateCommand.Id: return "area-create";
                 case AreaDeleteCommand.Id: return "area-delete";
@@ -190,9 +195,12 @@ namespace CS2MultiplayerMod.Game
                 case TilePurchaseCommand.Id: return "tile-purchase";
                 case EntityPolicyCommand.Id: return "policy-edit";
                 case AreaUpdateCommand.Id: return "area-update";
+                case OwnedAreaSnapshotCommand.Id: return "owned-area-snapshot";
                 case RouteUpdateCommand.Id: return "route-update";
                 case DevTreePurchaseCommand.Id: return "dev-tree-purchase";
                 case NetReplaceCommand.Id: return "net-replace";
+                case VisualCustomizationCommand.Id: return "visual-customization";
+                case ColorPaletteCommand.Id: return "color-palette";
                 default: return "unknown";
             }
         }
@@ -208,6 +216,45 @@ namespace CS2MultiplayerMod.Game
         /// <summary>/sync: ask the host for a fresh world stream (host: refresh everyone).</summary>
         public void RequestWorldSync() => _session.RequestWorldSync();
 
+        /// <summary>
+        /// One unresolved remote edit (a missed native capture, an owned sub-element that would not
+        /// resolve) must never loop the whole tens-of-MB world through recovery. A single automatic
+        /// recovery repairs a genuine divergence; a second inside this window is a storm — it freezes
+        /// both players for the length of a save+stream and does not fix the offending edit, which
+        /// simply re-triggers after every reload (the exact 52 MB epoch-loop seen in the field). EVERY
+        /// automatic caller funnels through here so none can bypass the cap; only manual /sync and the
+        /// settings button call <see cref="RequestWorldSync"/> directly.
+        /// </summary>
+        private const long AutoRecoveryCooldownMs = 90000;
+        private long _lastAutoRecoveryMs = long.MinValue;
+
+        public void RequestAutomaticWorldRecovery(string reason)
+        {
+            if (_session == null || _session.Status != SessionStatus.Connected) return;
+            long now = NowMs;
+            bool recovering = _worldSyncBarrierActive ||
+                              _phase == ClientWorldPhase.WaitingForMap ||
+                              _phase == ClientWorldPhase.LoadingMap ||
+                              _phase == ClientWorldPhase.WaitingForResume;
+            // Guard the sentinel before subtracting it. `now - long.MinValue` wraps negative in
+            // unchecked arithmetic, which otherwise makes the first automatic recovery look as if
+            // it were inside the cooldown forever.
+            bool coolingDown = _lastAutoRecoveryMs != long.MinValue &&
+                               now - _lastAutoRecoveryMs < AutoRecoveryCooldownMs;
+            if (recovering || coolingDown)
+            {
+                _log.Warn("[MP] Suppressed automatic world recovery (" + reason +
+                          "): a recovery is already in progress or within the cooldown. The offending " +
+                          "edit is left un-synced; use /sync if the city looks out of step.");
+                Diagnostics.FlightRecorder.Note("auto recovery suppressed (cooldown/in-progress): " + reason);
+                return;
+            }
+            _lastAutoRecoveryMs = now;
+            _log.Warn("[MP] Requesting world recovery: " + reason + ".");
+            Diagnostics.FlightRecorder.Note("resync requested: " + reason);
+            _session.RequestWorldSync();
+        }
+
         // ---- Chat log (in-game hub panel) --------------------------------------
 
         /// <summary>Bounded - old lines fall off so an all-night session cannot grow the UI payload.</summary>
@@ -217,6 +264,7 @@ namespace CS2MultiplayerMod.Game
         private readonly List<ChatLogEntry> _chatLog = new List<ChatLogEntry>();
         private int _nextChatId = 1;
         private string _chatLogJson = "[]";
+        private string _playerListJson = "[]";
 
         /// <summary>
         /// The chat/event feed as a JSON array for the hub panel binding:
@@ -225,6 +273,65 @@ namespace CS2MultiplayerMod.Game
         /// the same string instance instead of re-serializing the whole log.
         /// </summary>
         public string ChatLogJson { get { lock (_chatLock) return _chatLogJson; } }
+
+        /// <summary>
+        /// Host-side participant list used by the in-game panel. It is rebuilt only
+        /// when session membership changes, avoiding a fresh JSON allocation every UI
+        /// frame. The local host is included and is never kickable.
+        /// </summary>
+        public string PlayerListJson { get { lock (_chatLock) return _playerListJson; } }
+
+        /// <summary>Remove one authenticated client selected in the host player list.</summary>
+        public void KickPlayerFromUi(int playerId)
+        {
+            if (!_session.KickPlayer(playerId))
+                _log.Warn("[MP] Ignored kick request for unavailable player #" + playerId + ".");
+        }
+
+        /// <summary>Remove a client and block its address for the current hosting session.</summary>
+        public void BanPlayerFromUi(int playerId)
+        {
+            if (!_session.BanPlayer(playerId))
+                _log.Warn("[MP] Ignored ban request for unavailable player #" + playerId + ".");
+        }
+
+        private void RefreshPlayerListJson()
+        {
+            lock (_chatLock)
+            {
+                if (_session.Role != SessionRole.Host)
+                {
+                    _playerListJson = "[]";
+                    return;
+                }
+
+                var peers = new List<Peer>();
+                foreach (Peer peer in _session.Peers)
+                    if (peer.Handshaked) peers.Add(peer);
+                peers.Sort((a, b) => a.PlayerId.CompareTo(b.PlayerId));
+
+                var sb = new System.Text.StringBuilder((peers.Count + 1) * 56 + 2);
+                sb.Append("[{\"id\":").Append(_session.LocalPlayerId).Append(",\"name\":");
+                AppendJsonString(sb, _session.LocalPlayerName);
+                sb.Append(",\"isHost\":true}]");
+
+                if (peers.Count > 0)
+                {
+                    // Replace the closing bracket while appending keeps this a single,
+                    // small allocation and reuses the chat JSON escaping rules.
+                    sb.Length--;
+                    for (int i = 0; i < peers.Count; i++)
+                    {
+                        Peer peer = peers[i];
+                        sb.Append(",{\"id\":").Append(peer.PlayerId).Append(",\"name\":");
+                        AppendJsonString(sb, peer.Name);
+                        sb.Append(",\"isHost\":false}");
+                    }
+                    sb.Append(']');
+                }
+                _playerListJson = sb.ToString();
+            }
+        }
 
 
 
@@ -311,7 +418,19 @@ namespace CS2MultiplayerMod.Game
                 }
                 else if (status == SessionStatus.Offline || status == SessionStatus.Faulted)
                 {
+                    // Core teardown deliberately knows nothing about game worlds. If this
+                    // client had already installed the host's temporary city, hand the game
+                    // layer a deferred exit request before clearing the client phase.
+                    if (_service._clientHostWorldActive)
+                    {
+                        string reason = !string.IsNullOrWhiteSpace(detail) && detail != "Stopped"
+                            ? detail
+                            : "The connection to the host closed.";
+                        _service.QueueClientMainMenu(reason);
+                    }
+
                     if (status == SessionStatus.Faulted) _service._lastFault = detail;
+                    _service.ResetWorldSyncState(restoreSpeed: true);
                     _service.SetPhase(ClientWorldPhase.None);
                     _service._remotePlayers.Clear();
                 }
@@ -349,6 +468,7 @@ namespace CS2MultiplayerMod.Game
                 }
                 else if (status == SessionStatus.Faulted)
                     _service.AppendChatEntry(null, string.IsNullOrEmpty(detail) ? "Connection failed." : detail);
+                _service.RefreshPlayerListJson();
                 _lastStatus = status;
             }
 
@@ -358,6 +478,7 @@ namespace CS2MultiplayerMod.Game
             {
                 _log.Info("[MP] Peer joined: " + peer);
                 Diagnostics.FlightRecorder.Note("peer joined #" + peer.PlayerId);
+                _service.RefreshPlayerListJson();
                 // WorldResyncSystem observes joins too and pushes the live world to the newcomer.
             }
             public override void OnPeerLeft(Peer peer, string reason)
@@ -366,18 +487,26 @@ namespace CS2MultiplayerMod.Game
                 Diagnostics.FlightRecorder.Note("peer left #" + peer.PlayerId + " (" + reason + ")");
                 RemotePlayer removed;
                 _service._remotePlayers.TryRemove(peer.PlayerId, out removed);
+                _service.RefreshPlayerListJson();
             }
             public override void OnChatReceived(string sender, string text)
             {
                 _log.Info("[MP] " + (sender ?? "system") + ": " + text);
                 _service.AppendChatEntry(sender, text);
             }
-            public override void OnCommandReceived(SimulationCommandMessage command) =>
-                _service.RecordAppliedCommand(command);
-            public override void OnPlayerStateReceived(PlayerStateMessage state) => _service.RecordRemotePlayer(state);
-            public override void OnBlobReceived(string channel, byte[] data)
+            public override void OnCommandReceived(SimulationCommandMessage command)
             {
-                if (channel == MapChannel) _service.LoadReceivedMap(data);
+                _service.RecordAppliedCommand(command);
+            }
+            public override void OnPlayerStateReceived(PlayerStateMessage state) => _service.RecordRemotePlayer(state);
+            public override void OnBlobReceived(string channel, long transferId, byte[] data)
+            {
+                if (channel == MapChannel) _service.LoadReceivedMap(transferId, data);
+            }
+            public override void OnWorldSyncControl(WorldSyncStage stage, long epoch,
+                float resumeSpeed, Core.Networking.ConnectionId connection)
+            {
+                _service.HandleWorldSyncControl(stage, epoch, resumeSpeed);
             }
             public override void OnError(string message)
             {

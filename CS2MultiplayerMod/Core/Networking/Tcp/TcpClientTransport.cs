@@ -96,7 +96,10 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
                     _log.Info("Join canceled while connecting to " + host + ":" + port + ".");
                     return;
                 }
-                Enqueue(TransportEvent.Disconnected(ConnectionId.Server, "connect failed: " + ex.Message));
+                var socketEx = ex as SocketException;
+                string errorCode = socketEx != null ? " [" + socketEx.SocketErrorCode + "]" : "";
+                Enqueue(TransportEvent.Disconnected(ConnectionId.Server,
+                    "connect failed" + errorCode + ": " + ex.Message));
                 _log.Warn("Connect to " + host + ":" + port + " failed after " + elapsed.ElapsedMilliseconds +
                           " ms: " + ex.Message + DescribeConnectFailure(ex));
                 return;
@@ -254,6 +257,25 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
 
             var connection = _connection;
             if (connection != null) connection.Close("client shutting down");
+            _connection = null;
+
+            _log.Info("Client stopped.");
+        }
+
+        public void ShutdownAfterFlush(int timeoutMs)
+        {
+            var connection = _connection;
+            if (connection == null) { Shutdown(); return; }
+
+            _active = false;
+            connection.CloseAfterFlush("client left the session");
+
+            // The connection's OnClosed runs once the send thread has drained and hung up.
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (connection.PendingSendBytes > 0 && deadline.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(5);
+
+            connection.Close("client shutting down");
             _connection = null;
 
             _log.Info("Client stopped.");

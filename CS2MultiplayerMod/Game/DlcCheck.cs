@@ -34,8 +34,9 @@ namespace CS2MultiplayerMod.Game
         /// <summary>
         /// The owned, sync-relevant DLC names: canonical (prefix stripped), sorted
         /// ordinally so host and client produce byte-identical lists for equal content.
-        /// Returns an empty array when enumeration fails - the handshake treats that
-        /// as "unknown" and skips the check rather than blocking the player.
+        /// Returns an empty array when enumeration fails. The handshake compares that
+        /// as a real empty set, so a peer reporting any DLC is rejected rather than
+        /// being admitted with an unverified prefab catalogue.
         /// </summary>
         public static string[] OwnedSyncRelevantDlcs(IModLogger log)
         {
@@ -59,7 +60,7 @@ namespace CS2MultiplayerMod.Game
             catch (Exception ex)
             {
                 log.Warn("[MP] Could not enumerate DLCs (" + ex.Message + "); " +
-                         "the join handshake will skip the DLC compatibility check.");
+                         "reporting no DLCs, so peers reporting DLC content will be rejected.");
                 return Array.Empty<string>();
             }
         }

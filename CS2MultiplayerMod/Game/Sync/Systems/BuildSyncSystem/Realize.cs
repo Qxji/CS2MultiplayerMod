@@ -2,6 +2,7 @@ using System.Text;
 using Colossal.Mathematics;
 using Game.Common;
 using Game.Prefabs;
+using Game.Simulation;
 using Game.Tools;
 using Unity.Collections;
 using Unity.Entities;
@@ -47,7 +48,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void RealizeIncoming(MultiplayerSession session, long now)
         {
-            if (_incoming.IsEmpty && _attachRetry.Count == 0) return;
+            if (_incoming.IsEmpty && _attachRetry.Count == 0 && !_hasBlockedNativeObject) return;
+
+            PruneNativeObjectOperations(now);
+            if (_nativeNetCoordinator.IsCommitBusy) return;
+            if (!TryRealizeBlockedNativeObject(now)) return;
 
             _rzFrameSpawned = 0;
             _rzFrameDuplicates = 0;
@@ -89,15 +94,50 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 // Our own placement coming back to us — already built locally.
                 if (message.OriginPlayerId == session.LocalPlayerId) continue;
 
+                if (message.CommandId == ObjectToolOperationCommand.Id ||
+                    message.CommandId == AssetStampCommand.Id)
+                {
+                    Diagnostics.FlightRecorder.Note("object command received origin=" +
+                                                      message.OriginPlayerId);
+                    NativeObjectResult result = TryRealizeRemoteObjectMessage(message, now);
+                    if (result == NativeObjectResult.Retry)
+                    {
+                        BlockNativeObject(message, now);
+                        break;
+                    }
+                    if (result == NativeObjectResult.Armed) break;
+                    continue;
+                }
+
                 ObjectPlacementCommand command;
                 try { command = ObjectPlacementCommand.Decode(message.Body); }
                 catch (System.Exception ex) { Mod.log.Warn("[MP] BuildSync: dropping malformed command: " + ex.Message); continue; }
 
                 Entity prefab;
-                if (!_prefabIndex.TryResolve(command.PrefabName, out prefab))
+                if (!_prefabIndex.TryResolve(command.PrefabName,
+                        candidate => EntityManager.HasComponent<ObjectData>(candidate),
+                        out prefab))
                 {
                     Mod.log.Warn("[MP] BuildSync realize: unknown prefab '" + command.PrefabName +
                                  "' from player " + message.OriginPlayerId + "; skipping.");
+                    continue;
+                }
+
+                // A standalone definition cannot establish the ownership links required by
+                // movers, and zone growables are created by the zoning simulation rather than
+                // a player placement. Refuse both before any game definition is allocated.
+                if (IsSimulationOnlyPlacementPrefab(prefab))
+                {
+                    RecordRefused(command.PrefabName);
+                    continue;
+                }
+                if (RequiresCompleteObjectLifecycle(prefab))
+                {
+                    // A reduced command can't represent a building's owned graph; the native
+                    // object-tool path owns those. Drop this stray reduced command rather than
+                    // freeze the world for it.
+                    Mod.log.Warn("[MP] BuildSync realize: reduced placement for spatial object '" +
+                                 command.PrefabName + "' was dropped (handled by the native path).");
                     continue;
                 }
 
@@ -107,11 +147,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 {
                     if (_attachRetry.Count >= MaxPendingAttachments)
                     {
-                        // A peer cannot be allowed to grow this without bound; the oldest waiter
-                        // has had the most time to find its node, so it is the one to force through.
-                        var oldest = _attachRetry[0];
-                        _attachRetry.RemoveAt(0);
-                        RealizeCommand(oldest.command, oldest.prefab, oldest.originPlayerId, now);
+                        _attachRetry.Clear();
+                        Mod.log.Warn("[MP] BuildSync: attachment retry queue overflowed; dropping the " +
+                                     "backlog of unattached net objects rather than freezing the world.");
+                        Diagnostics.FlightRecorder.Note("attachment retry queue overflow dropped");
+                        return;
                     }
                     _attachRetry.Add((command, prefab, message.OriginPlayerId, now + AttachRetryWindowMs));
                     continue;
@@ -136,11 +176,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 }
                 else if (now >= pending.deadline)
                 {
+                    // The parent road never reached us. Drop the net object (it would only strand as
+                    // an inert prop anyway) instead of looping the world through recovery.
                     _attachRetry.RemoveAt(i);
                     Mod.log.Warn("[MP] BuildSync realize: no local road for '" + pending.command.PrefabName +
-                                 "' after " + (AttachRetryWindowMs / 1000) + " s; placing it unattached " +
-                                 "(it will have no effect on the road).");
-                    RealizeCommand(pending.command, pending.prefab, pending.originPlayerId, now);
+                                 "' after " + (AttachRetryWindowMs / 1000) +
+                                 " s; dropping this attachment (use /sync if the city drifts).");
+                    Diagnostics.FlightRecorder.Note("attachment target dropped after retry window");
                 }
             }
         }
@@ -148,7 +190,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private void RealizeCommand(ObjectPlacementCommand command, Entity prefab, int originPlayerId, long now)
         {
             var position = new float3(command.PosX, command.PosY, command.PosZ);
-            var rotation = new quaternion(command.RotX, command.RotY, command.RotZ, command.RotW);
+            var rotation = new quaternion(math.normalizesafe(
+                new float4(command.RotX, command.RotY, command.RotZ, command.RotW),
+                new float4(0f, 0f, 0f, 1f)));
 
             // The same placement arriving twice (a replayed message, a lagged echo) would stack a
             // second building exactly inside the first — geometry the sender's own validation can
@@ -242,8 +286,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// <summary>The local net entity this command's object hangs off, or Null (also when unattached).</summary>
         private Entity FindAttachTarget(ObjectPlacementCommand command)
         {
-            var anchor = new float3(command.AttachX, command.AttachY, command.AttachZ);
-            switch (command.AttachKind)
+            return ResolveNetAttachment(command.AttachKind,
+                new float3(command.AttachX, command.AttachY, command.AttachZ));
+        }
+
+        /// <summary>
+        /// Resolve a portable node/edge anchor for placement and relocation commands. Keeping one
+        /// resolver ensures both paths make the same choice when roads are subdivided differently.
+        /// </summary>
+        internal Entity ResolveNetAttachment(ObjectAttachKind kind, float3 anchor)
+        {
+            switch (kind)
             {
                 case ObjectAttachKind.NetNode: return FindAttachNode(anchor);
                 case ObjectAttachKind.NetEdge: return FindAttachEdge(anchor);
@@ -390,15 +443,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (attachParent != Entity.Null) NetAttachment.TagParentUpdated(EntityManager, attachParent);
         }
 
+        /// <summary>
+        /// Emit a prefab's owned lot areas and connection nets.
+        ///
+        /// <paramref name="lotOwner"/> is the building whose lot surface the connection nets are laid
+        /// on, or <see cref="Entity.Null"/> to lay them on the terrain. The tools pass the host
+        /// building here for a service upgrade (the extension's paths belong on the host's lot) and
+        /// nothing for a plain placement.
+        /// </summary>
         internal void RealizeOwnedSubElements(Entity prefab, OwnerDefinition owner,
-            ref Unity.Mathematics.Random random)
+            ref Unity.Mathematics.Random random, Entity lotOwner = default(Entity))
         {
             RealizeSubAreas(prefab, owner, Entity.Null, ref random);
-            RealizeSubNets(prefab, owner, Entity.Null, ref random);
+            RealizeSubNets(prefab, owner, Entity.Null, lotOwner, ref random);
         }
 
         internal void RealizeOwnedSubElements(Entity prefab, Entity ownerEntity,
-            global::Game.Objects.Transform ownerTransform, ref Unity.Mathematics.Random random)
+            global::Game.Objects.Transform ownerTransform, ref Unity.Mathematics.Random random,
+            Entity lotOwner = default(Entity))
         {
             PrefabRef ownerPrefab = EntityManager.GetComponentData<PrefabRef>(ownerEntity);
             var owner = new OwnerDefinition
@@ -408,7 +470,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 m_Rotation = ownerTransform.m_Rotation,
             };
             RealizeSubAreas(prefab, owner, ownerEntity, ref random);
-            RealizeSubNets(prefab, owner, ownerEntity, ref random);
+            RealizeSubNets(prefab, owner, ownerEntity, lotOwner, ref random);
         }
 
         /// <summary>
@@ -522,11 +584,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         /// node indices, mirrored for left-hand traffic and transformed local to world.
         /// </summary>
         private void RealizeSubNets(Entity prefab, OwnerDefinition owner, Entity ownerEntity,
-            ref Unity.Mathematics.Random random)
+            Entity lotOwner, ref Unity.Mathematics.Random random)
         {
             if (!EntityManager.HasBuffer<SubNet>(prefab)) return;
             DynamicBuffer<SubNet> subNets = EntityManager.GetBuffer<SubNet>(prefab, isReadOnly: true);
             if (subNets.Length == 0) return;
+
+            // Height fields for the per-course snapping below. GetHeightData(waitForPending) is how
+            // the terrain path already reads a settled surface; the water dependency is completed
+            // before the data is touched.
+            TerrainHeightData heightData = _terrainSystem.GetHeightData(waitForPending: true);
+            Unity.Jobs.JobHandle waterDeps;
+            WaterSurfaceData<SurfaceWater> waterData = _waterSystem.GetSurfaceData(out waterDeps);
+            waterDeps.Complete();
+            global::Game.Buildings.BuildingUtils.LotInfo lotInfo;
+            bool hasLot = TryGetOwnerLot(lotOwner, out lotInfo);
 
             // Average the curve endpoints that share a node index, so sub-nets meeting at a node agree
             // on one position (.w counts contributors; divide to get the mean).
@@ -567,7 +639,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     }
                     RealizeSubNetCourse(subNet.m_Prefab, subNet.m_Curve, subNet.m_NodeIndex,
                         subNet.m_ParentMesh, subNet.m_Upgrades, nodePositions, owner, ownerEntity,
-                        ref random);
+                        ref heightData, ref waterData, ref lotInfo, hasLot, ref random);
                 }
             }
             finally
@@ -576,9 +648,72 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             }
         }
 
+        /// <summary>
+        /// Reproduce the lot info the game derives for the building a set of connection nets is laid
+        /// on. Requires a <see cref="global::Game.Buildings.Lot"/>; without one the caller falls back
+        /// to terrain snapping, exactly as the tools do.
+        /// </summary>
+        private bool TryGetOwnerLot(Entity lotOwner,
+            out global::Game.Buildings.BuildingUtils.LotInfo lotInfo)
+        {
+            lotInfo = default(global::Game.Buildings.BuildingUtils.LotInfo);
+            if (lotOwner == Entity.Null || !EntityManager.Exists(lotOwner) ||
+                !EntityManager.HasComponent<global::Game.Buildings.Lot>(lotOwner) ||
+                !EntityManager.HasComponent<global::Game.Objects.Transform>(lotOwner) ||
+                !EntityManager.HasComponent<PrefabRef>(lotOwner)) return false;
+
+            Entity ownerPrefab = EntityManager.GetComponentData<PrefabRef>(lotOwner).m_Prefab;
+            if (!EntityManager.HasComponent<BuildingData>(ownerPrefab)) return false;
+
+            _transformLookup.Update(this);
+            _prefabRefLookup.Update(this);
+            _objectGeometryLookup.Update(this);
+            _buildingTerraformLookup.Update(this);
+            _buildingExtensionLookup.Update(this);
+
+            global::Game.Objects.Elevation elevation = default(global::Game.Objects.Elevation);
+            if (EntityManager.HasComponent<global::Game.Objects.Elevation>(lotOwner))
+                elevation = EntityManager.GetComponentData<global::Game.Objects.Elevation>(lotOwner);
+            DynamicBuffer<global::Game.Buildings.InstalledUpgrade> upgrades =
+                EntityManager.HasBuffer<global::Game.Buildings.InstalledUpgrade>(lotOwner)
+                    ? EntityManager.GetBuffer<global::Game.Buildings.InstalledUpgrade>(
+                        lotOwner, isReadOnly: true)
+                    : default(DynamicBuffer<global::Game.Buildings.InstalledUpgrade>);
+
+            bool hasExtensionLots;
+            lotInfo = global::Game.Buildings.BuildingUtils.CalculateLotInfo(
+                new float2(EntityManager.GetComponentData<BuildingData>(ownerPrefab).m_LotSize) * 4f,
+                EntityManager.GetComponentData<global::Game.Objects.Transform>(lotOwner),
+                elevation,
+                EntityManager.GetComponentData<global::Game.Buildings.Lot>(lotOwner),
+                EntityManager.GetComponentData<PrefabRef>(lotOwner),
+                upgrades, _transformLookup, _prefabRefLookup, _objectGeometryLookup,
+                _buildingTerraformLookup, _buildingExtensionLookup, defaultNoSmooth: false,
+                out hasExtensionLots);
+            return true;
+        }
+
+        /// <summary>
+        /// The world position of a node index several sub-nets share. A water net takes its height
+        /// from the water surface rather than from the averaged prefab-local position.
+        /// </summary>
+        private static float3 SharedSubNetNodePosition(float3 localPosition, OwnerDefinition owner,
+            NetGeometryData netGeometry, ref TerrainHeightData heightData,
+            ref WaterSurfaceData<SurfaceWater> waterData)
+        {
+            float3 world = global::Game.Objects.ObjectUtils.LocalToWorld(
+                owner.m_Position, owner.m_Rotation, localPosition);
+            if ((netGeometry.m_Flags & global::Game.Net.GeometryFlags.OnWater) == 0) return world;
+            world.y = global::Game.Simulation.WaterUtils.SampleHeight(ref waterData, ref heightData, world);
+            return world;
+        }
+
         private void RealizeSubNetCourse(Entity netPrefab, Bezier4x3 curve, int2 nodeIndex, int2 parentMesh,
             CompositionFlags upgrades, NativeList<float4> nodePositions, OwnerDefinition owner,
-            Entity ownerEntity, ref Unity.Mathematics.Random random)
+            Entity ownerEntity, ref TerrainHeightData heightData,
+            ref WaterSurfaceData<SurfaceWater> waterData,
+            ref global::Game.Buildings.BuildingUtils.LotInfo lotInfo, bool hasLot,
+            ref Unity.Mathematics.Random random)
         {
             Entity netDef = EntityManager.CreateEntity();
             EntityManager.AddComponentData(netDef, new CreationDefinition
@@ -593,7 +728,60 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             if (ownerEntity == Entity.Null) EntityManager.AddComponentData(netDef, owner);
 
             var course = default(NetCourse);
-            course.m_Curve = global::Game.Objects.ObjectUtils.LocalToWorld(owner.m_Position, owner.m_Rotation, curve);
+            // Height handling, matching the game's own sub-net course construction. A course whose
+            // BOTH ends are mesh-relative keeps its prefab-local height; otherwise the free end(s)
+            // are snapped - to water, to the host building's lot surface, or to the terrain - and the
+            // prefab-local height is then re-applied as an offset. Laying these at raw
+            // LocalToWorld height instead is why a building's paths met the street at the wrong
+            // height and read as unconnected.
+            _netGeometryLookup.Update(this);
+            NetGeometryData netGeometry = _netGeometryLookup.HasComponent(netPrefab)
+                ? _netGeometryLookup[netPrefab]
+                : default(NetGeometryData);
+            bool bothEndsOnMesh = parentMesh.x >= 0 && parentMesh.y >= 0;
+            var worldCurve = new global::Game.Net.Curve
+            {
+                m_Bezier = global::Game.Objects.ObjectUtils.LocalToWorld(
+                    owner.m_Position, owner.m_Rotation, curve),
+            };
+            if ((netGeometry.m_Flags & global::Game.Net.GeometryFlags.OnWater) != 0)
+            {
+                curve.y = default(Bezier4x1);
+                worldCurve.m_Bezier = global::Game.Objects.ObjectUtils.LocalToWorld(
+                    owner.m_Position, owner.m_Rotation, curve);
+                course.m_Curve = global::Game.Net.NetUtils.AdjustPosition(worldCurve,
+                    fixedStart: false, linearMiddle: false, fixedEnd: false,
+                    ref heightData, ref waterData).m_Bezier;
+            }
+            else if (!bothEndsOnMesh)
+            {
+                bool fixedStart = parentMesh.x >= 0;
+                bool fixedEnd = parentMesh.y >= 0;
+                bool linearMiddle = fixedStart || fixedEnd;
+                if ((netGeometry.m_Flags & global::Game.Net.GeometryFlags.FlattenTerrain) != 0)
+                {
+                    if (hasLot)
+                    {
+                        course.m_Curve = global::Game.Net.NetUtils.AdjustPosition(worldCurve,
+                            fixedStart, linearMiddle, fixedEnd, ref lotInfo).m_Bezier;
+                        course.m_Curve.a.y += curve.a.y;
+                        course.m_Curve.b.y += curve.b.y;
+                        course.m_Curve.c.y += curve.c.y;
+                        course.m_Curve.d.y += curve.d.y;
+                    }
+                    else course.m_Curve = worldCurve.m_Bezier;
+                }
+                else
+                {
+                    course.m_Curve = global::Game.Net.NetUtils.AdjustPosition(worldCurve,
+                        fixedStart, linearMiddle, fixedEnd, ref heightData).m_Bezier;
+                    course.m_Curve.a.y += curve.a.y;
+                    course.m_Curve.b.y += curve.b.y;
+                    course.m_Curve.c.y += curve.c.y;
+                    course.m_Curve.d.y += curve.d.y;
+                }
+            }
+            else course.m_Curve = worldCurve.m_Bezier;
 
             course.m_StartPosition.m_Position = course.m_Curve.a;
             course.m_StartPosition.m_Rotation = global::Game.Net.NetUtils.GetNodeRotation(MathUtils.StartTangent(course.m_Curve), owner.m_Rotation);
@@ -601,7 +789,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             course.m_StartPosition.m_Elevation = curve.a.y;
             course.m_StartPosition.m_ParentMesh = parentMesh.x;
             if (nodeIndex.x >= 0)
-                course.m_StartPosition.m_Position = global::Game.Objects.ObjectUtils.LocalToWorld(owner.m_Position, owner.m_Rotation, nodePositions[nodeIndex.x].xyz);
+                course.m_StartPosition.m_Position = SharedSubNetNodePosition(
+                    nodePositions[nodeIndex.x].xyz, owner, netGeometry,
+                    ref heightData, ref waterData);
 
             course.m_EndPosition.m_Position = course.m_Curve.d;
             course.m_EndPosition.m_Rotation = global::Game.Net.NetUtils.GetNodeRotation(MathUtils.EndTangent(course.m_Curve), owner.m_Rotation);
@@ -609,7 +799,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             course.m_EndPosition.m_Elevation = curve.d.y;
             course.m_EndPosition.m_ParentMesh = parentMesh.y;
             if (nodeIndex.y >= 0)
-                course.m_EndPosition.m_Position = global::Game.Objects.ObjectUtils.LocalToWorld(owner.m_Position, owner.m_Rotation, nodePositions[nodeIndex.y].xyz);
+                course.m_EndPosition.m_Position = SharedSubNetNodePosition(
+                    nodePositions[nodeIndex.y].xyz, owner, netGeometry,
+                    ref heightData, ref waterData);
 
             course.m_Length = MathUtils.Length(course.m_Curve);
             course.m_FixedIndex = -1;

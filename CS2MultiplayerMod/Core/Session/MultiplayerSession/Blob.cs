@@ -12,15 +12,25 @@ namespace CS2MultiplayerMod.Core.Session
         /// Send a large named byte stream to all peers, split into chunks. Used by map
         /// sync to ship the host's savegame so both players start on the same city.
         /// </summary>
-        public void SendBlob(string channel, byte[] data) => ChunkAndSend(channel, data, ConnectionId.None);
+        public void SendBlob(string channel, byte[] data) =>
+            ChunkAndSend(channel, 0, data, ConnectionId.None);
+
+        /// <summary>Send an epoch-tagged blob to every current peer.</summary>
+        public void SendBlob(string channel, long transferId, byte[] data) =>
+            ChunkAndSend(channel, transferId, data, ConnectionId.None);
 
         /// <summary>
         /// Send a blob to a single peer - auto-ships map to just-joined client
         /// without re-sending to everyone already in the session.
         /// </summary>
-        public void SendBlobTo(ConnectionId target, string channel, byte[] data) => ChunkAndSend(channel, data, target);
+        public void SendBlobTo(ConnectionId target, string channel, byte[] data) =>
+            ChunkAndSend(channel, 0, data, target);
 
-        private void ChunkAndSend(string channel, byte[] data, ConnectionId target)
+        /// <summary>Send an epoch-tagged blob to one peer.</summary>
+        public void SendBlobTo(ConnectionId target, string channel, long transferId, byte[] data) =>
+            ChunkAndSend(channel, transferId, data, target);
+
+        private void ChunkAndSend(string channel, long transferId, byte[] data, ConnectionId target)
         {
             if (_transport == null || Status != SessionStatus.Connected || data == null) return;
 
@@ -28,6 +38,13 @@ namespace CS2MultiplayerMod.Core.Session
             if (Role != SessionRole.Host)
             {
                 _log.Warn("Ignoring outgoing blob '" + channel + "': only the host streams blobs.");
+                return;
+            }
+            if ((transferId > 0 && (!_worldSyncSuspended || transferId != _worldSyncEpoch)) ||
+                (_worldSyncSuspended && transferId == 0))
+            {
+                _log.Warn("Ignoring outgoing blob '" + channel + "' transfer " + transferId +
+                          ": it does not match the active world-sync epoch.");
                 return;
             }
 
@@ -48,7 +65,7 @@ namespace CS2MultiplayerMod.Core.Session
                 offset += size;
                 bool last = offset >= total;
 
-                var message = new BlobChunkMessage(channel, total, last, chunk);
+                var message = new BlobChunkMessage(channel, transferId, total, last, chunk);
                 if (!target.IsNone)
                     SendTo(target, message);
                 else
@@ -77,6 +94,15 @@ namespace CS2MultiplayerMod.Core.Session
                 Punt(from, peer, "client attempted to stream a blob", "BlobChunk");
                 return;
             }
+            if (chunk.TransferId < 0 ||
+                (_worldSyncSuspended && chunk.TransferId != _worldSyncEpoch) ||
+                (!_worldSyncSuspended && chunk.TransferId != 0))
+            {
+                _log.Warn("Dropping blob '" + (chunk.Channel ?? "<null>") + "' transfer " +
+                          chunk.TransferId + ": it does not match active world-sync epoch " +
+                          (_worldSyncSuspended ? _worldSyncEpoch.ToString() : "none") + ".");
+                return;
+            }
 
             // Only channels the game layer registered are expected — and each carries
             // its own size ceiling (a savegame cap is far below the 512 MiB of old).
@@ -94,11 +120,23 @@ namespace CS2MultiplayerMod.Core.Session
                 _log.Warn("[security] Dropping blob '" + chunk.Channel + "': announced " +
                           chunk.TotalBytes + " bytes is outside (0, " + maxBytes + "].");
                 _blobs.Remove(chunk.Channel);
+                _blobTransferIds.Remove(chunk.Channel);
                 ClearBlobProgress();
                 return;
             }
 
             BlobReassembler reassembler;
+            long activeTransferId;
+            if (_blobs.TryGetValue(chunk.Channel, out reassembler) &&
+                (!_blobTransferIds.TryGetValue(chunk.Channel, out activeTransferId) ||
+                 activeTransferId != chunk.TransferId))
+            {
+                _log.Warn("Replacing incomplete blob '" + chunk.Channel + "' transfer " +
+                          activeTransferId + " with transfer " + chunk.TransferId + ".");
+                _blobs.Remove(chunk.Channel);
+                _blobTransferIds.Remove(chunk.Channel);
+                reassembler = null;
+            }
             if (!_blobs.TryGetValue(chunk.Channel, out reassembler))
             {
                 if (_blobs.Count >= MaxActiveBlobs)
@@ -108,7 +146,9 @@ namespace CS2MultiplayerMod.Core.Session
                 }
                 reassembler = new BlobReassembler(chunk.TotalBytes, nowUnixMs);
                 _blobs[chunk.Channel] = reassembler;
-                _log.Info("Receiving blob '" + chunk.Channel + "': expecting " + chunk.TotalBytes + " bytes.");
+                _blobTransferIds[chunk.Channel] = chunk.TransferId;
+                _log.Info("Receiving blob '" + chunk.Channel + "' transfer " + chunk.TransferId +
+                          ": expecting " + chunk.TotalBytes + " bytes.");
             }
 
             try
@@ -116,6 +156,7 @@ namespace CS2MultiplayerMod.Core.Session
                 reassembler.Append(chunk.TotalBytes, chunk.Data, nowUnixMs);
 
                 IncomingBlobChannel = chunk.Channel;
+                IncomingBlobTransferId = chunk.TransferId;
                 IncomingBlobReceived = reassembler.ReceivedBytes;
                 IncomingBlobTotal = reassembler.ExpectedBytes;
 
@@ -125,13 +166,15 @@ namespace CS2MultiplayerMod.Core.Session
                 // overlong transfer never reaches the game layer.
                 byte[] data = reassembler.Complete();
                 _blobs.Remove(chunk.Channel);
+                _blobTransferIds.Remove(chunk.Channel);
                 ClearBlobProgress();
-                NotifyBlob(chunk.Channel, data);
+                NotifyBlob(chunk.Channel, chunk.TransferId, data);
             }
             catch (ProtocolException ex)
             {
                 _log.Warn("[security] Dropping blob '" + chunk.Channel + "': " + ex.Message);
                 _blobs.Remove(chunk.Channel);
+                _blobTransferIds.Remove(chunk.Channel);
                 ClearBlobProgress();
             }
         }
@@ -153,6 +196,7 @@ namespace CS2MultiplayerMod.Core.Session
                 _log.Warn("Abandoning stalled blob '" + channel + "' (no chunk for " +
                           (BlobStallTimeoutMs / 1000) + " s).");
                 _blobs.Remove(channel);
+                _blobTransferIds.Remove(channel);
             }
             ClearBlobProgress();
         }
@@ -160,6 +204,7 @@ namespace CS2MultiplayerMod.Core.Session
         private void ClearBlobProgress()
         {
             IncomingBlobChannel = null;
+            IncomingBlobTransferId = 0;
             IncomingBlobReceived = 0;
             IncomingBlobTotal = 0;
         }

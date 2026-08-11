@@ -1,11 +1,18 @@
 import { bindValue, trigger, useValue } from "cs2/api";
-import { InputActionBarrier } from "cs2/input";
+import { AutoNavigationScope, InputActionBarrier, NavigationDirection } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
 import { Button, Portal, Tooltip } from "cs2/ui";
+import {
+    CONNECTION_DIRECT,
+    CONNECTION_LOC,
+    CONNECTION_RELAY,
+    ConnectionSegmented,
+    JoinCodeDisplay,
+} from "mods/connection-picker";
 import { CSSProperties, MouseEvent as ReactMouseEvent, useEffect, useMemo, useRef, useState } from "react";
-import { TransferProgress } from "mods/join-game";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
+import { TransferProgress } from "mods/transfer-progress";
 import { VersionWarningBanner } from "mods/version-banner";
 
 // Binding group shared with MultiplayerUISystem (same group as the join dialog).
@@ -21,12 +28,42 @@ const LOC = {
     noMessages: "CS2MP.UI.NoMessages",
     hostSession: "CS2MP.UI.HostSession",
     lanOnly: "CS2MP.UI.LanOnly",
+    ...CONNECTION_LOC,
     maxPlayers: "CS2MP.UI.MaxPlayers",
     resyncMinutes: "CS2MP.UI.ResyncMinutes",
     syncWorld: "CS2MP.UI.SyncWorld",
+    saveCopy: "CS2MP.UI.SaveCopy",
+    saveCopyTitle: "CS2MP.UI.SaveCopyTitle",
+    saveCopyBody: "CS2MP.UI.SaveCopyBody",
+    worldName: "CS2MP.UI.WorldName",
+    saveToPC: "CS2MP.UI.SaveToPC",
+    savingCopy: "CS2MP.UI.SavingCopy",
+    saveCopySuccess: "CS2MP.UI.SaveCopySuccess",
+    saveCopyExists: "CS2MP.UI.SaveCopyExists",
+    saveCopyInvalid: "CS2MP.UI.SaveCopyInvalid",
+    saveCopyUnavailable: "CS2MP.UI.SaveCopyUnavailable",
+    saveCopyFailed: "CS2MP.UI.SaveCopyFailed",
+    multiplayerWorld: "CS2MP.UI.MultiplayerWorld",
+    suggestedCopyName: "CS2MP.UI.SuggestedCopyName",
+    cancel: "CS2MP.UI.Cancel",
+    close: "CS2MP.UI.Close",
     sendingWorld: "CS2MP.UI.SendingWorld",
     lockedInSession: "CS2MP.UI.LockedInSession",
     players: "CS2MP.UI.Players",
+    host: "CS2MP.UI.Host",
+    you: "CS2MP.UI.You",
+    kick: "CS2MP.UI.Kick",
+    confirmKick: "CS2MP.UI.ConfirmKick",
+    ban: "CS2MP.UI.Ban",
+    confirmBan: "CS2MP.UI.ConfirmBan",
+    banHint: "CS2MP.UI.BanHint",
+    cancelKick: "CS2MP.UI.CancelKick",
+    tryThis: "CS2MP.UI.TryThis",
+    requireApproval: "CS2MP.UI.RequireApproval",
+    joinRequestTitle: "CS2MP.UI.JoinRequestTitle",
+    joinRequestBody: "CS2MP.UI.JoinRequestBody",
+    accept: "CS2MP.UI.Accept",
+    decline: "CS2MP.UI.Decline",
     playerName: "CS2MP.UI.PlayerName",
     port: "CS2MP.UI.Port",
     password: "CS2MP.UI.Password",
@@ -54,20 +91,43 @@ const playerCount$ = bindValue<number>(GROUP, "playerCount", 0);
 const statusKind$ = bindValue<string>(GROUP, "statusKind", "offline");
 const statusTitle$ = bindValue<string>(GROUP, "statusTitle", "Offline");
 const statusDetail$ = bindValue<string>(GROUP, "statusDetail", "");
+const statusHelp$ = bindValue<string>(GROUP, "statusHelp", "");
+const progressMode$ = bindValue<string>(GROUP, "progressMode", "none");
 const mapTransferPercent$ = bindValue<number>(GROUP, "mapTransferPercent", -1);
 const worldSendPercent$ = bindValue<number>(GROUP, "worldSendPercent", -1);
 const playerName$ = bindValue<string>(GROUP, "playerName", "Player");
+const hostConnection$ = bindValue<string>(GROUP, "hostConnection", "relay");
+const sessionUsesRelay$ = bindValue<boolean>(GROUP, "sessionUsesRelay", false);
+const joinCode$ = bindValue<string>(GROUP, "joinCode", "");
 const hostPort$ = bindValue<string>(GROUP, "hostPort", "25001");
 const hostPassword$ = bindValue<string>(GROUP, "hostPassword", "");
 const maxPlayers$ = bindValue<string>(GROUP, "maxPlayers", "8");
 const lanOnly$ = bindValue<boolean>(GROUP, "lanOnly", false);
+const requireApproval$ = bindValue<boolean>(GROUP, "requireApproval", true);
 const resyncMinutes$ = bindValue<string>(GROUP, "resyncMinutes", "15");
+const playerList$ = bindValue<string>(GROUP, "playerList", "[]");
+const pendingJoins$ = bindValue<string>(GROUP, "pendingJoins", "[]");
+const canSaveClientWorld$ = bindValue<boolean>(GROUP, "canSaveClientWorld", false);
+const clientWorldSaveStatus$ = bindValue<string>(GROUP, "clientWorldSaveStatus", "idle");
+const clientWorldSaveName$ = bindValue<string>(GROUP, "clientWorldSaveName", "");
+const cityName$ = bindValue<string>("toolbarBottom", "cityName", "");
 
 interface ChatEntry {
     id: number;
     sender: string | null; // null = system/event line ("X joined.")
     text: string;
     time: string;
+}
+
+interface PlayerEntry {
+    id: number;
+    name: string;
+    isHost: boolean;
+}
+
+interface PendingJoin {
+    id: number;
+    name: string;
 }
 
 const parseChatLog = (json: string): ChatEntry[] => {
@@ -79,16 +139,36 @@ const parseChatLog = (json: string): ChatEntry[] => {
     }
 };
 
+const parsePlayerList = (json: string): PlayerEntry[] => {
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
+const parsePendingJoins = (json: string): PendingJoin[] => {
+    try {
+        const parsed = JSON.parse(json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+
 // Vanilla right-menu styling so the button is indistinguishable from the
 // Chirper/notification buttons below it. The module paths are vanilla-internal
 // and may move on a game update, hence the inline fallback look.
-const tryClasses = (path: string): Record<string, string> | null => {
+const tryModule = (path: string, exportName: string): any => {
     try {
-        return getModule(path, "classes");
+        return getModule(path, exportName);
     } catch {
         return null;
     }
 };
+const tryClasses = (path: string): Record<string, string> | null =>
+    tryModule(path, "classes");
 const rmButton = tryClasses("game-ui/game/components/right-menu/right-menu-button.module.scss");
 const rmMenu = tryClasses("game-ui/game/components/right-menu/right-menu.module.scss");
 
@@ -97,6 +177,7 @@ const kindColors: Record<string, string> = {
     offline: "#8fa0b3",
     disabled: "#8fa0b3",
     connecting: "#72c8f0",
+    syncing: "#72c8f0",
     connected: "#8ee08c",
     error: "#ff8a7a",
 };
@@ -149,7 +230,8 @@ const styles: Record<string, CSSProperties> = {
     },
     toastAnchor: {
         position: "absolute",
-        right: "calc(100% + 12rem)",
+        right: "100%",
+        marginRight: "12rem",
         top: "50%",
         transform: "translateY(-50%)",
         width: "320rem",
@@ -207,14 +289,9 @@ const styles: Record<string, CSSProperties> = {
         borderBottom: "1rem solid rgba(157, 193, 222, 0.2)",
         flexShrink: 0,
     },
-    headerIcon: {
-        width: "20rem",
-        height: "20rem",
-        marginRight: "10rem",
-    },
     headerTitle: {
         flex: 1,
-        fontSize: "18rem",
+        fontSize: "16rem",
         color: "#ffffff",
         textTransform: "uppercase",
     },
@@ -225,11 +302,8 @@ const styles: Record<string, CSSProperties> = {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        borderRadius: "3rem",
-    },
-    headerButtonIcon: {
-        width: "18rem",
-        height: "18rem",
+        borderRadius: "50%",
+        transition: "background-color 120ms ease, opacity 120ms ease",
     },
     // flexGrow/flexBasis spelled out instead of the "flex" shorthand: the game's
     // Gameface runtime does not reliably expand column children from the shorthand.
@@ -334,10 +408,30 @@ const styles: Record<string, CSSProperties> = {
         margin: "2rem 0 12rem 0",
     },
     errorLine: {
-        fontSize: "12.5rem",
-        color: "#ff8a7a",
-        marginBottom: "10rem",
+        fontSize: "13rem",
+        color: "#ffd7d1",
+        backgroundColor: "rgba(205, 82, 70, 0.18)",
+        borderLeft: "3rem solid #ff8a7a",
+        borderRadius: "3rem",
+        padding: "9rem 10rem",
+        margin: "4rem 0 10rem 0",
         wordBreak: "break-word",
+    },
+    errorTitle: {
+        fontWeight: "bold",
+        marginBottom: "4rem",
+    },
+    errorHelpTitle: {
+        marginTop: "8rem",
+        color: "#9dc1de",
+        fontSize: "11.5rem",
+        fontWeight: "bold",
+        textTransform: "uppercase",
+    },
+    errorHelp: {
+        marginTop: "3rem",
+        color: "#d6e2eb",
+        lineHeight: "1.35",
     },
     lockedNote: {
         fontSize: "12rem",
@@ -398,6 +492,190 @@ const styles: Record<string, CSSProperties> = {
         height: 0,
         borderBottom: "11rem solid rgba(157, 193, 222, 0.45)",
         borderLeft: "11rem solid transparent",
+    },
+    activityDetail: {
+        marginTop: "-9rem",
+        marginBottom: "10rem",
+        color: "rgba(255, 255, 255, 0.68)",
+        fontSize: "12rem",
+        lineHeight: "1.3",
+    },
+    playerSection: {
+        flexShrink: 0,
+        marginBottom: "10rem",
+    },
+    sectionHeader: {
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginBottom: "5rem",
+        color: "#9dc1de",
+        fontSize: "12.5rem",
+        textTransform: "uppercase",
+    },
+    playerList: {
+        backgroundColor: "rgba(0, 0, 0, 0.3)",
+        border: "1rem solid rgba(157, 193, 222, 0.2)",
+        borderRadius: "3rem",
+        maxHeight: "145rem",
+        overflowY: "auto",
+    },
+    playerRow: {
+        minHeight: "36rem",
+        padding: "4rem 7rem",
+        display: "flex",
+        alignItems: "center",
+        borderBottom: "1rem solid rgba(157, 193, 222, 0.14)",
+    },
+    playerName: {
+        flexGrow: 1,
+        minWidth: 0,
+        color: "#ffffff",
+        fontSize: "13.5rem",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+    },
+    playerBadge: {
+        marginLeft: "6rem",
+        color: "rgba(255, 255, 255, 0.62)",
+        fontSize: "10.5rem",
+        textTransform: "uppercase",
+    },
+    kickButton: {
+        marginLeft: "7rem",
+        padding: "3rem 8rem",
+        minWidth: "52rem",
+        fontSize: "11.5rem",
+    },
+    banButton: {
+        marginLeft: "5rem",
+        padding: "3rem 8rem",
+        minWidth: "52rem",
+        fontSize: "11.5rem",
+        color: "#ff9a8e",
+    },
+    confirmKickButton: {
+        marginLeft: "5rem",
+        padding: "3rem 7rem",
+        fontSize: "11.5rem",
+        color: "#ff9a8e",
+    },
+    // Join-request prompt: floats at the top of the screen so the host notices it
+    // without being locked out of the game (only the cards capture input).
+    joinAnchor: {
+        position: "fixed",
+        top: "24rem",
+        left: 0,
+        right: 0,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        zIndex: 10002,
+        pointerEvents: "none",
+    },
+    joinCard: {
+        width: "440rem",
+        maxWidth: "90%",
+        backgroundColor: "rgba(24, 33, 51, 0.98)",
+        border: "1rem solid rgba(157, 193, 222, 0.3)",
+        borderLeft: "4rem solid #72c8f0",
+        borderRadius: "4rem",
+        padding: "16rem 18rem",
+        marginBottom: "10rem",
+        boxShadow: "0 12rem 36rem rgba(0, 0, 0, 0.5)",
+        pointerEvents: "auto",
+    },
+    joinCardTitle: {
+        fontSize: "12.5rem",
+        color: "#9dc1de",
+        textTransform: "uppercase",
+        letterSpacing: "1rem",
+        marginBottom: "8rem",
+    },
+    joinCardBody: {
+        fontSize: "15rem",
+        color: "#ffffff",
+        marginBottom: "14rem",
+        wordBreak: "break-word",
+    },
+    joinCardButtons: {
+        display: "flex",
+        justifyContent: "flex-end",
+    },
+    joinCardButton: {
+        marginLeft: "10rem",
+        padding: "7rem 18rem",
+    },
+    saveDialogOverlay: {
+        position: "fixed",
+        top: 0,
+        left: 0,
+        right: 0,
+        bottom: 0,
+        zIndex: 10003,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: "rgba(0, 0, 0, 0.62)",
+        pointerEvents: "auto",
+    },
+    saveDialog: {
+        width: "500rem",
+        maxWidth: "90%",
+        backgroundColor: "rgba(24, 33, 51, 0.98)",
+        border: "1rem solid rgba(157, 193, 222, 0.3)",
+        borderRadius: "4rem",
+        padding: "22rem 24rem",
+        boxShadow: "0 16rem 48rem rgba(0, 0, 0, 0.5)",
+        pointerEvents: "auto",
+    },
+    saveDialogTitle: {
+        color: "#ffffff",
+        fontSize: "23rem",
+        textTransform: "uppercase",
+        marginBottom: "10rem",
+    },
+    saveDialogBody: {
+        color: "rgba(255, 255, 255, 0.78)",
+        fontSize: "14rem",
+        lineHeight: "1.4",
+        marginBottom: "18rem",
+    },
+    saveDialogLabel: {
+        color: "#9dc1de",
+        fontSize: "12rem",
+        textTransform: "uppercase",
+        marginBottom: "6rem",
+    },
+    saveDialogInput: {
+        width: "100%",
+        boxSizing: "border-box",
+        color: "#ffffff",
+        backgroundColor: "rgba(0, 0, 0, 0.36)",
+        border: "1rem solid rgba(157, 193, 222, 0.4)",
+        borderRadius: "3rem",
+        fontSize: "16rem",
+        padding: "9rem 11rem",
+        marginBottom: "12rem",
+    },
+    saveDialogStatus: {
+        minHeight: "20rem",
+        color: "#ffd7d1",
+        fontSize: "13rem",
+        lineHeight: "1.35",
+        marginBottom: "12rem",
+    },
+    saveDialogSuccess: {
+        color: "#8ee08c",
+    },
+    saveDialogButtons: {
+        display: "flex",
+        justifyContent: "flex-end",
+    },
+    saveDialogButton: {
+        marginLeft: "10rem",
+        padding: "8rem 18rem",
     },
 };
 
@@ -473,20 +751,42 @@ const HeaderIconButton = ({ src, tooltip, selected, onSelect }: {
     tooltip: string;
     selected?: boolean;
     onSelect: () => void;
-}) => (
-    <Tooltip tooltip={tooltip} direction="down">
-        {/* stopPropagation: header mousedown starts the panel drag */}
-        <div onMouseDown={(e) => e.stopPropagation()}>
-            <Button
-                variant="icon"
-                selected={selected}
-                style={styles.headerButton}
-                onSelect={onSelect}>
-                <img src={src} style={styles.headerButtonIcon} />
-            </Button>
-        </div>
-    </Tooltip>
-);
+}) => {
+    const [hovered, setHovered] = useState(false);
+    const buttonStyle = {
+        ...styles.headerButton,
+        backgroundColor: selected
+            ? "rgba(114, 200, 240, 0.22)"
+            : hovered
+                ? "rgba(255, 255, 255, 0.13)"
+                : "transparent",
+        opacity: selected || hovered ? 1 : 0.82,
+        color: selected ? "#72c8f0" : "#ffffff",
+        "--iconColor": selected ? "#72c8f0" : "#ffffff",
+        "--iconSize": "18rem",
+        "--iconWidth": "18rem",
+        "--iconHeight": "18rem",
+    } as CSSProperties;
+
+    return (
+        <Tooltip tooltip={tooltip} direction="down">
+            {/* stopPropagation: header mousedown starts the panel drag */}
+            <div
+                onMouseDown={(e) => e.stopPropagation()}
+                onMouseEnter={() => setHovered(true)}
+                onMouseLeave={() => setHovered(false)}>
+                <Button
+                    variant="icon"
+                    src={src}
+                    tinted
+                    selected={selected}
+                    style={buttonStyle}
+                    onSelect={onSelect}
+                />
+            </div>
+        </Tooltip>
+    );
+};
 
 // The host/session settings fields. Connection-defining fields are locked while
 // a session runs (the running server cannot re-bind them); the re-sync interval
@@ -500,7 +800,15 @@ const SettingsFields = () => {
     const hostPassword = useValue(hostPassword$);
     const maxPlayers = useValue(maxPlayers$);
     const lanOnly = useValue(lanOnly$);
+    const requireApproval = useValue(requireApproval$);
     const resyncMinutes = useValue(resyncMinutes$);
+    const hostConnection = useValue(hostConnection$);
+    const sessionUsesRelay = useValue(sessionUsesRelay$);
+    const joinCode = useValue(joinCode$);
+
+    // In a live session follow what it actually runs on; outside one, what is
+    // configured for the next.
+    const relay = inSession ? sessionUsesRelay : hostConnection !== CONNECTION_DIRECT;
 
     return (
         <>
@@ -510,12 +818,29 @@ const SettingsFields = () => {
                 disabled={inSession}
                 onChange={(v) => trigger(GROUP, "setPlayerName", v)}
             />
-            <HubField
-                label={t(LOC.port, "Port")}
-                value={hostPort}
-                disabled={inSession}
-                onChange={(v) => trigger(GROUP, "setHostPort", v)}
-            />
+            <div style={styles.row}>
+                <div style={styles.label}>{t(LOC.mode, "Connection")}</div>
+                <ConnectionSegmented
+                    value={relay ? CONNECTION_RELAY : CONNECTION_DIRECT}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setHostConnection", v)}
+                />
+            </div>
+            {/* A relay session has no port to show; the code is what a host passes on.
+                Read-only and select-on-click - the game exposes no clipboard API. */}
+            {relay ? (
+                <div style={styles.row}>
+                    <div style={styles.label}>{t(LOC.joinCode, "Join Code")}</div>
+                    <JoinCodeDisplay code={joinCode} style={styles.input} />
+                </div>
+            ) : (
+                <HubField
+                    label={t(LOC.port, "Port")}
+                    value={hostPort}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setHostPort", v)}
+                />
+            )}
             <HubField
                 label={t(LOC.password, "Password")}
                 secret
@@ -529,11 +854,21 @@ const SettingsFields = () => {
                 disabled={inSession}
                 onChange={(v) => trigger(GROUP, "setMaxPlayers", v)}
             />
+            {/* Nothing on this machine is reachable over a relay, so there is no
+                exposure for the LAN filter to narrow. */}
+            {!relay && (
+                <HubToggle
+                    label={t(LOC.lanOnly, "LAN Only")}
+                    value={lanOnly}
+                    disabled={inSession}
+                    onChange={(v) => trigger(GROUP, "setLanOnly", v)}
+                />
+            )}
             <HubToggle
-                label={t(LOC.lanOnly, "LAN Only")}
-                value={lanOnly}
+                label={t(LOC.requireApproval, "Approve Players")}
+                value={requireApproval}
                 disabled={inSession}
-                onChange={(v) => trigger(GROUP, "setLanOnly", v)}
+                onChange={(v) => trigger(GROUP, "setRequireApproval", v)}
             />
             <HubField
                 label={t(LOC.resyncMinutes, "World Re-sync (min)")}
@@ -556,6 +891,7 @@ const HostSetupView = () => {
     const statusKind = useValue(statusKind$);
     const statusTitle = useValue(statusTitle$);
     const statusDetail = useValue(statusDetail$);
+    const statusHelp = useValue(statusHelp$);
 
     return (
         <div style={styles.body}>
@@ -564,8 +900,14 @@ const HostSetupView = () => {
                 <SettingsFields />
                 {statusKind === "error" ? (
                     <div style={styles.errorLine}>
-                        {statusTitle}
-                        {statusDetail ? " - " + statusDetail : ""}
+                        <div style={styles.errorTitle}>{statusTitle}</div>
+                        {statusDetail ? <div>{statusDetail}</div> : null}
+                        {statusHelp ? (
+                            <>
+                                <div style={styles.errorHelpTitle}>{t(LOC.tryThis, "Try this")}</div>
+                                <div style={styles.errorHelp}>{statusHelp}</div>
+                            </>
+                        ) : null}
                     </div>
                 ) : null}
             </div>
@@ -597,15 +939,263 @@ const SettingsView = () => {
     );
 };
 
+const HostPlayerList = ({ players }: { players: PlayerEntry[] }) => {
+    const t = useT();
+    const [pendingAction, setPendingAction] = useState<{
+        playerId: number;
+        action: "kick" | "ban";
+    } | null>(null);
+
+    useEffect(() => {
+        if (pendingAction !== null &&
+            !players.some((player) => player.id === pendingAction.playerId))
+            setPendingAction(null);
+    }, [players, pendingAction]);
+
+    return (
+        <div style={styles.playerSection}>
+            <div style={styles.sectionHeader}>
+                <span>{t(LOC.players, "Players")}</span>
+                <span>{players.length}</span>
+            </div>
+            <div style={styles.playerList}>
+                {players.map((player) => {
+                    const pendingKind = pendingAction !== null &&
+                        pendingAction.playerId === player.id
+                        ? pendingAction.action
+                        : null;
+                    const confirming = pendingKind !== null;
+                    return (
+                        <div key={player.id} style={styles.playerRow}>
+                            <div style={styles.playerName}>{player.name}</div>
+                            {player.isHost ? (
+                                <>
+                                    <span style={styles.playerBadge}>{t(LOC.host, "Host")}</span>
+                                    <span style={styles.playerBadge}>{t(LOC.you, "You")}</span>
+                                </>
+                            ) : confirming ? (
+                                <>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.confirmKickButton}
+                                        onSelect={() => {
+                                            trigger(
+                                                GROUP,
+                                                pendingKind === "ban"
+                                                    ? "banPlayer"
+                                                    : "kickPlayer",
+                                                player.id,
+                                            );
+                                            setPendingAction(null);
+                                        }}>
+                                        {pendingKind === "ban"
+                                            ? t(LOC.confirmBan, "Ban?")
+                                            : t(LOC.confirmKick, "Remove?")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.confirmKickButton}
+                                        onSelect={() => setPendingAction(null)}>
+                                        {t(LOC.cancelKick, "Cancel")}
+                                    </Button>
+                                </>
+                            ) : (
+                                <>
+                                    <Button
+                                        variant="flat"
+                                        style={styles.kickButton}
+                                        onSelect={() => setPendingAction({
+                                            playerId: player.id,
+                                            action: "kick",
+                                        })}>
+                                        {t(LOC.kick, "Kick")}
+                                    </Button>
+                                    <Tooltip
+                                        tooltip={t(
+                                            LOC.banHint,
+                                            "Remove this player and prevent them from rejoining until hosting stops.",
+                                        )}
+                                        direction="down">
+                                        <Button
+                                            variant="flat"
+                                            style={styles.banButton}
+                                            onSelect={() => setPendingAction({
+                                                playerId: player.id,
+                                                action: "ban",
+                                            })}>
+                                            {t(LOC.ban, "Ban")}
+                                        </Button>
+                                    </Tooltip>
+                                </>
+                            )}
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+
+const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
+    const t = useT();
+    const canSave = useValue(canSaveClientWorld$);
+    const saveStatus = useValue(clientWorldSaveStatus$);
+    const savedName = useValue(clientWorldSaveName$);
+    const cityName = useValue(cityName$).trim();
+    const [draft, setDraft] = useState(() =>
+        t(LOC.suggestedCopyName, "{0} - Copy")
+            .replace("{0}", cityName || t(LOC.multiplayerWorld, "Multiplayer World"))
+            .slice(0, 85)
+            .trim());
+    const [submitted, setSubmitted] = useState(false);
+    const inputRef = useRef<HTMLInputElement | null>(null);
+
+    const saving = submitted && saveStatus === "saving";
+    const saved = submitted && saveStatus === "saved";
+
+    useEffect(() => {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+    }, []);
+
+    const submit = () => {
+        const saveName = draft.trim();
+        if (!canSave || saving || saved || !saveName) return;
+        setSubmitted(true);
+        trigger(GROUP, "saveClientWorld", saveName);
+    };
+
+    let statusText = "";
+    if (submitted) {
+        switch (saveStatus) {
+            case "saving":
+                statusText = t(LOC.savingCopy, "Saving a local copy...");
+                break;
+            case "saved":
+                statusText = t(LOC.saveCopySuccess, "Saved to this PC as \"{0}\".")
+                    .replace("{0}", savedName || draft.trim());
+                break;
+            case "exists":
+                statusText = t(LOC.saveCopyExists,
+                    "A saved world with this name already exists. Choose a different name.");
+                break;
+            case "invalid":
+                statusText = t(LOC.saveCopyInvalid,
+                    "Enter a name between 1 and 85 characters.");
+                break;
+            case "unavailable":
+                statusText = t(LOC.saveCopyUnavailable,
+                    "Wait until the host world has fully loaded before saving a copy.");
+                break;
+            case "failed":
+                statusText = t(LOC.saveCopyFailed,
+                    "The copy could not be saved. Try another name and check free disk space.");
+                break;
+        }
+    } else if (!canSave) {
+        statusText = t(LOC.saveCopyUnavailable,
+            "Wait until the host world has fully loaded before saving a copy.");
+    }
+
+    return (
+        <Portal>
+            <InputActionBarrier>
+                <AutoNavigationScope
+                    debugName="CS2MP Save World Copy"
+                    direction={NavigationDirection.Both}
+                    initialFocused={saved ? "close" : "save-copy"}
+                    allowLooping>
+                <div
+                    style={styles.saveDialogOverlay}
+                    onMouseDown={(event) => event.stopPropagation()}>
+                    <div style={styles.saveDialog}>
+                        <div style={styles.saveDialogTitle}>
+                            {t(LOC.saveCopyTitle, "Save a World Copy")}
+                        </div>
+                        <div style={styles.saveDialogBody}>
+                            {t(LOC.saveCopyBody,
+                                "Keep the current shared city on this PC so you can continue it later in single-player.")}
+                        </div>
+                        <div style={styles.saveDialogLabel}>
+                            {t(LOC.worldName, "World Name")}
+                        </div>
+                        <input
+                            ref={inputRef}
+                            type="text"
+                            value={draft}
+                            maxLength={85}
+                            disabled={saving || saved}
+                            spellCheck={false}
+                            autoComplete="off"
+                            style={styles.saveDialogInput}
+                            onMouseDown={(event) => event.stopPropagation()}
+                            onChange={(event) => {
+                                setDraft((event.target as HTMLInputElement).value);
+                                setSubmitted(false);
+                                trigger(GROUP, "resetClientWorldSaveStatus");
+                            }}
+                            onKeyDown={(event) => {
+                                event.stopPropagation();
+                                if (event.key === "Enter") submit();
+                                if (event.key === "Escape" && !saving) onClose();
+                            }}
+                        />
+                        <div style={saved
+                            ? { ...styles.saveDialogStatus, ...styles.saveDialogSuccess }
+                            : styles.saveDialogStatus}>
+                            {statusText}
+                        </div>
+                        <div style={styles.saveDialogButtons}>
+                            {saved ? (
+                                <Button focusKey="close" variant="primary" style={styles.saveDialogButton} onSelect={onClose}>
+                                    {t(LOC.close, "Close")}
+                                </Button>
+                            ) : (
+                                <>
+                                    <Button
+                                        variant="primary"
+                                        focusKey="save-copy"
+                                        style={styles.saveDialogButton}
+                                        disabled={!canSave || saving || !draft.trim()}
+                                        onSelect={submit}>
+                                        {saving
+                                            ? t(LOC.savingCopy, "Saving a local copy...")
+                                            : t(LOC.saveToPC, "Save to This PC")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        focusKey="cancel"
+                                        style={styles.saveDialogButton}
+                                        disabled={saving}
+                                        onSelect={onClose}>
+                                        {t(LOC.cancel, "Cancel")}
+                                    </Button>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+                </AutoNavigationScope>
+            </InputActionBarrier>
+        </Portal>
+    );
+};
+
 // Active session: player count, chat feed (player lines + "X joined." event
-// lines), send box, world sync and disconnect.
-const SessionView = ({ entries }: { entries: ChatEntry[] }) => {
+// lines), send box, world sync, local client copy and disconnect.
+const SessionView = ({ entries, players }: { entries: ChatEntry[]; players: PlayerEntry[] }) => {
     const t = useT();
     const playerCount = useValue(playerCount$);
     const mapTransferPercent = useValue(mapTransferPercent$);
     const worldSendPercent = useValue(worldSendPercent$);
+    const isHost = useValue(isHost$);
+    const progressMode = useValue(progressMode$);
+    const statusTitle = useValue(statusTitle$);
+    const statusDetail = useValue(statusDetail$);
+    const canSaveClientWorld = useValue(canSaveClientWorld$);
     const [draft, setDraft] = useState("");
     const [typing, setTyping] = useState(false);
+    const [saveDialogOpen, setSaveDialogOpen] = useState(false);
     const listRef = useRef<HTMLDivElement | null>(null);
 
     // Keep the newest line in view (only auto-stick when already near the bottom,
@@ -624,13 +1214,29 @@ const SessionView = ({ entries }: { entries: ChatEntry[] }) => {
         setDraft("");
     };
 
+    const activityPercent = isHost ? worldSendPercent : mapTransferPercent;
+    const showActivity = progressMode !== "none";
+
     return (
         <div style={styles.body}>
+            {saveDialogOpen ? (
+                <ClientWorldSaveDialog onClose={() => setSaveDialogOpen(false)} />
+            ) : null}
             {/* Single string child: Gameface puts each adjacent bare text node on
                 its own line, which split "Players: 3" into three lines. */}
-            <div style={styles.playerCountRow}>{t(LOC.players, "Players") + ": " + playerCount}</div>
-            <TransferProgress percent={mapTransferPercent} />
-            <TransferProgress percent={worldSendPercent} label={t(LOC.sendingWorld, "Sending World")} />
+            {isHost
+                ? <HostPlayerList players={players} />
+                : <div style={styles.playerCountRow}>{t(LOC.players, "Players") + ": " + playerCount}</div>}
+            {showActivity ? (
+                <>
+                    <TransferProgress
+                        percent={activityPercent}
+                        label={statusTitle}
+                        indeterminate={progressMode === "indeterminate"}
+                    />
+                    {statusDetail ? <div style={styles.activityDetail}>{statusDetail}</div> : null}
+                </>
+            ) : null}
             <div ref={listRef} style={styles.chatList}>
                 {entries.length === 0 ? (
                     <div style={styles.chatEmpty}>{t(LOC.noMessages, "No messages yet.")}</div>
@@ -675,6 +1281,18 @@ const SessionView = ({ entries }: { entries: ChatEntry[] }) => {
                 <Button variant="flat" style={styles.footerButton} onSelect={() => trigger(GROUP, "syncNow")}>
                     {t(LOC.syncWorld, "Sync World")}
                 </Button>
+                {!isHost ? (
+                    <Button
+                        variant="flat"
+                        style={styles.footerButton}
+                        disabled={!canSaveClientWorld}
+                        onSelect={() => {
+                            trigger(GROUP, "resetClientWorldSaveStatus");
+                            setSaveDialogOpen(true);
+                        }}>
+                        {t(LOC.saveCopy, "Save Copy")}
+                    </Button>
+                ) : null}
                 <Button variant="flat" style={styles.footerButton} onSelect={() => trigger(GROUP, "disconnect")}>
                     {t(LOC.disconnect, "Disconnect")}
                 </Button>
@@ -706,8 +1324,9 @@ interface DragState {
     baseH: number;
 }
 
-export const MultiplayerPanel = ({ entries, geometry, onGeometry, onClose }: {
+export const MultiplayerPanel = ({ entries, players, geometry, onGeometry, onClose }: {
     entries: ChatEntry[];
+    players: PlayerEntry[];
     geometry: PanelGeometry;
     onGeometry: (geometry: PanelGeometry) => void;
     onClose: () => void;
@@ -781,16 +1400,15 @@ export const MultiplayerPanel = ({ entries, geometry, onGeometry, onClose }: {
         panelStyle.maxHeight = "none";
     }
 
+    const titleText = showSettings
+        ? t(LOC.sessionSettings, "Session Settings")
+        : t(LOC.multiplayer, "Multiplayer");
+
     return (
         <Portal>
             <div ref={panelRef} style={panelStyle} onMouseDown={(e) => e.stopPropagation()}>
                 <div style={styles.header} onMouseDown={(e) => beginDrag(e, "move")}>
-                    <img src={ICON_MULTIPLAYER} style={styles.headerIcon} />
-                    <div style={styles.headerTitle}>
-                        {showSettings
-                            ? t(LOC.sessionSettings, "Session Settings")
-                            : t(LOC.multiplayer, "Multiplayer")}
-                    </div>
+                    <div style={styles.headerTitle}>{titleText}</div>
                     {inSession ? (
                         <HeaderIconButton
                             src={ICON_GEAR}
@@ -805,7 +1423,11 @@ export const MultiplayerPanel = ({ entries, geometry, onGeometry, onClose }: {
                         onSelect={onClose}
                     />
                 </div>
-                {showSettings && inSession ? <SettingsView /> : inSession ? <SessionView entries={entries} /> : <HostSetupView />}
+                {showSettings && inSession
+                    ? <SettingsView />
+                    : inSession
+                        ? <SessionView entries={entries} players={players} />
+                        : <HostSetupView />}
                 <div style={styles.resizeHandle} onMouseDown={(e) => beginDrag(e, "resize")}>
                     <div style={styles.resizeGrip} />
                 </div>
@@ -833,15 +1455,69 @@ const ToastList = ({ toasts }: { toasts: ChatEntry[] }) => (
     </div>
 );
 
+// Host-only prompt shown whenever one or more players are waiting to be let in.
+// It floats at the top of the screen (not a full-screen blocker) so the host can
+// keep playing and admit each join when ready. Always mounted with the right-menu
+// button, so it appears even when the hub panel is closed.
+const JoinRequestModal = () => {
+    const t = useT();
+    const isHost = useValue(isHost$);
+    const pendingJson = useValue(pendingJoins$);
+    const pending = useMemo(() => parsePendingJoins(pendingJson), [pendingJson]);
+
+    if (!isHost || pending.length === 0) return null;
+
+    return (
+        <Portal>
+            <div style={styles.joinAnchor}>
+                {pending.map((join) => (
+                    <InputActionBarrier key={join.id}>
+                        <AutoNavigationScope
+                            debugName="CS2MP Join Request"
+                            direction={NavigationDirection.Horizontal}
+                            initialFocused="accept"
+                            allowLooping>
+                            <div style={styles.joinCard} onMouseDown={(e) => e.stopPropagation()}>
+                                <div style={styles.joinCardTitle}>{t(LOC.joinRequestTitle, "Join Request")}</div>
+                                <div style={styles.joinCardBody}>
+                                    {t(LOC.joinRequestBody, "{0} wants to join your session.").replace("{0}", join.name)}
+                                </div>
+                                <div style={styles.joinCardButtons}>
+                                    <Button
+                                        variant="primary"
+                                        focusKey="accept"
+                                        style={styles.joinCardButton}
+                                        onSelect={() => trigger(GROUP, "approveJoin", join.id)}>
+                                        {t(LOC.accept, "Accept")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        focusKey="decline"
+                                        style={styles.joinCardButton}
+                                        onSelect={() => trigger(GROUP, "declineJoin", join.id)}>
+                                        {t(LOC.decline, "Decline")}
+                                    </Button>
+                                </div>
+                            </div>
+                        </AutoNavigationScope>
+                    </InputActionBarrier>
+                ))}
+            </div>
+        </Portal>
+    );
+};
+
 export const MultiplayerRightMenuButton = () => {
     const t = useT();
     const [open, setOpen] = useState(false);
     const [geometry, setGeometry] = useState<PanelGeometry>({ pos: null, size: null });
     const chatJson = useValue(chatLog$);
+    const playerJson = useValue(playerList$);
     const inSession = useValue(inSession$);
     const statusKind = useValue(statusKind$);
     const accepted = useValue(disclaimerAccepted$);
     const entries = useMemo(() => parseChatLog(chatJson), [chatJson]);
+    const players = useMemo(() => parsePlayerList(playerJson), [playerJson]);
 
     // Read marker: everything up to this id has been seen with the panel open.
     const [readSeenId, setReadSeenId] = useState(0);
@@ -882,6 +1558,7 @@ export const MultiplayerRightMenuButton = () => {
 
     return (
         <>
+            <JoinRequestModal />
             <Tooltip tooltip={title} direction="left">
                 <div style={styles.buttonWrap} className={rmMenu ? rmMenu.item : undefined}>
                     <Button
@@ -905,6 +1582,7 @@ export const MultiplayerRightMenuButton = () => {
                 accepted ? (
                     <MultiplayerPanel
                         entries={entries}
+                        players={players}
                         geometry={geometry}
                         onGeometry={setGeometry}
                         onClose={() => setOpen(false)}

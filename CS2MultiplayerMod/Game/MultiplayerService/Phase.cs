@@ -1,7 +1,11 @@
 using System;
 using Game.SceneFlow;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
+using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Localization;
+using CS2MultiplayerMod.Game.Sync.Infrastructure;
+using Unity.Entities;
 
 namespace CS2MultiplayerMod.Game
 {
@@ -21,15 +25,27 @@ namespace CS2MultiplayerMod.Game
                 case ClientWorldPhase.Connecting: return L10n.T(L10n.Key.StateConnecting);
                 case ClientWorldPhase.WaitingForMap: return L10n.T(L10n.Key.PhaseWaitingForMap);
                 case ClientWorldPhase.LoadingMap: return L10n.T(L10n.Key.PhaseLoadingMap);
+                case ClientWorldPhase.WaitingForResume: return L10n.T(L10n.Key.PhaseFinishingSetup);
                 default: return phase.ToString();
             }
         }
 
         /// <summary>Called once per simulation tick by the ECS system.</summary>
-        public void Update()
+        public void Update(World world)
         {
+            _currentWorld = world;
             _session.Update(_clock.ElapsedMilliseconds);
+            PumpClientWorldSave();
+            PumpDeferredReceivedMap();
+            RefreshPendingJoinsJson();
+            string recoveryReason;
+            if (_session.Status == SessionStatus.Connected &&
+                SyncInbox.TryTakeResyncRequest(out recoveryReason))
+                RequestAutomaticWorldRecovery(recoveryReason);
             PumpWorldPhase();
+            MaintainWorldSyncBarrier();
+            PumpClientWorldSyncQuiescence();
+            PumpGameExit();
         }
 
         /// <summary>
@@ -50,8 +66,9 @@ namespace CS2MultiplayerMod.Game
 
             if (_sawLoading)
             {
-                SetPhase(ClientWorldPhase.InSession);
-                _log.Info("[MP] Host world loaded - gameplay sync active.");
+                SetPhase(ClientWorldPhase.WaitingForResume);
+                _log.Info("[MP] Host world loaded - waiting for the epoch resume barrier.");
+                _session.SendWorldSyncStage(_activeWorldSyncEpoch, WorldSyncStage.Loaded);
                 return;
             }
 
@@ -60,6 +77,8 @@ namespace CS2MultiplayerMod.Game
                 // The load never started (failed staging, asset index miss, …). Recover
                 // to a defined state instead of idling half-connected forever.
                 SetPhase(ClientWorldPhase.WaitingForMap);
+                if (_worldSyncBarrierActive && _activeWorldSyncEpoch > 0)
+                    _session.SendWorldSyncStage(_activeWorldSyncEpoch, WorldSyncStage.Failed);
                 _log.Warn("[MP] Host world never started loading. Still connected - use /sync to " +
                           "request it again, or load '" + JoinMapLoader.TransientName + "' manually.");
             }
@@ -119,10 +138,14 @@ namespace CS2MultiplayerMod.Game
         {
             if (!ModEnabled) { _log.Warn("Cannot host: the mod is disabled in settings."); return; }
             if (_session.Role != SessionRole.None) { _log.Warn("Cannot host: a session is already active."); return; }
+            ClearClientExitNotice();
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: true);
-            _log.Info("[MP] Host requested: port=" + config.Port +
+            _log.Info("[MP] Host requested: transport=" + config.Transport +
+                      (config.Transport == TransportMode.SteamRelay
+                          ? " joinCode=" + RelayProvider.LocalJoinCode
+                          : " port=" + config.Port) +
                       " lanOnly=" + config.LanOnly +
                       " password=" + (config.Password.Length > 0 ? "SET" : "NONE") +
                       " maxPlayers=" + config.MaxPlayers +
@@ -136,10 +159,14 @@ namespace CS2MultiplayerMod.Game
         {
             if (!ModEnabled) { _log.Warn("Cannot join: the mod is disabled in settings."); return; }
             if (_session.Role != SessionRole.None) { _log.Warn("Cannot join: a session is already active."); return; }
+            ClearClientExitNotice();
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: false);
-            _log.Info("[MP] Join requested: target=" + config.HostAddress + ":" + config.Port +
+            _log.Info("[MP] Join requested: transport=" + config.Transport +
+                      " target=" + (config.Transport == TransportMode.SteamRelay
+                          ? config.JoinCode
+                          : config.HostAddress + ":" + config.Port) +
                       " password=" + (config.Password.Length > 0 ? "SET" : "NONE") +
                       " name='" + config.PlayerName + "'" +
                       " mod=" + config.ModVersion + " game=" + config.GameVersion +
@@ -150,29 +177,53 @@ namespace CS2MultiplayerMod.Game
 
         public void Disconnect()
         {
-            _session.Stop();
+            if (_session.Role == SessionRole.Client && _clientHostWorldActive)
+                QueueClientMainMenu("You disconnected from the multiplayer session.");
+
+            ResetWorldSyncState(restoreSpeed: true);
+            // A host that stops hosting owes its clients a reason: without the notice they
+            // only ever see the socket drop, which reads as a network failure.
+            _session.StopWithNotice("The host ended this multiplayer session.");
             SetPhase(ClientWorldPhase.None);
-            JoinMapLoader.DeleteTransient(_log); // a joining client keeps no copy of the host world
+
+            // Do not delete a save which is still loading or is the currently open client
+            // world. The lifecycle pump removes it after MainMenu has completed.
+            if (_clientHostWorldActive || _clientMainMenuPending)
+                _transientCleanupPending = true;
+            else
+                JoinMapLoader.DeleteTransient(_log);
         }
 
         public void Shutdown()
         {
-            _session.Stop();
+            ResetWorldSyncState(restoreSpeed: false); // the world is going away with the process
+            _session.StopWithNotice("The host closed the game, so this session has ended.");
             SetPhase(ClientWorldPhase.None);
             RestoreAutosave(); // even if the phase was already None
+            ForgetClientHostWorld(); // process teardown owns the world; do not start MainMenu
+            ClearClientExitNotice();
             JoinMapLoader.DeleteTransient(_log);
         }
 
         private MultiplayerConfig BuildConfig(Setting settings, bool hosting)
         {
+            // Both sides pick their connection explicitly, so a player joining a relay
+            // host sees the same choice the host made rather than having it inferred.
+            TransportMode transport = hosting ? settings.HostTransport() : settings.JoinTransport();
+            bool relay = transport == TransportMode.SteamRelay;
+            string target = (settings.ServerAddress ?? "").Trim();
+            string joinCode = (settings.JoinCodeInput ?? "").Trim();
+
             string portText = hosting ? settings.HostPort : settings.JoinPort;
             int port;
             if (!int.TryParse((portText ?? "").Trim(), out port) || port <= 0 || port > 65535)
             {
                 // Never fall back silently: hosting on a different port than the user
                 // thinks they configured is exactly the kind of failure nobody can debug.
-                _log.Warn("[MP] Invalid " + (hosting ? "host" : "join") + " port '" + portText +
-                          "' - using default " + DefaultPort + " instead. Enter a number from 1 to 65535.");
+                // Relay sessions carry no port at all, so there is nothing to warn about.
+                if (!relay)
+                    _log.Warn("[MP] Invalid " + (hosting ? "host" : "join") + " port '" + portText +
+                              "' - using default " + DefaultPort + " instead. Enter a number from 1 to 65535.");
                 port = DefaultPort;
             }
 
@@ -198,11 +249,17 @@ namespace CS2MultiplayerMod.Game
             // crashed the host silently). Authentication is unaffected - the password
             // challenge-response never sends the password itself.
             return new MultiplayerConfig(
-                settings.PlayerName, (settings.ServerAddress ?? "").Trim(), port,
+                settings.PlayerName, target, port,
                 hosting ? settings.HostPassword : settings.JoinPassword,
-                settings.LanOnly, useEncryption: false, maxPlayers: maxPlayers,
+                // A relay session is not reachable from the network at all, so the LAN-only
+                // exposure control has nothing to restrict.
+                lanOnly: !relay && settings.LanOnly,
+                useEncryption: false, maxPlayers: maxPlayers,
                 modVersion: modVersion, gameVersion: gameVersion,
-                dlcList: dlcs);
+                dlcList: dlcs,
+                requireJoinApproval: hosting && settings.RequireJoinApproval,
+                transport: transport,
+                joinCode: relay && !hosting ? joinCode : "");
         }
 
     }

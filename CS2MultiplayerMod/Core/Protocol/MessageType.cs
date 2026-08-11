@@ -50,5 +50,24 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// for incompatible client detection.
         /// </summary>
         HandshakeChallenge = 11,
+
+        /// <summary>
+        /// Coordinates an atomic world replacement. The host opens an epoch, clients
+        /// acknowledge quiescence and load completion, and the host explicitly resumes it.
+        /// </summary>
+        WorldSyncControl = 12,
+
+        /// <summary>
+        /// Host -> client: explains why the host is deliberately ending this player's
+        /// session (for example, an administrative kick) before closing the connection.
+        /// </summary>
+        DisconnectNotice = 13,
+
+        /// <summary>
+        /// Host -> client: the handshake passed every automatic check, but the host
+        /// requires manual approval. The client waits (showing an "awaiting approval"
+        /// screen) until a <see cref="HandshakeResponse"/> accepts or rejects it.
+        /// </summary>
+        HandshakePending = 14,
     }
 }

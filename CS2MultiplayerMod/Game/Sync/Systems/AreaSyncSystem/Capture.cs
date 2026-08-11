@@ -46,23 +46,81 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _lastEditScanMs = now;
 
             _nextRings.Clear();
-            NativeArray<Entity> entities = _liveAreas.ToEntityArray(Allocator.Temp);
+            ScanForEdits(session, now, _liveAreas, ownedSpecialized: false);
+            ScanForEdits(session, now, _ownedSpecializedAreas, ownedSpecialized: true);
+
+            var swap = _knownRings;
+            _knownRings = _nextRings;
+            _nextRings = swap;
+        }
+
+        private void ScanForEdits(MultiplayerSession session, long now,
+            EntityQuery query, bool ownedSpecialized)
+        {
+            NativeArray<Entity> entities = query.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < entities.Length; i++)
                 {
                     Entity entity = entities[i];
-                    float3[] ring = ReadRing(entity);
-                    if (ring.Length < 3) continue;
+                    Entity areaPrefab = EntityManager
+                        .GetComponentData<PrefabRef>(entity).m_Prefab;
+                    Entity ownerPrefab = Entity.Null;
+                    global::Game.Objects.Transform ownerTransform =
+                        default(global::Game.Objects.Transform);
+                    if (ownedSpecialized &&
+                        !TryGetOwnedAreaIdentity(entity, out areaPrefab,
+                            out ownerPrefab, out ownerTransform)) continue;
 
+                    float3[] ring = ReadRing(entity);
                     float3[] old;
                     bool had = _knownRings.TryGetValue(entity, out old);
+                    // Record even a lot that is not a polygon yet: a building placed without
+                    // drawing its area keeps the prefab's seed nodes, and without that baseline
+                    // the player's first real draw reads as a first sighting and is never sent.
                     _nextRings[entity] = ring;
-                    if (!had || RingsEqual(old, ring)) continue;
+                    if (ring.Length < 3 || !had || RingsEqual(old, ring)) continue;
 
-                    string name = _prefabSystem.GetPrefabName(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                    string name = _prefabSystem.GetPrefabName(areaPrefab);
                     if (string.IsNullOrEmpty(name)) continue;
-                    if (_guard.Consume(AreaUpdateKey(name, CentroidOf(ring)), now)) continue;
+                    DynamicBuffer<Node> nodes = EntityManager.GetBuffer<Node>(entity, true);
+
+                    if (ownedSpecialized)
+                    {
+                        string ownerName = _prefabSystem.GetPrefabName(ownerPrefab);
+                        if (string.IsNullOrEmpty(ownerName)) continue;
+                        string key = OwnedAreaUpdateKey(name, ownerName,
+                            ownerTransform.m_Position);
+                        if (_guard.Consume(key, now)) continue;
+
+                        var ownedCommand = new OwnedAreaSnapshotCommand
+                        {
+                            AreaPrefabName = name,
+                            OwnerPrefabName = ownerName,
+                            OwnerX = ownerTransform.m_Position.x,
+                            OwnerY = ownerTransform.m_Position.y,
+                            OwnerZ = ownerTransform.m_Position.z,
+                            OwnerRotX = ownerTransform.m_Rotation.value.x,
+                            OwnerRotY = ownerTransform.m_Rotation.value.y,
+                            OwnerRotZ = ownerTransform.m_Rotation.value.z,
+                            OwnerRotW = ownerTransform.m_Rotation.value.w,
+                            NodeX = new float[ring.Length],
+                            NodeY = new float[ring.Length],
+                            NodeZ = new float[ring.Length],
+                            NodeElevation = new float[ring.Length],
+                        };
+                        CopyNodes(nodes, ownedCommand.NodeX, ownedCommand.NodeY,
+                            ownedCommand.NodeZ, ownedCommand.NodeElevation);
+                        session.SendCommand(0, OwnedAreaSnapshotCommand.Id,
+                            ownedCommand.Encode());
+                        Mod.Verbose("[MP] AreaSync captured owned redraw of '" + name +
+                                    "' on '" + ownerName + "' (" + ring.Length +
+                                    " nodes).");
+                        continue;
+                    }
+
+                    if (_guard.Consume(AreaUpdateKey(name, CentroidOf(ring)), now))
+                        continue;
 
                     float3 oldCentroid = CentroidOf(old);
                     var command = new AreaUpdateCommand
@@ -74,14 +132,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         NodeZ = new float[ring.Length],
                         NodeElevation = new float[ring.Length],
                     };
-                    DynamicBuffer<Node> nodes = EntityManager.GetBuffer<Node>(entity, true);
-                    for (int n = 0; n < nodes.Length; n++)
-                    {
-                        command.NodeX[n] = nodes[n].m_Position.x;
-                        command.NodeY[n] = nodes[n].m_Position.y;
-                        command.NodeZ[n] = nodes[n].m_Position.z;
-                        command.NodeElevation[n] = nodes[n].m_Elevation;
-                    }
+                    CopyNodes(nodes, command.NodeX, command.NodeY,
+                        command.NodeZ, command.NodeElevation);
                     session.SendCommand(0, AreaUpdateCommand.Id, command.Encode());
                     Mod.Verbose("[MP] AreaSync captured redraw of '" + name + "' (" + ring.Length + " nodes).");
                 }
@@ -90,10 +142,18 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             {
                 entities.Dispose();
             }
+        }
 
-            var swap = _knownRings;
-            _knownRings = _nextRings;
-            _nextRings = swap;
+        private static void CopyNodes(DynamicBuffer<Node> nodes,
+            float[] x, float[] y, float[] z, float[] elevation)
+        {
+            for (int i = 0; i < nodes.Length; i++)
+            {
+                x[i] = nodes[i].m_Position.x;
+                y[i] = nodes[i].m_Position.y;
+                z[i] = nodes[i].m_Position.z;
+                elevation[i] = nodes[i].m_Elevation;
+            }
         }
 
         private void CaptureCreated(MultiplayerSession session, long now)

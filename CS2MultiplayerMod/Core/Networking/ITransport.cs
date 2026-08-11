@@ -67,5 +67,15 @@ namespace CS2MultiplayerMod.Core.Networking
 
         /// <summary>Stop all I/O and release sockets. Idempotent.</summary>
         void Shutdown();
+
+        /// <summary>
+        /// Close every connection once its queued payloads have gone out, waiting up to
+        /// <paramref name="timeoutMs"/> for that drain before closing the rest by force.
+        /// Blocks the caller, so the timeout must stay short: this exists for the moment
+        /// the process (or the world) is going away and a final notice still has to reach
+        /// the peers, which <see cref="Shutdown"/> alone cannot guarantee - it abandons
+        /// whatever is still queued.
+        /// </summary>
+        void ShutdownAfterFlush(int timeoutMs);
     }
 }

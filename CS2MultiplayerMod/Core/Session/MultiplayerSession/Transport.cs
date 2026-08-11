@@ -40,6 +40,16 @@ namespace CS2MultiplayerMod.Core.Session
                     return;
                 }
 
+                if (!string.IsNullOrEmpty(address) && _hostBannedAddresses.Contains(address))
+                {
+                    _log.Warn("[security] Refused " + connection + " (" + address +
+                              "): banned by the host for this session.");
+                    SendTo(connection, HandshakeResponse.Reject(
+                        "The host banned this connection for the current hosting session."));
+                    _transport.DisconnectAfterFlush(connection);
+                    return;
+                }
+
                 // Cap the number of sockets sitting in the pre-handshake state.
                 int pending = 0;
                 foreach (var pair in _peers)
@@ -84,6 +94,7 @@ namespace CS2MultiplayerMod.Core.Session
             if (_peers.TryGetValue(connection.Value, out peer))
             {
                 _peers.Remove(connection.Value);
+                bool removedByHost = _administrativeRemovals.Remove(connection.Value);
                 if (peer.Handshaked)
                 {
                     NotifyPeerLeft(peer, reason);
@@ -92,7 +103,9 @@ namespace CS2MultiplayerMod.Core.Session
                         // Mirror of the join notice: clients get no OnPeerLeft for each
                         // other, so this system chat line is how every machine learns of
                         // a leave (and the host's own UI via NotifyChat).
-                        string notice = peer.Name + " left.";
+                        string notice = removedByHost
+                            ? peer.Name + " was removed by the host."
+                            : peer.Name + " left.";
                         BroadcastToAll(new ChatMessage(null, notice), ConnectionId.None);
                         NotifyChat(null, notice);
                     }
@@ -129,7 +142,9 @@ namespace CS2MultiplayerMod.Core.Session
         private void EndByRemote(string reason)
         {
             _log.Info("Host ended the session (" + reason + "). Disconnecting cleanly.");
-            Stop();
+            // Preserve the host notice / transport failure for the game layer. It uses
+            // this detail to tell the player why their temporary host world is closing.
+            Stop(reason);
         }
 
         private void OnTransportData(ConnectionId connection, byte[] payload, long nowUnixMs)
@@ -162,7 +177,8 @@ namespace CS2MultiplayerMod.Core.Session
             // chat, blobs or resync requests while skipping the password entirely.
             bool handshakeTraffic = message.Type == MessageType.HandshakeRequest ||
                                     message.Type == MessageType.HandshakeResponse ||
-                                    message.Type == MessageType.HandshakeChallenge;
+                                    message.Type == MessageType.HandshakeChallenge ||
+                                    message.Type == MessageType.HandshakePending;
             if (!handshakeTraffic && (peer == null || !peer.Handshaked))
             {
                 Punt(connection, peer, "sent " + message.Type + " before authenticating", message.Type.ToString());
@@ -195,6 +211,9 @@ namespace CS2MultiplayerMod.Core.Session
                 case MessageType.HandshakeResponse:
                     HandleHandshakeResponse(peer, (HandshakeResponse)message);
                     break;
+                case MessageType.HandshakePending:
+                    HandleHandshakePending(connection, peer);
+                    break;
                 case MessageType.Heartbeat:
                     HandleHeartbeat(connection, peer, (Heartbeat)message, nowUnixMs);
                     break;
@@ -218,6 +237,12 @@ namespace CS2MultiplayerMod.Core.Session
                     break;
                 case MessageType.ResyncRequest:
                     HandleResyncRequest(connection, peer, nowUnixMs);
+                    break;
+                case MessageType.WorldSyncControl:
+                    HandleWorldSyncControl(connection, peer, (WorldSyncControlMessage)message);
+                    break;
+                case MessageType.DisconnectNotice:
+                    HandleDisconnectNotice(connection, peer, (DisconnectNoticeMessage)message);
                     break;
             }
         }

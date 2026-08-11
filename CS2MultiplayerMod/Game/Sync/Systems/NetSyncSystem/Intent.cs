@@ -11,18 +11,21 @@ using CS2MultiplayerMod.Game.Sync.Commands;
 
 namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 {
-    // Native tool-intent capture. DefinitionGateSystem calls ObserveLocalNetDefinitions after the
-    // tool-output barrier; SyncRealizeSystem calls CaptureLocalNetApply before ToolOutputSystem
-    // consumes an Apply frame. Keeping those two points separate lets the previous frame's exact
-    // preview definition describe the Temps that are about to commit.
+    // Native tool-intent capture. DefinitionGateSystem observes definitions after the tool-output
+    // barrier and also gets the last chance to publish an Apply whose graph was generated on that
+    // same frame. SyncRealizeSystem still captures the usual case earlier from the previous frame's
+    // exact preview. Together those two slots cover both a standing preview and a click that creates
+    // its first entity-visible course graph only at the barrier.
     public partial class NetSyncSystem
     {
         private const long CommittedSideEffectWindowMs = 5000;
 
         /// <summary>
         /// Refresh the active net tool's cached course definitions. An empty steady-state frame keeps
-        /// the prior cache because a motionless preview does not necessarily regenerate definitions;
-        /// a Clear frame or a different active tool invalidates it.
+        /// the prior cache because a motionless preview does not necessarily regenerate definitions.
+        /// The net tool also uses Clear while replacing a moving cursor preview, so Clear by itself
+        /// is not cancellation and must not erase the last complete native operation. Switching away
+        /// from the net tool still invalidates it.
         /// </summary>
         public void ObserveLocalNetDefinitions(NativeArray<Entity> definitions)
         {
@@ -30,13 +33,34 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (!(active is global::Game.Tools.NetToolSystem))
             {
                 _cachedLocalCourses.Clear();
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
                 return;
             }
+
+            // A network prefab may create a top-level object as the owner of its course graph.
+            // Owner-linked courses cannot be replayed as independent network placements; the
+            // complete heterogeneous batch is captured atomically by BuildSyncSystem.
+            if (global::CS2MultiplayerMod.Game.Sync.Systems.NativeObjectGraph
+                .HasNewTopLevelObjectRoot(EntityManager, definitions))
+            {
+                _cachedLocalCourses.Clear();
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
+                return;
+            }
+
             var netTool = (global::Game.Tools.NetToolSystem)active;
             bool pointOperation = netTool.actualMode == global::Game.Tools.NetToolSystem.Mode.Point;
 
             var next = new List<NetPlacementCommand>();
-            bool overflow = false;
+            // A course of this operation that cannot be expressed on the wire voids the whole native
+            // envelope. Publishing the rest would ship a self-consistent but INCOMPLETE operation
+            // (CourseCount counts only what survived) and would then suppress final-edge capture too,
+            // so the missing courses would never reach the other machines at all.
+            string rejection = null;
+            int rejected = 0;
+            var rejectedOriginalEdges = new List<Entity>();
             for (int i = 0; i < definitions.Length; i++)
             {
                 Entity entity = definitions[i];
@@ -45,38 +69,80 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     EntityManager.HasComponent<OwnerDefinition>(entity)) continue;
 
                 CreationDefinition definition = EntityManager.GetComponentData<CreationDefinition>(entity);
-                if (!IsPlainLocalNetDefinition(definition)) continue;
+                if (!IsPlainLocalNetDefinition(definition))
+                {
+                    rejected++;
+                    rejection = rejection ?? "reference an original/owner or use a non-placement mode";
+                    Entity original = definition.m_Original;
+                    if (original != Entity.Null && EntityManager.Exists(original) &&
+                        EntityManager.HasComponent<Edge>(original) &&
+                        EntityManager.HasComponent<Curve>(original) &&
+                        EntityManager.HasComponent<PrefabRef>(original) &&
+                        !rejectedOriginalEdges.Contains(original))
+                        rejectedOriginalEdges.Add(original);
+                    continue;
+                }
 
                 NetCourse course = EntityManager.GetComponentData<NetCourse>(entity);
                 // Point-mode network prefabs intentionally commit a zero-length course (for example
                 // a circular junction). Other modes' zero-length definitions are only cursor markers.
-                if (course.m_Length < 1f && !pointOperation) continue;
+                // The threshold is the realize side's degenerate limit, not a round metre: a drawn
+                // net can legitimately contain a sub-metre course (two crossings close together in
+                // one drag, a short remainder in a grid), and dropping one silently shortens the
+                // operation to a chain with a gap the receiver cannot bridge.
+                if (course.m_Length < NetPlacementCommand.MinCourseLength && !pointOperation) continue;
 
-                NetPlacementCommand command = CaptureDefinitionCommand(definition, course);
-                if (command == null) continue;
+                string unrepresentable;
+                NetPlacementCommand command = CaptureDefinitionCommand(definition, course,
+                    out unrepresentable);
+                if (command == null)
+                {
+                    if (unrepresentable == null) continue;
+                    rejected++;
+                    rejection = rejection ?? unrepresentable;
+                    continue;
+                }
                 if (next.Count >= NetPlacementCommand.MaxCoursesPerOperation)
                 {
-                    overflow = true;
+                    rejected++;
+                    rejection = "exceed the " + NetPlacementCommand.MaxCoursesPerOperation +
+                                "-course cap";
                     break;
                 }
                 next.Add(command);
             }
 
-            if (overflow)
+            if (next.Count == 0)
             {
-                _cachedLocalCourses.Clear();
-                Mod.log.Warn("[MP] NetSync: local operation exceeded the native-course cap; " +
-                             "using final-edge capture for this apply.");
+                // Nothing plain to publish. An apply made up entirely of upgrades, replaces or
+                // deletes belongs to another sync system and never had a native envelope to void,
+                // so leave the cache and stay quiet - the steady-state frame rule above applies.
+                return;
             }
-            else if (next.Count > 0)
+
+            _cachedLocalCourses.Clear();
+            if (rejection == null)
             {
-                _cachedLocalCourses.Clear();
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
                 _cachedLocalCourses.AddRange(next);
+                return;
             }
-            else if (active.applyMode == global::Game.Tools.ApplyMode.Clear)
-            {
-                _cachedLocalCourses.Clear();
-            }
+
+            _cachedFallbackOriginalEdges.Clear();
+            _cachedFallbackOriginalEdges.AddRange(rejectedOriginalEdges);
+            _cachedNeedsFinalEdgeFallback = true;
+
+            Mod.log.Warn("[MP] NetSync: local net operation cannot be replayed as one atomic apply (" +
+                         rejected + " of " + (rejected + next.Count) + " courses " + rejection +
+                         "); falling back to final-edge capture, which rebuilds it segment by segment " +
+                         "on the other machines" +
+                         (_cachedFallbackOriginalEdges.Count > 0
+                             ? "; " + _cachedFallbackOriginalEdges.Count +
+                               " Updated-only original edge(s) will use replacement capture."
+                             : "."));
+            Diagnostics.FlightRecorder.Note("net native capture voided rejected=" + rejected + "/" +
+                                              (rejected + next.Count));
         }
 
         /// <summary>
@@ -86,14 +152,69 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         /// </summary>
         public void CaptureLocalNetApply()
         {
+            CaptureLocalNetApply(refreshStandingDefinitions: true, barrierRecovery: false);
+        }
+
+        /// <summary>
+        /// Last-chance Apply capture after <see cref="global::Game.Tools.ToolOutputBarrier"/> has made
+        /// this frame's buffered definitions entity-visible. <see cref="DefinitionGateSystem"/> has
+        /// already passed those exact definitions to <see cref="ObserveLocalNetDefinitions"/>, so do
+        /// not replace them with the older untagged standing graph here.
+        /// </summary>
+        public void CaptureBufferedLocalNetApply()
+        {
+            CaptureLocalNetApply(refreshStandingDefinitions: false, barrierRecovery: true);
+        }
+
+        private void CaptureLocalNetApply(bool refreshStandingDefinitions, bool barrierRecovery)
+        {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady || _nativeApplyCapturedFrame == _realizeFrame)
+            if (service == null || !service.GameplaySyncReady ||
+                _nativeApplyCapturedFrame == _realizeFrame ||
+                _finalEdgeFallbackCapturedFrame == _realizeFrame)
                 return;
 
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
             if (!(active is global::Game.Tools.NetToolSystem) ||
-                active.applyMode != global::Game.Tools.ApplyMode.Apply ||
-                _cachedLocalCourses.Count == 0) return;
+                active.applyMode != global::Game.Tools.ApplyMode.Apply) return;
+
+            // Re-read the graph that is actually standing behind this Apply. The after-barrier cache
+            // is intentionally retained across empty preview frames, but a grid can regenerate all of
+            // its courses on the click frame. Publishing a stale or partial cache makes the final-edge
+            // fallback replay every generated edge as a separate operation. A net-owned object graph
+            // (for example a network prefab with its own root object) clears the course cache here and
+            // is captured atomically by BuildSyncSystem instead.
+            if (refreshStandingDefinitions && !_standingLocalDefinitions.IsEmptyIgnoreFilter)
+            {
+                NativeArray<Entity> definitions =
+                    _standingLocalDefinitions.ToEntityArray(Allocator.Temp);
+                try
+                {
+                    ObserveLocalNetDefinitions(definitions);
+                }
+                finally
+                {
+                    definitions.Dispose();
+                }
+            }
+            if (_cachedLocalCourses.Count == 0)
+            {
+                if (!_cachedNeedsFinalEdgeFallback) return;
+
+                global::CS2MultiplayerMod.Game.Sync.Systems.NetReplaceSyncSystem replaceSync =
+                    World.GetOrCreateSystemManaged<
+                        global::CS2MultiplayerMod.Game.Sync.Systems.NetReplaceSyncSystem>();
+                for (int i = 0; i < _cachedFallbackOriginalEdges.Count; i++)
+                    replaceSync.ExpectMixedLocalGeometryChange(_cachedFallbackOriginalEdges[i]);
+
+                Diagnostics.FlightRecorder.Note("net mixed fallback armed originals=" +
+                                                  _cachedFallbackOriginalEdges.Count +
+                                                  (barrierRecovery ? " source=barrier" : string.Empty));
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
+                _finalEdgeFallbackCapturedFrame = _realizeFrame;
+                return;
+            }
 
             // When a remote batch is armed, BeginRealizeFrame has already Disabled its Temps and
             // restored the local preview for this Apply frame. The local operation therefore commits
@@ -146,9 +267,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             }
 
             _cachedLocalCourses.Clear();
-            if (sent > 0) _nativeApplyCapturedFrame = _realizeFrame;
+            // A partial native envelope is deliberately not considered captured. The receiver will
+            // expire those fragments as one incomplete operation, while final-edge capture remains
+            // enabled to provide a complete geometry fallback for this local apply.
+            if (sent == count) _nativeApplyCapturedFrame = _realizeFrame;
             if (sent > 0)
-                Diagnostics.FlightRecorder.Note("net intent apply op=" + operationId + " courses=" + sent);
+                Diagnostics.FlightRecorder.Note("net intent apply op=" + operationId + " courses=" +
+                                                  sent + "/" + count +
+                                                  (barrierRecovery ? " source=barrier" : string.Empty));
         }
 
         /// <summary>
@@ -173,23 +299,47 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                    definition.m_Attached == Entity.Null && (definition.m_Flags & incompatible) == 0;
         }
 
-        private NetPlacementCommand CaptureDefinitionCommand(CreationDefinition definition, NetCourse course)
+        /// <summary>
+        /// Build the wire command for one course definition. A null result with a null
+        /// <paramref name="unrepresentable"/> is a deliberate skip (the game's own hidden sub-nets);
+        /// a reason means this course belongs to the operation but cannot be replayed, which voids
+        /// the native envelope.
+        /// </summary>
+        private NetPlacementCommand CaptureDefinitionCommand(CreationDefinition definition,
+            NetCourse course, out string unrepresentable)
         {
+            unrepresentable = null;
             string prefabName = PrefabNameOf(definition.m_Prefab);
-            if (string.IsNullOrEmpty(prefabName) || prefabName.StartsWith("Invisible")) return null;
+            // Hidden sub-nets are regenerated by the receiver from the visible net; an unnamed
+            // prefab is not a skip but a course that cannot be addressed on the wire, and dropping
+            // it silently would remove a link from the middle of the operation.
+            if (string.IsNullOrEmpty(prefabName))
+            {
+                unrepresentable = "use a prefab that cannot be named";
+                return null;
+            }
+            if (prefabName.StartsWith("Invisible")) return null;
 
             Bezier4x3 curve = course.m_Curve;
-            return new NetPlacementCommand
+            var command = new NetPlacementCommand
             {
                 CourseIndex = 0,
                 CourseCount = 1,
                 HasNativeCourse = true,
                 PrefabName = prefabName,
                 SubPrefabName = PrefabNameOf(definition.m_SubPrefab),
-                Ax = curve.a.x, Ay = curve.a.y, Az = curve.a.z,
-                Bx = curve.b.x, By = curve.b.y, Bz = curve.b.z,
-                Cx = curve.c.x, Cy = curve.c.y, Cz = curve.c.z,
-                Dx = curve.d.x, Dy = curve.d.y, Dz = curve.d.z,
+                Ax = curve.a.x,
+                Ay = curve.a.y,
+                Az = curve.a.z,
+                Bx = curve.b.x,
+                By = curve.b.y,
+                Bz = curve.b.z,
+                Cx = curve.c.x,
+                Cy = curve.c.y,
+                Cz = curve.c.z,
+                Dx = curve.d.x,
+                Dy = curve.d.y,
+                Dz = curve.d.z,
                 Length = course.m_Length,
                 RandomSeed = definition.m_RandomSeed,
                 CreationFlags = (uint)definition.m_Flags,
@@ -199,6 +349,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 Start = CaptureEndpoint(course.m_StartPosition),
                 End = CaptureEndpoint(course.m_EndPosition),
             };
+            const string unnamedOwner = "target an owned sub-net whose owner cannot be named";
+            if ((command.Start.Kind == NetEndpointTargetKind.OwnedNode ||
+                 command.Start.Kind == NetEndpointTargetKind.OwnedEdge) &&
+                string.IsNullOrEmpty(command.Start.OwnerPrefabName))
+            {
+                unrepresentable = unnamedOwner;
+                return null;
+            }
+            if ((command.End.Kind == NetEndpointTargetKind.OwnedNode ||
+                 command.End.Kind == NetEndpointTargetKind.OwnedEdge) &&
+                string.IsNullOrEmpty(command.End.OwnerPrefabName))
+            {
+                unrepresentable = unnamedOwner;
+                return null;
+            }
+            return command;
         }
 
         private NetEndpointIntent CaptureEndpoint(CoursePos position)
@@ -229,9 +395,16 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             Entity target = position.m_Entity;
             if (target == Entity.Null || !EntityManager.Exists(target)) return result;
 
-            result.TargetPrefabName = EntityManager.HasComponent<PrefabRef>(target)
-                ? PrefabNameOf(EntityManager.GetComponentData<PrefabRef>(target).m_Prefab)
-                : null;
+            Entity targetPrefab = EntityManager.HasComponent<PrefabRef>(target)
+                ? EntityManager.GetComponentData<PrefabRef>(target).m_Prefab
+                : Entity.Null;
+            result.TargetPrefabName = PrefabNameOf(targetPrefab);
+            if (targetPrefab != Entity.Null && EntityManager.HasComponent<NetData>(targetPrefab))
+            {
+                NetData data = EntityManager.GetComponentData<NetData>(targetPrefab);
+                result.TargetRequiredLayers = (uint)data.m_RequiredLayers;
+                result.TargetConnectLayers = (uint)data.m_ConnectLayers;
+            }
 
             if (EntityManager.HasComponent<Node>(target))
             {
@@ -255,7 +428,35 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 result.TargetCx = targetCurve.c.x; result.TargetCy = targetCurve.c.y; result.TargetCz = targetCurve.c.z;
                 result.TargetDx = targetCurve.d.x; result.TargetDy = targetCurve.d.y; result.TargetDz = targetCurve.d.z;
             }
+            if (result.Kind == NetEndpointTargetKind.OwnedNode ||
+                result.Kind == NetEndpointTargetKind.OwnedEdge)
+                CaptureEndpointOwner(target, ref result);
             return result;
+        }
+
+        private void CaptureEndpointOwner(Entity target, ref NetEndpointIntent result)
+        {
+            Entity cursor = target;
+            Entity top = Entity.Null;
+            for (int depth = 0; depth < 64 && EntityManager.HasComponent<Owner>(cursor); depth++)
+            {
+                Entity next = EntityManager.GetComponentData<Owner>(cursor).m_Owner;
+                if (next == Entity.Null || next == cursor || !EntityManager.Exists(next)) return;
+                top = next;
+                cursor = next;
+            }
+            if (top == Entity.Null || !EntityManager.HasComponent<PrefabRef>(top) ||
+                !EntityManager.HasComponent<global::Game.Objects.Transform>(top)) return;
+            result.OwnerPrefabName = PrefabNameOf(EntityManager.GetComponentData<PrefabRef>(top).m_Prefab);
+            global::Game.Objects.Transform transform =
+                EntityManager.GetComponentData<global::Game.Objects.Transform>(top);
+            result.OwnerX = transform.m_Position.x;
+            result.OwnerY = transform.m_Position.y;
+            result.OwnerZ = transform.m_Position.z;
+            result.OwnerRotX = transform.m_Rotation.value.x;
+            result.OwnerRotY = transform.m_Rotation.value.y;
+            result.OwnerRotZ = transform.m_Rotation.value.z;
+            result.OwnerRotW = transform.m_Rotation.value.w;
         }
 
         private string PrefabNameOf(Entity prefab)
@@ -267,7 +468,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
 
         private void RecordPlacementOriginals(long now)
         {
-            NativeArray<Entity> temps = _tempNetEntities.ToEntityArray(Allocator.Temp);
+            NativeArray<Entity> temps = _netTransactionTemps.ToEntityArray(Allocator.Temp);
             try
             {
                 for (int i = 0; i < temps.Length; i++)

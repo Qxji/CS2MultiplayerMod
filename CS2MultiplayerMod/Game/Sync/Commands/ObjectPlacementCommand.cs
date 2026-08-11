@@ -77,6 +77,7 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             RotY = WireGuard.ReadFinite(reader);
             RotZ = WireGuard.ReadFinite(reader);
             RotW = WireGuard.ReadFinite(reader);
+            ValidateRotation(RotX, RotY, RotZ, RotW);
             RandomSeed = reader.ReadInt();
             if (RandomSeed < 0 || RandomSeed > ushort.MaxValue)
                 throw new ProtocolException("Object random seed is outside ushort range.");
@@ -111,6 +112,13 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             var command = new ObjectPlacementCommand();
             command.Read(new NetworkReader(body));
             return command;
+        }
+
+        private static void ValidateRotation(float x, float y, float z, float w)
+        {
+            float lengthSq = x * x + y * y + z * z + w * w;
+            if (lengthSq < 0.25f || lengthSq > 2.25f)
+                throw new ProtocolException("Implausible object rotation length " + lengthSq + ".");
         }
     }
 }

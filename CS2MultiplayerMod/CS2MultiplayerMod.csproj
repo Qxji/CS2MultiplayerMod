@@ -18,6 +18,9 @@
         <Reference Include="Colossal.Core">
             <Private>false</Private>
         </Reference>
+        <Reference Include="Colossal.Collections">
+            <Private>false</Private>
+        </Reference>
         <Reference Include="Colossal.Logging">
             <Private>false</Private>
         </Reference>
@@ -40,6 +43,11 @@
             <Private>false</Private>
         </Reference>
         <Reference Include="Colossal.PSI.Common">
+            <Private>false</Private>
+        </Reference>
+        <!--Steamworks.NET, shipped with the game. Used only for the relay transport, and
+        only after a runtime probe: builds without it fall back to direct connections.-->
+        <Reference Include="com.rlabrecque.steamworks.net">
             <Private>false</Private>
         </Reference>
         <Reference Include="Unity.InputSystem">

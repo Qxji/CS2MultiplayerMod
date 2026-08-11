@@ -21,6 +21,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private AreaSyncSystem _areaSync;
         private RouteSyncSystem _routeSync;
         private TilePurchaseSyncSystem _tileSync;
+        private DisasterSyncSystem _disasterSync;
 
         protected override void OnCreate()
         {
@@ -37,6 +38,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _areaSync = World.GetOrCreateSystemManaged<AreaSyncSystem>();
             _routeSync = World.GetOrCreateSystemManaged<RouteSyncSystem>();
             _tileSync = World.GetOrCreateSystemManaged<TilePurchaseSyncSystem>();
+            _disasterSync = World.GetOrCreateSystemManaged<DisasterSyncSystem>();
         }
 
         private bool _wasDeferringTerrain;
@@ -47,10 +49,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // any feeder runs — DeleteSync/NetReplaceSync may hijack the frame before NetSync does.
             _netSync.BeginRealizeFrame();
             _buildSync.ObserveLocalToolOutput();
+            _buildSync.CaptureLocalObjectApply();
 
             // The active net tool has already selected Apply, while ToolOutputSystem has not yet
-            // consumed its standing preview. Publish the native definition cached after last
-            // frame's tool-output barrier and remember its exact split originals now.
+            // consumed its standing preview. Publish its cached native courses and remember exact
+            // split originals now. Object graphs are captured later at the dedicated pre-output
+            // hook, directly from their standing definitions and only on the Apply frame.
             _netSync.CaptureLocalNetApply();
 
             // Hold NEW net/object realizes while remote terrain edits are backlogged: a course or
@@ -92,8 +96,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _moveSync.RealizePending();
             if (!deferNetworkDependents) _netUpgradeSync.RealizePending();
             _areaSync.RealizePending();
+            _routeSync.FinalizePending();
             if (!deferNetworkDependents) _routeSync.RealizePending();
             _tileSync.RealizePending();
+            // Disaster events are plain simulation entities - no definitions, no terrain
+            // dependency - but they must still be created here: the game's event initialization
+            // runs later this frame and only ever looks at freshly Created events.
+            _disasterSync.RealizePending();
         }
     }
 }

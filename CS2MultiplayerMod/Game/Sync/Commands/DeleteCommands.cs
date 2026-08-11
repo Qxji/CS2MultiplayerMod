@@ -32,6 +32,8 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             PosX = WireGuard.ReadCoordinate(reader);
             PosY = WireGuard.ReadCoordinate(reader);
             PosZ = WireGuard.ReadCoordinate(reader);
+            if (reader.Remaining != 0)
+                throw new ProtocolException("Trailing bytes in object-delete command: " + reader.Remaining + ".");
         }
 
         public byte[] Encode()
@@ -84,6 +86,8 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             Bx = WireGuard.ReadCoordinate(reader); By = WireGuard.ReadCoordinate(reader); Bz = WireGuard.ReadCoordinate(reader);
             Cx = WireGuard.ReadCoordinate(reader); Cy = WireGuard.ReadCoordinate(reader); Cz = WireGuard.ReadCoordinate(reader);
             Dx = WireGuard.ReadCoordinate(reader); Dy = WireGuard.ReadCoordinate(reader); Dz = WireGuard.ReadCoordinate(reader);
+            if (reader.Remaining != 0)
+                throw new ProtocolException("Trailing bytes in net-delete command: " + reader.Remaining + ".");
         }
 
         public byte[] Encode()

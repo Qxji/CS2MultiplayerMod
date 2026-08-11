@@ -64,7 +64,13 @@ namespace CS2MultiplayerMod
 
             // Stand up the multiplayer core (portable session + game logger adapter) and
             // register the ECS system that pumps it once per simulation tick.
-            Service = new MultiplayerService(new ColossalModLogger(log));
+            var coreLog = new ColossalModLogger(log);
+
+            // Offer Steam's relay as a hosting backend. Availability is decided here once;
+            // when Steam is absent the mod simply keeps to direct connections.
+            Core.Networking.Steam.SteamRelayProvider.Register(coreLog);
+
+            Service = new MultiplayerService(coreLog);
             FlightRecorder.Note("startup-stage service-created");
             log.Info("Multiplayer core initialised. Protocol v" +
                      CS2MultiplayerMod.Core.Protocol.ProtocolConstants.ProtocolVersion +
@@ -75,7 +81,7 @@ namespace CS2MultiplayerMod
             // screen pauses the simulation, which previously froze all connection
             // handling exactly while the player was looking at the connect buttons.
             updateSystem.UpdateAt<MultiplayerSystem>(SystemUpdatePhase.UIUpdate);
-            // Bindings for the main-menu "Join Game" dialog (UI module in UI/).
+            // Bindings for the main-menu multiplayer screen (UI module in UI/).
             updateSystem.UpdateAt<MultiplayerUISystem>(SystemUpdatePhase.UIUpdate);
             // UIUpdate, not GameSimulation: the GameSimulation phase stops ticking the
             // moment the game is paused (selectedSpeed 0), so a system there can never
@@ -115,6 +121,11 @@ namespace CS2MultiplayerMod
             updateSystem.UpdateAt<Game.Sync.Systems.AreaSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.RouteSyncSystem>(SystemUpdatePhase.ModificationEnd);
             updateSystem.UpdateAt<Game.Sync.Systems.TilePurchaseSyncSystem>(SystemUpdatePhase.ModificationEnd);
+            // ModificationEnd, after the game's event initialization at Modification2: that pass is
+            // what turns a bare disaster event into a placed one (position, radius, duration), and
+            // the Created tag it keys on is gone by the next frame. Capturing here reads the
+            // resolved disaster, not an empty shell.
+            updateSystem.UpdateAt<Game.Sync.Systems.DisasterSyncSystem>(SystemUpdatePhase.ModificationEnd);
             // UIUpdate, NOT GameSimulation: dev-tree nodes can be purchased while the game
             // is paused (the progression panel works paused, and a node's Locked clears
             // outside the simulation loop), but GameSimulation freezes at selectedSpeed 0.
@@ -126,14 +137,28 @@ namespace CS2MultiplayerMod
             // that points channel, the local spend and the host's deduction keep pace whether
             // the game is paused or not.
             updateSystem.UpdateAt<Game.Sync.Systems.DevTreeSyncSystem>(SystemUpdatePhase.UIUpdate);
+            // The visual menu mutates render/building state directly and is usable while paused.
+            // Observe it after SelectedInfoUISystem so the resulting state is captured, not UI intent.
+            updateSystem.UpdateAfter<Game.Sync.Systems.VisualCustomizationSyncSystem,
+                global::Game.UI.InGame.SelectedInfoUISystem>(SystemUpdatePhase.UIUpdate);
             // Realization must run at ToolUpdate: definition entities are consumed at
             // Modification1 and their Updated tag is stripped at Cleanup, so a definition
             // spawned at ModificationEnd is never realized (see SyncRealizeSystem).
+            // Repair stranded movers at the front of ToolUpdate, before the default tool can
+            // hover/select an invalid legacy instance. The sweep is one-shot per world load and
+            // internally frame-budgeted for large cities.
+            updateSystem.UpdateBefore<Game.Sync.Systems.WorldRepairSystem>(
+                SystemUpdatePhase.ToolUpdate);
             // Complete remote terrain GPU readback at the very start of ToolUpdate, before a local
             // road/object tool can generate a preview from stale CPU heights.
             updateSystem.UpdateBefore<Game.Sync.Systems.TerrainReadbackBarrierSystem>(
                 SystemUpdatePhase.ToolUpdate);
             updateSystem.UpdateAt<Game.Sync.Systems.SyncRealizeSystem>(SystemUpdatePhase.ToolUpdate);
+            // Capture one-frame object lifecycle applies after the active object/upgrade tool made
+            // its decision but before ToolOutputSystem consumes the complete standing definition
+            // graph. This is the only frame that serializes the graph; hover previews stay cheap.
+            updateSystem.UpdateBefore<Game.Sync.Systems.ObjectToolApplyCaptureSystem,
+                global::Game.Tools.ToolOutputSystem>(SystemUpdatePhase.ToolUpdate);
             // After ToolOutputBarrier: tools record their definitions through that end-of-phase
             // buffer, so this is the first (and only) slot where they exist as entities but have
             // not been consumed - the gate keeps them out of an armed net commit (see there).

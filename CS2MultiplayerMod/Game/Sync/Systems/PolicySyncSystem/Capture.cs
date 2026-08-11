@@ -16,6 +16,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             ScanKind(session, now, _districts, EntityPolicyCommand.KindDistrict);
             ScanKind(session, now, _routes, EntityPolicyCommand.KindRoute);
             ScanKind(session, now, _buildings, EntityPolicyCommand.KindBuilding);
+            // Disabling a service upgrade is the "Out of Service" policy on the owned upgrade entity.
+            ScanKind(session, now, _ownedUpgrades, EntityPolicyCommand.KindBuilding,
+                playerUpgradesOnly: true);
 
             // Swap: entities that vanished fall out of the cache automatically.
             var swap = _known;
@@ -26,7 +29,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _primed = true;
         }
 
-        private void ScanKind(MultiplayerSession session, long now, EntityQuery query, byte kind)
+        private void ScanKind(MultiplayerSession session, long now, EntityQuery query, byte kind,
+            bool playerUpgradesOnly = false)
         {
             if (query.IsEmptyIgnoreFilter) return;
 
@@ -36,13 +40,21 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 for (int i = 0; i < entities.Length; i++)
                 {
                     Entity entity = entities[i];
-                    string targetName = _prefabSystem.GetPrefabName(EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab);
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                    // Both tool entry points for an upgrade require ServiceUpgradeData, so anything
+                    // else parented to a building is lot content the simulation spawns and despawns
+                    // (a storage yard's container piles) - never a player's on/off decision.
+                    if (playerUpgradesOnly &&
+                        !EntityManager.HasComponent<ServiceUpgradeData>(prefab)) continue;
+                    string targetName = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(targetName)) continue;
 
                     float3 anchor;
                     if (!TryAnchor(kind, entity, out anchor)) continue;
 
-                    var current = ReadPolicies(entity);
+                    var current = playerUpgradesOnly
+                        ? ReadUpgradePolicies(entity)
+                        : ReadPolicies(entity);
                     List<PolicyEntry> old;
                     bool had = _known.TryGetValue(entity, out old);
                     _next[entity] = current;

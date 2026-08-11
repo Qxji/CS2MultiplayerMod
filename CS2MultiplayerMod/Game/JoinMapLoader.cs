@@ -57,6 +57,12 @@ namespace CS2MultiplayerMod.Game
                 File.WriteAllBytes(path, saveBytes);
                 log.Info("[MP] Host world staged at '" + path + "' (" + (saveBytes.Length / 1024) + " KB).");
                 log.Info("[MP] Host world received (" + (saveBytes.Length / 1024) + " KB); loading into game...");
+
+                // Claim the load before starting it: the session watcher treats a world swap
+                // it did not ask for as the player walking out of the session. Claimed here
+                // rather than at the Load call so the fallback below - the player loading the
+                // staged world by hand after an index miss - is covered by the same mark.
+                if (Mod.Service != null) Mod.Service.ExpectOwnWorldLoad();
                 return TryLoad(log);
             }
             catch (Exception ex)

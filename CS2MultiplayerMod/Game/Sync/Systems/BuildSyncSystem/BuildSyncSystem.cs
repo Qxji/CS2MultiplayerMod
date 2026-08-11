@@ -50,6 +50,12 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private long _diagStartMs = -1;
         private int _diagTotal;
 
+        // Commands refused because their prefab belongs to simulation spawning rather than
+        // player placement. Aggregate them: a bad peer can otherwise produce hundreds of
+        // warnings per second while we are protecting the world from the flood.
+        private readonly Dictionary<string, int> _refused = new Dictionary<string, int>();
+        private int _refusedTotal;
+
         // Diagnostic probes: how many entities each successive filter sees, so a quiet log
         // pinpoints whether the update phase is even seeing freshly-Created entities.
         private int _hbUpdates, _hbAnyCreated, _hbCreatedPrefab, _hbCreatedTransform, _hbFiltered;
@@ -57,9 +63,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private PrefabSystem _prefabSystem;
         private PrefabIndex _prefabIndex;
+        private CityStateSyncSystem _cityStateSync;
         private ToolSystem _toolSystem;
+        private AreaToolSystem _areaToolSystem;
+        private bool _localObjectToolRanThisFrame;
+        private bool _localNetToolRanThisFrame;
         private bool _localObjectApplyThisFrame;
+        // The object/upgrade tool that was active until it applied and handed activeTool back to the
+        // default tool. Valid for that one frame only - see ObserveLocalToolOutput. Owned-area
+        // handoffs have their own explicit recreate marker and do not depend on prior-frame state.
+        private global::Game.Tools.ToolBaseSystem _switchedAwayObjectTool;
+        // The move tool clears its control-point list as it applies. Sample the standing snapped
+        // point on preview frames so the apply capture can still recover its destination net parent.
+        private ControlPoint _lastObjectToolControlPoint;
+        private bool _hasLastObjectToolControlPoint;
+        // The stamp placement the standing definitions were generated from. An asset stamp travels
+        // as this one point plus its prefab and tool seed, so the peer regenerates the graph rather
+        // than rebuilding it from transmitted definitions.
+        private ControlPoint _lastStampControlPoint;
+        private bool _hasLastStampControlPoint;
+        private bool _partialPlacementRecoveryRequested;
         private EntityQuery _createdObjects;
+        private EntityQuery _createdAppliedObjects;
         private EntityQuery _liveNodes;
         private EntityQuery _liveEdges;
         private EntityQuery _liveStaticObjects;
@@ -73,18 +98,39 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         private ComponentLookup<NetGeometryData> _netGeometryLookup;
         private ComponentLookup<SpawnableObjectData> _spawnableObjectLookup;
 
+        // A building's connection nets are not laid at their prefab-local height: the game snaps each
+        // course to the terrain, or to the host building's lot surface when it has one. Reproducing
+        // that needs the height/water fields plus the five lookups CalculateLotInfo reads. See
+        // RealizeSubNetCourse.
+        private global::Game.Simulation.TerrainSystem _terrainSystem;
+        private global::Game.Simulation.WaterSystem _waterSystem;
+        private ComponentLookup<global::Game.Objects.Transform> _transformLookup;
+        private ComponentLookup<PrefabRef> _prefabRefLookup;
+        private ComponentLookup<ObjectGeometryData> _objectGeometryLookup;
+        private ComponentLookup<BuildingTerraformData> _buildingTerraformLookup;
+        private ComponentLookup<BuildingExtensionData> _buildingExtensionLookup;
+
         protected override void OnCreate()
         {
             base.OnCreate();
 
             Mod.log.Info(nameof(BuildSyncSystem) + " ready.");
             _prefabSystem = World.GetOrCreateSystemManaged<PrefabSystem>();
+            _cityStateSync = World.GetOrCreateSystemManaged<CityStateSyncSystem>();
             _toolSystem = World.GetOrCreateSystemManaged<ToolSystem>();
+            _areaToolSystem = World.GetOrCreateSystemManaged<AreaToolSystem>();
             _prefabIndex = new PrefabIndex(_prefabSystem, GetEntityQuery(ComponentType.ReadOnly<PrefabData>()));
 
             _cityConfig = World.GetOrCreateSystemManaged<CityConfigurationSystem>();
             _netGeometryLookup = GetComponentLookup<NetGeometryData>(isReadOnly: true);
             _spawnableObjectLookup = GetComponentLookup<SpawnableObjectData>(isReadOnly: true);
+            _terrainSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.TerrainSystem>();
+            _waterSystem = World.GetOrCreateSystemManaged<global::Game.Simulation.WaterSystem>();
+            _transformLookup = GetComponentLookup<global::Game.Objects.Transform>(isReadOnly: true);
+            _prefabRefLookup = GetComponentLookup<PrefabRef>(isReadOnly: true);
+            _objectGeometryLookup = GetComponentLookup<ObjectGeometryData>(isReadOnly: true);
+            _buildingTerraformLookup = GetComponentLookup<BuildingTerraformData>(isReadOnly: true);
+            _buildingExtensionLookup = GetComponentLookup<BuildingExtensionData>(isReadOnly: true);
 
             // Top-level objects created this frame: prefab + transform, not a tool preview
             // (Temp), not an owned sub-object (Owner), not being deleted, not a net edge.
@@ -102,6 +148,30 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     ComponentType.ReadOnly<Owner>(),
                     ComponentType.ReadOnly<Deleted>(),
                     ComponentType.ReadOnly<global::Game.Net.Edge>(),
+                    ComponentType.ReadOnly<global::Game.Objects.Moving>(),
+                    ComponentType.ReadOnly<global::Game.Vehicles.Vehicle>(),
+                    ComponentType.ReadOnly<global::Game.Creatures.Creature>(),
+                },
+            });
+
+            // Full object-tool transactions can commit through an owned extension rather than a
+            // top-level object. Keep a narrow Applied query for correlating either kind with the
+            // exact preview graph cached before the click.
+            _createdAppliedObjects = GetEntityQuery(new EntityQueryDesc
+            {
+                All = new[]
+                {
+                    ComponentType.ReadOnly<Created>(),
+                    ComponentType.ReadOnly<Applied>(),
+                    ComponentType.ReadOnly<PrefabRef>(),
+                    ComponentType.ReadOnly<Transform>(),
+                    ComponentType.ReadOnly<PseudoRandomSeed>(),
+                    ComponentType.ReadOnly<global::Game.Objects.Object>(),
+                },
+                None = new[]
+                {
+                    ComponentType.ReadOnly<Temp>(),
+                    ComponentType.ReadOnly<Deleted>(),
                 },
             });
 
@@ -152,9 +222,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _diagCreatedTransform = GetEntityQuery(
                 ComponentType.ReadOnly<Created>(), ComponentType.ReadOnly<PrefabRef>(), ComponentType.ReadOnly<Transform>());
 
+            InitializeNativeObjectOperations();
+            InitializeNativeDerive();
+
             if (Mod.Service != null)
             {
-                _observer = new CommandObserver(_incoming, ObjectPlacementCommand.Id);
+                _observer = new CommandObserver(_incoming,
+                    ObjectPlacementCommand.Id, ObjectToolOperationCommand.Id,
+                    AssetStampCommand.Id)
+                {
+                    MaxBodyBytes = ObjectToolOperationCommand.MaxEncodedBytes,
+                };
                 Mod.Service.Session.AddObserver(_observer);
             }
             SyncInbox.RegisterDrain(DrainQueue);
@@ -172,8 +250,23 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         {
             SyncInbox.Clear(_incoming);
             _attachRetry.Clear();
+            DrainNativeObjectOperations();
+            _cachedLocalObjectOperation = null;
+            ClearRecentLocalObjectOperations();
+            _selectedAssetStampPrefabName = null;
+            ClearSpecializedAreaCapture();
+            _nativeLifecycleCapturedThisFrame = false;
+            _localObjectToolRanThisFrame = false;
+            _localNetToolRanThisFrame = false;
             _localObjectApplyThisFrame = false;
+            _switchedAwayObjectTool = null;
+            _hasLastObjectToolControlPoint = false;
+            _hasLastStampControlPoint = false;
+            _localLifecycleApplyThisFrame = false;
+            _partialPlacementRecoveryRequested = false;
             DeferForTerrain = false;
+            _refused.Clear();
+            _refusedTotal = 0;
         }
 
         protected override void OnUpdate()
@@ -181,36 +274,141 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             MultiplayerService service = Mod.Service;
             if (service == null) return;
 
-            // Diagnostic sampling runs every frame so the 5 s summary reflects peak visibility.
+            bool ready = service.GameplaySyncReady;
             _hbUpdates++;
-            _hbAnyCreated = System.Math.Max(_hbAnyCreated, _diagAnyCreated.CalculateEntityCount());
-            _hbCreatedPrefab = System.Math.Max(_hbCreatedPrefab, _diagCreatedPrefab.CalculateEntityCount());
-            _hbCreatedTransform = System.Math.Max(_hbCreatedTransform, _diagCreatedTransform.CalculateEntityCount());
-            _hbFiltered = System.Math.Max(_hbFiltered, _createdObjects.CalculateEntityCount());
+            // These probes walk broad Created queries. They are troubleshooting-only work,
+            // so keep them off the normal frame path unless their verbose summary is enabled.
+            if (ready && Mod.Setting != null && Mod.Setting.VerboseLogging)
+            {
+                _hbAnyCreated = System.Math.Max(_hbAnyCreated, _diagAnyCreated.CalculateEntityCount());
+                _hbCreatedPrefab = System.Math.Max(_hbCreatedPrefab, _diagCreatedPrefab.CalculateEntityCount());
+                _hbCreatedTransform = System.Math.Max(_hbCreatedTransform, _diagCreatedTransform.CalculateEntityCount());
+                _hbFiltered = System.Math.Max(_hbFiltered, _createdObjects.CalculateEntityCount());
+            }
 
             long now = service.NowMs;
             MultiplayerSession session = service.Session;
-            if (service.GameplaySyncReady)
+            if (ready)
             {
+                CaptureCompletedSpecializedArea();
+                PrioritizeCreatedTrees(session);
                 _guard.Prune(now);
+                TryPublishCommittedObjectGraph(now);
                 CaptureNewObjects(session, now);
             }
             else DrainQueue();
             _localObjectApplyThisFrame = false;
-            FlushDiagnostics(now, service.GameplaySyncReady);
+            FlushDiagnostics(now, ready);
+        }
+
+        private void PrioritizeCreatedTrees(MultiplayerSession session)
+        {
+            if (session.Role != SessionRole.Host || _createdObjects.IsEmptyIgnoreFilter) return;
+            NativeArray<Entity> entities = _createdObjects.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                    if (EntityManager.HasComponent<Tree>(entities[i]))
+                        _cityStateSync.PrioritizeTree(entities[i]);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
         }
 
         /// <summary>
         /// Remember the ToolUpdate decision that can produce Created objects later this frame.
         /// Some one-shot placements leave the object tool before ModificationEnd, so checking the
         /// active tool only at capture time loses the placement entirely.
+        ///
+        /// ToolSystem drives the whole ToolUpdate phase from inside its own update, so by the time
+        /// any of our systems run the active tool has already made its decision this frame. A
+        /// one-shot action can assign the default tool, or the owned-area editor for a
+        /// non-overlapping lot, to <c>activeTool</c> as part of applying. Reading only
+        /// <c>activeTool</c> is blind on exactly that frame. Keep the last object-lifecycle tool for
+        /// one frame and accept only those two engine-owned transitions.
         /// </summary>
         public void ObserveLocalToolOutput()
         {
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
-            _localObjectApplyThisFrame = active is ObjectToolSystem &&
-                                         active.applyMode == ApplyMode.Apply;
+            ObjectToolSystem activeObjectTool = active as ObjectToolSystem;
+            if (activeObjectTool != null)
+            {
+                if (activeObjectTool.actualMode == ObjectToolSystem.Mode.Move)
+                    RememberObjectToolControlPoint(activeObjectTool);
+                else
+                    _hasLastObjectToolControlPoint = false;
+
+                // The apply frame's capture runs at ToolUpdate, before this sample, so it reads the
+                // preview point that actually produced the definitions now committing.
+                if (activeObjectTool.actualMode == ObjectToolSystem.Mode.Stamp)
+                    RememberStampControlPoint(activeObjectTool);
+                else
+                    _hasLastStampControlPoint = false;
+            }
+            Entity recreatedArea = _areaToolSystem != null
+                ? _areaToolSystem.recreate
+                : Entity.Null;
+            // A non-overlapping owned lot is one lifecycle action split across two tools. The
+            // object tool leaves an applying graph standing, assigns that lot to AreaTool.recreate,
+            // and switches activeTool before later observers run. ToolSystem.applyMode still belongs
+            // to the tool that ran this phase, so this conjunction identifies exactly the transition
+            // frame rather than every frame spent drawing the area.
+            bool objectToOwnedAreaHandoff =
+                active is AreaToolSystem &&
+                recreatedArea != Entity.Null &&
+                _toolSystem != null &&
+                _toolSystem.applyMode == ApplyMode.Apply &&
+                _objectToolSystem != null &&
+                _objectToolSystem.applyMode == ApplyMode.Apply;
+
+            // Conversely, closing or cancelling that polygon switches activeTool back before the
+            // area tool's output is consumed. The object tool is current at that point but did not
+            // run, and its old ApplyMode must not be interpreted as a second object placement.
+            bool returningFromOwnedArea =
+                active is ObjectToolSystem &&
+                recreatedArea != Entity.Null;
+            bool activeLifecycleToolRan =
+                IsObjectLifecycleTool(active) && !returningFromOwnedArea;
+            _localNetToolRanThisFrame = active is global::Game.Tools.NetToolSystem;
+            // Default hand-backs and recreate-area handoffs are engine-owned transitions. Any
+            // other different build tool is a user action and must not inherit the prior tool's
+            // Apply state.
+            global::Game.Tools.ToolBaseSystem lifecycleTool = null;
+            if (activeLifecycleToolRan)
+                lifecycleTool = active;
+            else if (objectToOwnedAreaHandoff)
+                lifecycleTool = _objectToolSystem;
+            else if (active is global::Game.Tools.DefaultToolSystem)
+                lifecycleTool = _switchedAwayObjectTool;
+            // Consumed after one frame: only the switch-away frame still belongs to that tool.
+            _switchedAwayObjectTool = activeLifecycleToolRan ? active : null;
+
+            bool applying = lifecycleTool != null &&
+                            lifecycleTool.applyMode == ApplyMode.Apply;
+            RememberSelectedAssetStampPrefab(lifecycleTool);
+            SampleLifecycleToolSeed(lifecycleTool);
+            _localObjectToolRanThisFrame = activeLifecycleToolRan || applying;
+            _localObjectApplyThisFrame = applying;
+            _localLifecycleApplyThisFrame = _localObjectApplyThisFrame;
+
+            if (objectToOwnedAreaHandoff && applying)
+                Diagnostics.FlightRecorder.Note(
+                    "object lifecycle apply retained across owned-area handoff");
         }
+
+        // Sampled at ToolUpdate and kept for the rest of the frame, unlike
+        // _localObjectApplyThisFrame which capture paths consume and clear.
+        private bool _localLifecycleApplyThisFrame;
+
+        /// <summary>
+        /// True for the whole frame in which a local object-lifecycle tool applied. A placement,
+        /// upgrade or relocation removes whatever its footprint covers - lot sub-nets, sub-areas,
+        /// props - and the receiver reproduces those removals from the same action, so they must not
+        /// also be captured as bulldozes.
+        /// </summary>
+        public bool LocalObjectLifecycleAppliedThisFrame => _localLifecycleApplyThisFrame;
 
         /// <summary>
         /// Called by <see cref="SyncRealizeSystem"/> during ToolUpdate. Definitions realize
@@ -235,6 +433,14 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             int count;
             _diag.TryGetValue(prefabName, out count);
             _diag[prefabName] = count + 1;
+        }
+
+        private void RecordRefused(string prefabName)
+        {
+            _refusedTotal++;
+            int count;
+            _refused.TryGetValue(prefabName, out count);
+            _refused[prefabName] = count + 1;
         }
 
         private void FlushDiagnostics(long now, bool connected)
@@ -266,6 +472,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Mod.Verbose(sb.ToString());
             }
 
+            if (_refusedTotal > 0)
+            {
+                var sb = new StringBuilder();
+                sb.Append("[MP] BuildSync realize: refused ").Append(_refusedTotal)
+                  .Append(" simulation-only placement(s) in the last 5s [");
+                int n = 0;
+                foreach (KeyValuePair<string, int> pair in _refused)
+                {
+                    if (n > 0) sb.Append(", ");
+                    sb.Append(pair.Key).Append(" x").Append(pair.Value);
+                    if (++n >= 10) { sb.Append(", ..."); break; }
+                }
+                sb.Append(']');
+                Mod.log.Warn(sb.ToString());
+                _refused.Clear();
+                _refusedTotal = 0;
+            }
+
             _diag.Clear();
             _diagTotal = 0;
             _diagStartMs = now;
@@ -274,23 +498,71 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureNewObjects(MultiplayerSession session, long now)
         {
-            if (_createdObjects.IsEmptyIgnoreFilter) return;
-
-            // Narrow capture to genuine player placements: tool-applied objects appear
-            // on frames where the object tool is active. Simulation-spawned objects
-            // (zone growth, sub-spawns) arrive regardless of the active tool, so
-            // requiring it filters them out. (In-game verification tracked in docs.)
-            if (!_localObjectApplyThisFrame) return;
+            if (_createdObjects.IsEmptyIgnoreFilter || _nativeLifecycleCapturedThisFrame ||
+                (_nativeNetCoordinator != null && _nativeNetCoordinator.DidCommitObjectGraphThisFrame)) return;
+            // Specialized-industry placement is not committed until its area-tool polygon closes.
+            // Its initial building root must never publish the incomplete object half here.
+            if (_pendingSpecializedObjectOperation != null ||
+                (_areaToolSystem != null && _areaToolSystem.recreate != Entity.Null)) return;
 
             NativeArray<Entity> entities = _createdObjects.ToEntityArray(Allocator.Temp);
             try
             {
+                var localCreated = new List<Entity>(entities.Length);
                 for (int i = 0; i < entities.Length; i++)
                 {
                     Entity entity = entities[i];
                     Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
                     string name = _prefabSystem.GetPrefabName(prefab);
+                    if (string.IsNullOrEmpty(name) || IsSimulationOnlyPlacementPrefab(prefab))
+                        continue;
+                    Transform transform = EntityManager.GetComponentData<Transform>(entity);
+                    if (_guard.Consume(ReplicationGuard.Key(name, transform.m_Position), now))
+                        continue;
+                    localCreated.Add(entity);
+                }
+
+                if (localCreated.Count == 0) return;
+
+                // A committed root is a stronger signal than the transient tool Apply pulse. Its
+                // prefab, transform, and random seed select the exact recent preview graph.
+                if (TryPublishMatchingRecentLocalObjectOperation(localCreated, now)) return;
+
+                // Record every failed graph correlation, including the original failure mode where
+                // the one-frame Apply pulse was not sampled. Apply still gates the reduced fallback.
+                NoteCommittedObjectGraphMiss(localCreated);
+
+                // Only the reduced compatibility fallback still depends on the tool Apply sample.
+                if (!_localObjectApplyThisFrame) return;
+
+                for (int i = 0; i < localCreated.Count; i++)
+                {
+                    Entity entity = localCreated[i];
+                    Entity prefab = EntityManager.GetComponentData<PrefabRef>(entity).m_Prefab;
+                    string name = _prefabSystem.GetPrefabName(prefab);
                     if (string.IsNullOrEmpty(name)) continue;
+
+                    // The final-entity path is only a compatibility fallback. Simulation
+                    // movers and zone-grown buildings can be Created on the same frame as a
+                    // real tool apply, but they are not part of that player action.
+                    if (IsSimulationOnlyPlacementPrefab(prefab)) continue;
+
+                    if (RequiresCompleteObjectLifecycle(prefab))
+                    {
+                        // Buildings and prefabs with owned elements must never enter the reduced
+                        // placement channel: it cannot preserve their complete subobject, network,
+                        // area, terrain, and attachment transaction.
+                        if (!_partialPlacementRecoveryRequested)
+                        {
+                            _partialPlacementRecoveryRequested = true;
+                            Mod.log.Error("[MP] BuildSync: complete lifecycle capture was missed for '" +
+                                          name + "'; requesting (debounced) world recovery instead of " +
+                                          "sending a partial object graph. " +
+                                          (_lastObjectGraphMissDetail ?? "no correlation detail"));
+                            Mod.Service.RequestAutomaticWorldRecovery("building placement capture missed");
+                        }
+                        continue;
+                    }
 
                     Transform transform = EntityManager.GetComponentData<Transform>(entity);
                     int randomSeed = EntityManager.HasComponent<PseudoRandomSeed>(entity)
@@ -299,9 +571,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                     float age = EntityManager.HasComponent<Tree>(entity)
                         ? TreeAge(EntityManager.GetComponentData<Tree>(entity))
                         : 0f;
-
-                    // Skip objects we just realized from a remote command — don't echo them.
-                    if (_guard.Consume(ReplicationGuard.Key(name, transform.m_Position), now)) continue;
 
                     // A net object (roundabout island, turn-restriction sign) is inert without its
                     // parent: the ring and the restriction are derived from the parent's sub-objects,
@@ -356,6 +625,46 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 default: age = growth / 2560f; break;
             }
             return math.clamp(age, 0f, 1f);
+        }
+
+        /// <summary>
+        /// True for prefabs whose live instances must be created by simulation ownership
+        /// machinery, never by a standalone multiplayer placement definition.
+        /// </summary>
+        private bool IsSimulationOnlyPlacementPrefab(Entity prefab)
+        {
+            if (prefab == Entity.Null || !EntityManager.Exists(prefab)) return true;
+            if (EntityManager.HasComponent<MovingObjectData>(prefab)) return true;
+            return EntityManager.HasComponent<SpawnableBuildingData>(prefab) &&
+                   !EntityManager.HasComponent<SignatureBuildingData>(prefab);
+        }
+
+        /// <summary>
+        /// True when a final root transform is not a complete representation of the placement.
+        /// These prefabs must travel through the native atomic object-lifecycle command.
+        /// </summary>
+        private bool RequiresCompleteObjectLifecycle(Entity prefab)
+        {
+            if (IsNetObjectPlacement(prefab)) return false;
+
+            return EntityManager.HasComponent<BuildingData>(prefab) ||
+                   EntityManager.HasComponent<TransportStopData>(prefab) ||
+                   EntityManager.HasBuffer<global::Game.Prefabs.SubObject>(prefab) ||
+                   EntityManager.HasBuffer<global::Game.Prefabs.SubNet>(prefab) ||
+                   EntityManager.HasBuffer<global::Game.Prefabs.SubArea>(prefab);
+        }
+
+        /// <summary>
+        /// A net object (roundabout island, turn-restriction sign) is described completely by prefab,
+        /// transform and attach anchor: the receiver regenerates its owned elements from the prefab
+        /// and tags the parent itself. Decorated variants carry sub-objects, which would otherwise
+        /// pin them to the native path where a capture miss escalates to a whole-world reload.
+        /// </summary>
+        private bool IsNetObjectPlacement(Entity prefab)
+        {
+            return EntityManager.HasComponent<global::Game.Prefabs.NetObjectData>(prefab) &&
+                   !EntityManager.HasComponent<BuildingData>(prefab) &&
+                   !EntityManager.HasComponent<TransportStopData>(prefab);
         }
 
 

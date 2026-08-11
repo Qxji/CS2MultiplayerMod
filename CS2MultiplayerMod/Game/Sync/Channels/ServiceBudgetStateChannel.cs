@@ -97,11 +97,14 @@ namespace CS2MultiplayerMod.Game.Sync.Channels
             }
             if (_serviceByName.TryGetValue(name, out entity)) return entity;
 
-            // Fallback: a service the receiver has never adjusted is not in the buffer yet,
-            // so scan prefabs once to map every name.
+            // Fallback: a service the receiver has never adjusted is not in the buffer yet.
+            // Restrict lookup to actual service prefabs: prefab names are not globally unique,
+            // and CityServiceBudgetSystem rejects an entity that is not one of its services.
             if (!_prefabQueryReady)
             {
-                _prefabQuery = em.CreateEntityQuery(ComponentType.ReadOnly<PrefabData>());
+                _prefabQuery = em.CreateEntityQuery(
+                    ComponentType.ReadOnly<PrefabData>(),
+                    ComponentType.ReadOnly<ServiceData>());
                 _prefabQueryReady = true;
             }
             NativeArray<Entity> prefabs = _prefabQuery.ToEntityArray(Allocator.Temp);

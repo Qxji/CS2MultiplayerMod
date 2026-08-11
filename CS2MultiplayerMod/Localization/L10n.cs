@@ -21,8 +21,12 @@ namespace CS2MultiplayerMod.Localization
         /// </summary>
         public static class Key
         {
-            // -- Main-menu Join Game dialog (read by the UI module via useLocalization) --
+            // -- Main-menu multiplayer screen (read by the UI module via useLocalization) --
             public const string UiJoinGame = "CS2MP.UI.JoinGame";
+            public const string UiHostGame = "CS2MP.UI.HostGame";
+            public const string UiHostWorldTitle = "CS2MP.UI.HostWorldTitle";
+            public const string UiLoadWorld = "CS2MP.UI.LoadWorld";
+            public const string UiCreateWorld = "CS2MP.UI.CreateWorld";
             public const string UiDialogTitle = "CS2MP.UI.DialogTitle";
             public const string UiPlayerName = "CS2MP.UI.PlayerName";
             public const string UiHostAddress = "CS2MP.UI.HostAddress";
@@ -47,6 +51,22 @@ namespace CS2MultiplayerMod.Localization
             public const string UiSyncWorld = "CS2MP.UI.SyncWorld";
             public const string UiLockedInSession = "CS2MP.UI.LockedInSession";
             public const string UiPlayers = "CS2MP.UI.Players";
+            public const string UiHost = "CS2MP.UI.Host";
+            public const string UiYou = "CS2MP.UI.You";
+            public const string UiKick = "CS2MP.UI.Kick";
+            public const string UiConfirmKick = "CS2MP.UI.ConfirmKick";
+            public const string UiBan = "CS2MP.UI.Ban";
+            public const string UiConfirmBan = "CS2MP.UI.ConfirmBan";
+            public const string UiBanHint = "CS2MP.UI.BanHint";
+            public const string UiCancelKick = "CS2MP.UI.CancelKick";
+            public const string UiSendingWorld = "CS2MP.UI.SendingWorld";
+            public const string UiTryThis = "CS2MP.UI.TryThis";
+            public const string UiRequireApproval = "CS2MP.UI.RequireApproval";
+            public const string UiJoinRequestTitle = "CS2MP.UI.JoinRequestTitle";
+            // {0} = joining player's name.
+            public const string UiJoinRequestBody = "CS2MP.UI.JoinRequestBody";
+            public const string UiAccept = "CS2MP.UI.Accept";
+            public const string UiDecline = "CS2MP.UI.Decline";
 
             // -- One-time disclaimer gate (shown before first host/join) --
             public const string UiDisclaimerTitle = "CS2MP.UI.DisclaimerTitle";
@@ -81,21 +101,85 @@ namespace CS2MultiplayerMod.Localization
             public const string AccessOpen = "CS2MP.Status.AccessOpen";
             public const string ExposureInternet = "CS2MP.Status.ExposureInternet";
             public const string ExposureLan = "CS2MP.Status.ExposureLan";
+            public const string ExposureRelay = "CS2MP.Status.ExposureRelay";
+            public const string ExposureRelayClient = "CS2MP.Status.ExposureRelayClient";
+            public const string ExposureForwarding = "CS2MP.Status.ExposureForwarding";
+            public const string ExposureForwarded = "CS2MP.Status.ExposureForwarded";
+            public const string ExposureForwardedAt = "CS2MP.Status.ExposureForwardedAt";
+            public const string ExposureForwardManually = "CS2MP.Status.ExposureForwardManually";
             public const string WorldNone = "CS2MP.Status.WorldNone";
             public const string WorldHosting = "CS2MP.Status.WorldHosting";
             public const string WorldMapProgress = "CS2MP.Status.WorldMapProgress";
             public const string WorldLoaded = "CS2MP.Status.WorldLoaded";
             public const string PhaseWaitingForMap = "CS2MP.Status.WaitingForMap";
             public const string PhaseLoadingMap = "CS2MP.Status.LoadingMap";
+            public const string PhaseSynchronizing = "CS2MP.Status.Synchronizing";
+            public const string PhaseFinishingSetup = "CS2MP.Status.FinishingSetup";
+            public const string TitlePlayerJoining = "CS2MP.Status.PlayerJoining";
+            public const string TitlePlayersJoining = "CS2MP.Status.PlayersJoining";
+            public const string TitleRefreshingWorld = "CS2MP.Status.RefreshingWorld";
             public const string TitleModDisabled = "CS2MP.Status.ModDisabled";
             public const string TitleConnectionFailed = "CS2MP.Status.ConnectionFailed";
             public const string TitleHosting = "CS2MP.Status.Hosting";
+            public const string TitleAwaitingApproval = "CS2MP.Status.AwaitingApproval";
+            public const string DetailAwaitingApproval = "CS2MP.Status.DetailAwaitingApproval";
             public const string DetailEnableMod = "CS2MP.Status.DetailEnableMod";
             public const string DetailPlayersOne = "CS2MP.Status.DetailPlayersOne";
             public const string DetailPlayersMany = "CS2MP.Status.DetailPlayersMany";
             public const string DetailPasswordProtected = "CS2MP.Status.DetailPasswordProtected";
             public const string DetailOpenAccess = "CS2MP.Status.DetailOpenAccess";
             public const string DetailPublic = "CS2MP.Status.DetailPublic";
+            public const string DetailContactingHost = "CS2MP.Status.DetailContactingHost";
+            public const string DetailHostPreparing = "CS2MP.Status.DetailHostPreparing";
+            public const string DetailWorldReceived = "CS2MP.Status.DetailWorldReceived";
+            public const string DetailWorldLoaded = "CS2MP.Status.DetailWorldLoaded";
+            public const string DetailPausingWorld = "CS2MP.Status.DetailPausingWorld";
+            public const string DetailSavingWorld = "CS2MP.Status.DetailSavingWorld";
+            public const string DetailSendingWorld = "CS2MP.Status.DetailSendingWorld";
+            public const string DetailWaitingForPlayer = "CS2MP.Status.DetailWaitingForPlayer";
+            public const string DetailWaitingForPlayers = "CS2MP.Status.DetailWaitingForPlayers";
+
+            // -- Friendly, actionable connection failures --
+            public const string ErrorPassword = "CS2MP.Error.Password";
+            public const string ErrorPasswordHelp = "CS2MP.Error.Password.Help";
+            public const string ErrorModVersion = "CS2MP.Error.ModVersion";
+            public const string ErrorModVersionHelp = "CS2MP.Error.ModVersion.Help";
+            public const string ErrorGameVersion = "CS2MP.Error.GameVersion";
+            public const string ErrorGameVersionHelp = "CS2MP.Error.GameVersion.Help";
+            public const string ErrorDlc = "CS2MP.Error.Dlc";
+            public const string ErrorDlcHelp = "CS2MP.Error.Dlc.Help";
+            public const string ErrorFull = "CS2MP.Error.Full";
+            public const string ErrorFullHelp = "CS2MP.Error.Full.Help";
+            public const string ErrorAddress = "CS2MP.Error.Address";
+            public const string ErrorAddressHelp = "CS2MP.Error.Address.Help";
+            public const string ErrorRefused = "CS2MP.Error.Refused";
+            public const string ErrorRefusedHelp = "CS2MP.Error.Refused.Help";
+            public const string ErrorTimeout = "CS2MP.Error.Timeout";
+            public const string ErrorTimeoutHelp = "CS2MP.Error.Timeout.Help";
+            public const string ErrorNetwork = "CS2MP.Error.Network";
+            public const string ErrorNetworkHelp = "CS2MP.Error.Network.Help";
+            public const string ErrorPortInUse = "CS2MP.Error.PortInUse";
+            public const string ErrorPortInUseHelp = "CS2MP.Error.PortInUse.Help";
+            public const string ErrorRemoved = "CS2MP.Error.Removed";
+            public const string ErrorRemovedHelp = "CS2MP.Error.Removed.Help";
+            public const string ErrorDeclined = "CS2MP.Error.Declined";
+            public const string ErrorDeclinedHelp = "CS2MP.Error.Declined.Help";
+            public const string ErrorGeneric = "CS2MP.Error.Generic";
+            public const string ErrorGenericHelp = "CS2MP.Error.Generic.Help";
+
+            // -- Connection mode --
+            public const string ConnectionRelay = "CS2MP.Connection.Relay";
+            public const string ConnectionDirect = "CS2MP.Connection.Direct";
+            public const string ConnectionMode = "CS2MP.Connection.Mode";
+            public const string JoinCode = "CS2MP.Connection.JoinCode";
+            public const string JoinCodeUnavailable = "CS2MP.Connection.JoinCodeUnavailable";
+            public const string JoinCodeHint = "CS2MP.Connection.JoinCodeHint";
+            public const string JoinCodeSelectHint = "CS2MP.Connection.JoinCodeSelectHint";
+            public const string JoinCodeEntry = "CS2MP.Connection.JoinCodeEntry";
+            public const string JoinCodeEntryHint = "CS2MP.Connection.JoinCodeEntryHint";
+            public const string RelayHint = "CS2MP.Connection.RelayHint";
+            public const string DirectHint = "CS2MP.Connection.DirectHint";
+            public const string RelayUnavailableHint = "CS2MP.Connection.RelayUnavailableHint";
 
             // -- Host tab state line --
             public const string HostLoadCityFirst = "CS2MP.Host.LoadCityFirst";

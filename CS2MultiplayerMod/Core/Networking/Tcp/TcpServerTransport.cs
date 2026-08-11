@@ -244,6 +244,35 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
             _log.Info("Host stopped.");
         }
 
+        public void ShutdownAfterFlush(int timeoutMs)
+        {
+            if (!_active) { Shutdown(); return; }
+            _active = false;
+
+            // Stop admitting new clients first: an accept completing mid-drain would add a
+            // connection nobody waits for.
+            try { _listener.Stop(); } catch { /* ignore */ }
+
+            foreach (var pair in _connections)
+                pair.Value.CloseAfterFlush("host left the session");
+
+            // Each connection removes itself from the map once its send thread has drained
+            // and closed, so an empty map is the accurate "everything went out" signal.
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
+            while (!_connections.IsEmpty && deadline.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(5);
+
+            if (!_connections.IsEmpty)
+                _log.Warn("Host stopping with " + _connections.Count +
+                          " connection(s) still draining after " + timeoutMs + " ms; closing them now.");
+
+            foreach (var pair in _connections)
+                pair.Value.Close("host shutting down");
+            _connections.Clear();
+
+            _log.Info("Host stopped.");
+        }
+
         public void Dispose() => Shutdown();
     }
 }

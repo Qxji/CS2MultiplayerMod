@@ -39,6 +39,9 @@ namespace CS2MultiplayerMod.Game.Sync.Infrastructure
             for (int i = 0; i < dead.Count; i++) _expiry.Remove(dead[i]);
         }
 
+        /// <summary>Forget every marker when a world/session boundary invalidates spatial keys.</summary>
+        public void Clear() => _expiry.Clear();
+
         /// <summary>Spatial key: prefab name + position rounded to 0.5 m buckets.</summary>
         public static string Key(string prefabName, float3 position)
         {

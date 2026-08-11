@@ -39,6 +39,11 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
 
         public string TargetPrefabName;
         public float AnchorX, AnchorY, AnchorZ;
+        public uint TargetRequiredLayers;
+        public uint TargetConnectLayers;
+        public string OwnerPrefabName;
+        public float OwnerX, OwnerY, OwnerZ;
+        public float OwnerRotX, OwnerRotY, OwnerRotZ, OwnerRotW;
 
         // Source target-edge curve. It disambiguates close parallel carriageways and crossings;
         // the anchor still permits a receiver whose equivalent road is subdivided differently.
@@ -59,6 +64,15 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
         public const ushort Id = 2;
         public const int MaxEncodedBytes = 4096;
         public const int MaxCoursesPerOperation = 1024;
+
+        /// <summary>
+        /// Shortest course that carries geometry rather than being a cursor marker. Capture and
+        /// realize must use the SAME value: a course the sender drops is a link the receiver never
+        /// hears about, and coincident course endpoints only become one node on an exact position
+        /// match - so a dropped link leaves two ends a fraction of a metre apart, looking continuous
+        /// and being two disconnected nets.
+        /// </summary>
+        public const float MinCourseLength = 0.1f;
 
         private const uint KnownCoursePosFlags = 0x7fffu;
         private const uint KnownCreationFlags = 0xfffffu;
@@ -102,7 +116,17 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             WriteCurve(w, Ax, Ay, Az, Bx, By, Bz, Cx, Cy, Cz, Dx, Dy, Dz);
             w.WriteFloat(Length);
 
-            if (!HasNativeCourse) return;
+            if (!HasNativeCourse)
+            {
+                // Elevation travels even without captured intent. An endpoint that arrives as 0 is
+                // committed as a ground net and the generator snaps its curve end to the terrain -
+                // which over water is the lakebed, not the surface the span was drawn above.
+                w.WriteFloat(Start.ElevationLeft);
+                w.WriteFloat(Start.ElevationRight);
+                w.WriteFloat(End.ElevationLeft);
+                w.WriteFloat(End.ElevationRight);
+                return;
+            }
 
             w.WriteInt(RandomSeed);
             w.WriteInt(unchecked((int)CreationFlags));
@@ -146,6 +170,13 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
                     throw new ProtocolException("Implausible fixed-net index " + FixedIndex + ".");
                 Start = ReadEndpoint(r);
                 End = ReadEndpoint(r);
+            }
+            else
+            {
+                Start.ElevationLeft = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                Start.ElevationRight = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                End.ElevationLeft = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
+                End.ElevationRight = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
             }
 
             if (r.Remaining != 0)
@@ -195,6 +226,17 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             w.WriteBool(hasTargetPrefab);
             if (hasTargetPrefab) w.WriteString(endpoint.TargetPrefabName);
             w.WriteFloat(endpoint.AnchorX); w.WriteFloat(endpoint.AnchorY); w.WriteFloat(endpoint.AnchorZ);
+            w.WriteInt(unchecked((int)endpoint.TargetRequiredLayers));
+            w.WriteInt(unchecked((int)endpoint.TargetConnectLayers));
+            bool hasOwner = !string.IsNullOrEmpty(endpoint.OwnerPrefabName);
+            w.WriteBool(hasOwner);
+            if (hasOwner)
+            {
+                w.WriteString(endpoint.OwnerPrefabName);
+                w.WriteFloat(endpoint.OwnerX); w.WriteFloat(endpoint.OwnerY); w.WriteFloat(endpoint.OwnerZ);
+                w.WriteFloat(endpoint.OwnerRotX); w.WriteFloat(endpoint.OwnerRotY);
+                w.WriteFloat(endpoint.OwnerRotZ); w.WriteFloat(endpoint.OwnerRotW);
+            }
             if (endpoint.Kind == NetEndpointTargetKind.Edge ||
                 endpoint.Kind == NetEndpointTargetKind.OwnedEdge)
                 WriteCurve(w,
@@ -217,6 +259,11 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             endpoint.RotY = ReadBounded(r, -2f, 2f, "course rotation");
             endpoint.RotZ = ReadBounded(r, -2f, 2f, "course rotation");
             endpoint.RotW = ReadBounded(r, -2f, 2f, "course rotation");
+            float rotationLengthSq = endpoint.RotX * endpoint.RotX + endpoint.RotY * endpoint.RotY +
+                                     endpoint.RotZ * endpoint.RotZ + endpoint.RotW * endpoint.RotW;
+            if (rotationLengthSq < 0.25f || rotationLengthSq > 2.25f)
+                throw new ProtocolException("Implausible course rotation length " +
+                                            rotationLengthSq + ".");
             endpoint.ElevationLeft = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
             endpoint.ElevationRight = ReadBounded(r, -100000f, 100000f, "endpoint elevation");
             endpoint.CourseDelta = ReadBounded(r, -2f, 3f, "course delta");
@@ -238,6 +285,29 @@ namespace CS2MultiplayerMod.Game.Sync.Commands
             endpoint.AnchorX = WireGuard.ReadCoordinate(r);
             endpoint.AnchorY = WireGuard.ReadCoordinate(r);
             endpoint.AnchorZ = WireGuard.ReadCoordinate(r);
+            endpoint.TargetRequiredLayers = unchecked((uint)r.ReadInt());
+            endpoint.TargetConnectLayers = unchecked((uint)r.ReadInt());
+            if (r.ReadBool())
+            {
+                endpoint.OwnerPrefabName = WireGuard.ReadName(r);
+                endpoint.OwnerX = WireGuard.ReadCoordinate(r);
+                endpoint.OwnerY = WireGuard.ReadCoordinate(r);
+                endpoint.OwnerZ = WireGuard.ReadCoordinate(r);
+                endpoint.OwnerRotX = ReadBounded(r, -2f, 2f, "connector owner rotation");
+                endpoint.OwnerRotY = ReadBounded(r, -2f, 2f, "connector owner rotation");
+                endpoint.OwnerRotZ = ReadBounded(r, -2f, 2f, "connector owner rotation");
+                endpoint.OwnerRotW = ReadBounded(r, -2f, 2f, "connector owner rotation");
+                float ownerRotationLengthSq = endpoint.OwnerRotX * endpoint.OwnerRotX +
+                    endpoint.OwnerRotY * endpoint.OwnerRotY + endpoint.OwnerRotZ * endpoint.OwnerRotZ +
+                    endpoint.OwnerRotW * endpoint.OwnerRotW;
+                if (ownerRotationLengthSq < 0.25f || ownerRotationLengthSq > 2.25f)
+                    throw new ProtocolException("Implausible connector owner rotation length " +
+                                                ownerRotationLengthSq + ".");
+            }
+            if ((endpoint.Kind == NetEndpointTargetKind.OwnedNode ||
+                 endpoint.Kind == NetEndpointTargetKind.OwnedEdge) &&
+                string.IsNullOrEmpty(endpoint.OwnerPrefabName))
+                throw new ProtocolException("Owned net target has no portable owner identity.");
             if (endpoint.Kind == NetEndpointTargetKind.Edge ||
                 endpoint.Kind == NetEndpointTargetKind.OwnedEdge)
                 ReadCurve(r,

@@ -78,6 +78,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
         // the target edge exists, the commit just couldn't run yet. Replayed first next idle cycle.
         private readonly List<NetReplaceCommand> _replayCommands = new List<NetReplaceCommand>();
 
+        // Edges named as originals by a mixed local net-tool graph whose plain courses have to use
+        // final-edge fallback. Normal replacement detection only watches prefab/direction changes;
+        // this one-frame set also makes an in-place curve update portable instead of losing it.
+        private readonly HashSet<Entity> _expectedMixedGeometryChanges = new HashSet<Entity>();
+
         // Last-seen state of each live edge entity: prefab + the full committed curve. An in-place
         // replacement keeps the edge entity, so a change of prefab IS a replacement, a swap of the
         // endpoints IS a direction flip, and a curve that GREW beyond its old span is the survivor of
@@ -193,7 +198,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             _edgeBaseline.Clear();
             _retry.Clear();
             _replayCommands.Clear();
+            _expectedMixedGeometryChanges.Clear();
             _seeded = false;
+        }
+
+        public void ExpectMixedLocalGeometryChange(Entity edge)
+        {
+            if (edge != Entity.Null) _expectedMixedGeometryChanges.Add(edge);
         }
 
         protected override void OnUpdate()
@@ -305,7 +316,22 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private void CaptureReplacements(MultiplayerSession session, long now)
         {
-            if (_updatedEdges.IsEmptyIgnoreFilter) return;
+            BuildSyncSystem buildSync = World.GetExistingSystemManaged<BuildSyncSystem>();
+            if ((buildSync != null && buildSync.NativeLifecycleCapturedThisFrame) ||
+                (_netSync != null && _netSync.DidCommitObjectGraphThisFrame))
+            {
+                // The native object graph already carries these mutations. Advance the baseline so
+                // a later unrelated Updated tag cannot rediscover them as a delayed replacement.
+                AdoptUpdatedEdges();
+                _expectedMixedGeometryChanges.Clear();
+                return;
+            }
+
+            if (_updatedEdges.IsEmptyIgnoreFilter)
+            {
+                _expectedMixedGeometryChanges.Clear();
+                return;
+            }
 
             // Two passes: detect against the UNCHANGED baselines first, then advance them all. The
             // extension test below checks whether a grown span was previously covered by a
@@ -341,8 +367,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 (Entity e, EdgeBaseline previous, Entity current, Bezier4x3 b) = changes[i];
                 bool prefabChanged = previous.Prefab != current;
                 bool reversed = IsReversed(previous, b);
+                bool expectedGeometryChange = _expectedMixedGeometryChanges.Contains(e) &&
+                                              !SameCurveBits(previous.Curve, b);
 
-                if (!prefabChanged && !reversed)
+                if (!prefabChanged && !reversed && !expectedGeometryChange)
                 {
                     // Updated for some other reason — unless the curve GREW beyond its old span,
                     // which is the survivor of a node reduction. If nothing else ever covered the
@@ -375,7 +403,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 };
                 session.SendCommand(0, NetReplaceCommand.Id, command.Encode());
                 Mod.Verbose("[MP] NetReplaceSync captured " +
-                            (prefabChanged ? "replacement -> '" + name + "'" : "direction flip of '" + name + "'") + ".");
+                            (prefabChanged ? "replacement -> '" + name + "'" :
+                             reversed ? "direction flip of '" + name + "'" :
+                             "mixed-operation geometry update of '" + name + "'") + ".");
             }
 
             // Advance every touched baseline to the committed state — whether we sent or not — so a
@@ -383,6 +413,28 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             // back. Endpoint drift from neighbouring work lands here too.
             for (int i = 0; i < changes.Count; i++)
                 _edgeBaseline[changes[i].e] = new EdgeBaseline { Prefab = changes[i].current, Curve = changes[i].b };
+            _expectedMixedGeometryChanges.Clear();
+        }
+
+        private static bool SameCurveBits(Bezier4x3 left, Bezier4x3 right)
+        {
+            return math.all(left.a == right.a) && math.all(left.b == right.b) &&
+                   math.all(left.c == right.c) && math.all(left.d == right.d);
+        }
+
+        private void AdoptUpdatedEdges()
+        {
+            if (_updatedEdges.IsEmptyIgnoreFilter) return;
+            NativeArray<Entity> entities = _updatedEdges.ToEntityArray(Allocator.Temp);
+            try
+            {
+                for (int i = 0; i < entities.Length; i++)
+                    _edgeBaseline[entities[i]] = BaselineOf(entities[i]);
+            }
+            finally
+            {
+                entities.Dispose();
+            }
         }
 
         // Shortest extension worth replicating (metres). Node snapping and neighbouring work nudge
@@ -410,11 +462,17 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             float tMin = math.min(tA, tD);
             float tMax = math.max(tA, tD);
 
-            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(0f, tMin)));
-            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(tMax, 1f)));
+            // Each piece keeps the elevation of the merged edge end it grew from - a piece that
+            // travelled as elevation 0 would be rebuilt as a ground net and snapped to the terrain.
+            Edge ends = EntityManager.GetComponentData<Edge>(edge);
+            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(0f, tMin)),
+                NodeElevation(ends.m_Start));
+            TrySendExtensionPiece(session, edge, prefab, MathUtils.Cut(now, new float2(tMax, 1f)),
+                NodeElevation(ends.m_End));
         }
 
-        private void TrySendExtensionPiece(MultiplayerSession session, Entity edge, Entity prefab, Bezier4x3 piece)
+        private void TrySendExtensionPiece(MultiplayerSession session, Entity edge, Entity prefab,
+            Bezier4x3 piece, float2 elevation)
         {
             float length = MathUtils.Length(piece);
             if (length < MinExtensionLength) return;
@@ -441,6 +499,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Cx = piece.c.x, Cy = piece.c.y, Cz = piece.c.z,
                 Dx = piece.d.x, Dy = piece.d.y, Dz = piece.d.z,
                 Length = length,
+                Start = { ElevationLeft = elevation.x, ElevationRight = elevation.y },
+                End = { ElevationLeft = elevation.x, ElevationRight = elevation.y },
             };
             session.SendCommand(0, NetPlacementCommand.Id, command.Encode());
             Mod.Verbose("[MP] NetReplaceSync: captured merged continuation of '" + name + "' (" +
