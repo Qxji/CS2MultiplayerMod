@@ -19,7 +19,17 @@ namespace CS2MultiplayerMod.Game
     {
         /// <summary>DLCs with no effect on the simulation (CS2M's verified list).</summary>
         private static readonly string[] ClientSideDlcs =
-            { "AtmosphericPianoRadio", "DeluxeRelaxRadio", "FeelgoodFunkRadio", "JadeRoadRadio" };
+            { 
+                "AtmosphericPianoRadio", 
+                "DeluxeRelaxRadio", 
+                "FeelgoodFunkRadio", 
+                "JadeRoadRadio", 
+                "CloudLoungeFMRadio", 
+                "ColdWaveRadio", 
+                "SkyrailRadio", 
+                "SoftRockRadio", 
+                "SynthAndSteelRadio"
+            };
 
         /// <summary>
         /// The owned, sync-relevant DLC names: canonical (prefix stripped), sorted
