@@ -4,6 +4,13 @@ import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
 import { Button, DialogContext, DialogStack, MenuButton } from "cs2/ui";
 import { CSSProperties, ReactNode, useContext, useEffect, useRef, useState } from "react";
+import {
+    CONNECTION_DIRECT,
+    CONNECTION_LOC,
+    CONNECTION_RELAY,
+    ConnectionDropdown,
+    JoinCodeDisplay,
+} from "mods/connection-picker";
 import { DisclaimerModal, disclaimerAccepted$ } from "mods/disclaimer";
 import { MultiplayerJoinLoadingScreen } from "mods/loading-screen";
 import { MULTIPLAYER_BLUE } from "mods/multiplayer-theme";
@@ -31,6 +38,7 @@ const LOC = {
     password: "CS2MP.UI.Password",
     join: "CS2MP.UI.Join",
     disconnect: "CS2MP.UI.Disconnect",
+    ...CONNECTION_LOC,
 };
 
 // translate() is typed string | null; this narrows it to the English fallback so
@@ -50,6 +58,12 @@ const inSession$ = bindValue<boolean>(GROUP, "inSession", false);
 // menu item. Using it keeps our Load World choice in exact lockstep with vanilla.
 const savedGames$ = bindValue<unknown[]>("menu", "saves", []);
 const multiplayerMenuActive$ = bindValue<boolean>(GROUP, "multiplayerMenuActive", false);
+const hostConnection$ = bindValue<string>(GROUP, "hostConnection", CONNECTION_RELAY);
+const joinCode$ = bindValue<string>(GROUP, "joinCode", "");
+const relayAvailable$ = bindValue<boolean>(GROUP, "relayAvailable", false);
+const relayUnavailableReason$ = bindValue<string>(GROUP, "relayUnavailableReason", "");
+const joinConnection$ = bindValue<string>(GROUP, "joinConnection", CONNECTION_RELAY);
+const joinCodeInput$ = bindValue<string>(GROUP, "joinCodeInput", "");
 
 const openMultiplayerScreen = () => trigger(GROUP, "openMultiplayerScreen");
 
@@ -264,6 +278,64 @@ const styles: Record<string, CSSProperties> = {
         padding: "10rem 28rem",
         fontSize: "17rem",
     },
+    // Connection picker sitting above the Load/Create tiles on the host screen. It
+    // shares choiceRow's geometry and the tiles' 16rem side margin so its edges line
+    // up with them exactly at any resolution.
+    connectionRail: {
+        width: "980rem",
+        maxWidth: "90%",
+        display: "flex",
+        marginBottom: "20rem",
+    },
+    connectionPanel: {
+        flex: "1 1 0%",
+        minWidth: 0,
+        margin: "0 16rem",
+        backgroundColor: MULTIPLAYER_BLUE,
+        borderRadius: "4rem",
+        padding: "16rem 20rem",
+        boxShadow: "0 10rem 28rem rgba(0, 0, 0, 0.38)",
+        pointerEvents: "auto",
+    },
+    connectionRow: {
+        display: "flex",
+        alignItems: "center",
+    },
+    connectionSpacer: {
+        height: "12rem",
+    },
+    dropdownToggle: {
+        minWidth: "260rem",
+    },
+    optionFallback: {
+        display: "block",
+        width: "100%",
+        padding: "9rem 14rem",
+        fontSize: "17rem",
+        textAlign: "left",
+    },
+    hint: {
+        fontSize: "15rem",
+        lineHeight: "1.35",
+        color: "rgba(157, 193, 222, 0.85)",
+        marginTop: "10rem",
+    },
+    hintWarning: {
+        fontSize: "15rem",
+        lineHeight: "1.35",
+        color: "#ffb454",
+        marginTop: "10rem",
+    },
+    codeInput: {
+        flex: 1,
+        fontSize: "20rem",
+        letterSpacing: "1rem",
+        color: "#ffffff",
+        backgroundColor: "rgba(0, 0, 0, 0.35)",
+        border: "1rem solid rgba(157, 193, 222, 0.35)",
+        borderRadius: "3rem",
+        padding: "9rem 12rem",
+    },
 };
 
 interface FieldProps {
@@ -340,19 +412,70 @@ const ChoiceTile = ({ focusKey, icon, label, disabled, onSelect }: ChoiceTilePro
     </Button>
 );
 
+/**
+ * Host connection picker: relay (default) or a direct port. In relay mode the code
+ * players need is shown right here, because that is the only thing they have to be
+ * given - there is no address, no port and nothing to forward.
+ */
+const ConnectionPicker = () => {
+    const t = useT();
+    const mode = useValue(hostConnection$);
+    const code = useValue(joinCode$);
+    const relayAvailable = useValue(relayAvailable$);
+    const relayReason = useValue(relayUnavailableReason$);
+
+    const relay = mode !== CONNECTION_DIRECT;
+
+    return (
+        <div style={styles.connectionRail}>
+        <div style={styles.connectionPanel} onMouseDown={(e) => e.stopPropagation()}>
+            <div style={styles.connectionRow}>
+                <div style={styles.label}>{t(LOC.mode, "Connection")}</div>
+                <ConnectionDropdown
+                    value={mode}
+                    style={styles.dropdownToggle}
+                    onChange={(value) => trigger(GROUP, "setHostConnection", value)}
+                />
+            </div>
+
+            {relay && relayAvailable && (
+                <>
+                    <div style={styles.connectionSpacer} />
+                    <div style={styles.connectionRow}>
+                        <div style={styles.label}>{t(LOC.joinCode, "Join Code")}</div>
+                        <JoinCodeDisplay code={code} style={styles.codeInput} />
+                    </div>
+                </>
+            )}
+
+            <div style={relay && !relayAvailable ? styles.hintWarning : styles.hint}>
+                {relay
+                    ? relayAvailable
+                        ? `${t(LOC.joinCodeHint, "Send this code to your friends. They pick Steam Relay on their Join screen and enter it.")} ${t(LOC.joinCodeSelectHint, "Click the code to select it, then press Ctrl+C.")}`
+                        : `${t(LOC.relayUnavailableHint, "Steam is not available right now, so relay hosting cannot start. Use a direct connection instead.")}${relayReason ? ` (${relayReason})` : ""}`
+                    : t(LOC.directHint, "Players connect to your address and port. Needs the port forwarded on your router.")}
+            </div>
+        </div>
+        </div>
+    );
+};
+
 const ChoiceScreen = ({
     focusKey,
     debugName,
     initialFocused,
+    header,
     children,
 }: {
     focusKey: string | number;
     debugName: string;
     initialFocused: string;
+    header?: ReactNode;
     children: ReactNode;
 }) => (
     <div style={styles.choiceArea}>
         <VersionWarningBanner style={styles.choiceWarning} />
+        {header}
         <AutoNavigationScope
             focusKey={focusKey}
             debugName={debugName}
@@ -396,7 +519,10 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
     const password = useValue(password$);
     const statusKind = useValue(statusKind$);
     const inSession = useValue(inSession$);
+    const joinConnection = useValue(joinConnection$);
+    const joinCodeInput = useValue(joinCodeInput$);
     const hasSavedGame = useValue(savedGames$).length > 0;
+    const joinIsRelay = joinConnection !== CONNECTION_DIRECT;
     const [view, setView] = useState<MultiplayerView>("choice");
 
     // Keep the multiplayer marker alive through the native exit animation. Once
@@ -459,16 +585,38 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
                         value={playerName}
                         onChange={(v) => trigger(GROUP, "setPlayerName", v)}
                     />
-                    <Field
-                        label={t(LOC.hostAddress, "Host Address")}
-                        value={address}
-                        onChange={(v) => trigger(GROUP, "setJoinAddress", v)}
-                    />
-                    <Field
-                        label={t(LOC.port, "Port")}
-                        value={port}
-                        onChange={(v) => trigger(GROUP, "setJoinPort", v)}
-                    />
+                    <div style={styles.row}>
+                        <div style={styles.label}>{t(LOC.mode, "Connection")}</div>
+                        <ConnectionDropdown
+                            value={joinConnection}
+                            disabled={inSession}
+                            style={styles.dropdownToggle}
+                            onChange={(v) => trigger(GROUP, "setJoinConnection", v)}
+                        />
+                    </div>
+                    {/* Relay joins carry no address or port: the code is the whole target,
+                        so asking for the other two would only be more to get wrong. */}
+                    {joinIsRelay ? (
+                        <Field
+                            label={t(LOC.joinCodeEntry, "Join Code")}
+                            value={joinCodeInput}
+                            disabled={inSession}
+                            onChange={(v) => trigger(GROUP, "setJoinCodeInput", v)}
+                        />
+                    ) : (
+                        <>
+                            <Field
+                                label={t(LOC.hostAddress, "Host Address")}
+                                value={address}
+                                onChange={(v) => trigger(GROUP, "setJoinAddress", v)}
+                            />
+                            <Field
+                                label={t(LOC.port, "Port")}
+                                value={port}
+                                onChange={(v) => trigger(GROUP, "setJoinPort", v)}
+                            />
+                        </>
+                    )}
                     <Field
                         label={t(LOC.password, "Password")}
                         secret
@@ -523,7 +671,8 @@ export const MultiplayerScreenRenderer = ({ focusKey, className, onClose }: Nati
         <ChoiceScreen
             focusKey={PAGE_INDEX.host}
             debugName="CS2MP Host World Choice"
-            initialFocused={hasSavedGame ? "load-world" : "create-world"}>
+            initialFocused={hasSavedGame ? "load-world" : "create-world"}
+            header={<ConnectionPicker />}>
             <ChoiceTile
                 focusKey="load-world"
                 icon="Media/Glyphs/Progress.svg"

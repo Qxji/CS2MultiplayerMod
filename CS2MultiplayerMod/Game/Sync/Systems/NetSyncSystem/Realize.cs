@@ -324,8 +324,50 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                         // legitimately exceed that range. The wire decoder already rejects every
                         // non-finite or globally implausible value, so preserve these values intact.
 
-                        bool alreadyBuilt = !nativePoint &&
-                                            SpanAlreadyBuilt(prefab, curve, ref liveEdgeSearch);
+                        NetPrefabInfo placedInfo = NetInfoOf(prefab);
+                        bool startExternal = HasExternalNativeTarget(command.Start.Kind);
+                        bool endExternal = HasExternalNativeTarget(command.End.Kind);
+                        bool startResolved = true, endResolved = true;
+                        Entity startTarget = Entity.Null, endTarget = Entity.Null;
+                        float startT = 0f, endT = 0f;
+                        int startKind = KindFree, endKind = KindFree;
+                        bool usedLocalSurface;
+                        if (startExternal)
+                        {
+                            startResolved = TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.Start, placedInfo,
+                                nodeEntities, nodeData, edgeEntities, edgeCurves,
+                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref heightData, ref waterData,
+                                out startTarget, out startT, out startKind,
+                                out usedLocalSurface);
+                        }
+                        if (endExternal)
+                        {
+                            endResolved = TryResolveNativeEndpointWithLocalSurface(prefab,
+                                command.End, placedInfo,
+                                nodeEntities, nodeData, edgeEntities, edgeCurves,
+                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
+                                ref heightData, ref waterData,
+                                out endTarget, out endT, out endKind,
+                                out usedLocalSurface);
+                        }
+
+                        bool resolved = startResolved && endResolved;
+                        bool topologyNeedsReplay =
+                            (startExternal && startResolved &&
+                             IsEdgeNativeTarget(command.Start.Kind) && startKind == KindSplit) ||
+                            (endExternal && endResolved &&
+                             IsEdgeNativeTarget(command.End.Kind) && endKind == KindSplit);
+                        bool geometryAlreadyBuilt = !nativePoint &&
+                                                    SpanAlreadyBuilt(prefab, curve, ref liveEdgeSearch);
+
+                        // Geometry coverage alone is not enough for a native operation. An endpoint
+                        // aimed at an edge also creates a split node. Skipping that course while the
+                        // target is still an unsplit edge leaves the next operation's Node target
+                        // unresolved even though the road pixels look identical on both machines.
+                        // External node targets must resolve as well before this is a safe no-op.
+                        bool alreadyBuilt = geometryAlreadyBuilt && resolved && !topologyNeedsReplay;
                         if (alreadyBuilt) alreadyBuiltCourses++;
                         preparedNative[i] = new PreparedNativeCourse
                         {
@@ -337,43 +379,25 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                             AlreadyBuilt = alreadyBuilt,
                         };
 
-                        // A course already present is this operation's idempotent portion. It needs
-                        // no source target, and the remaining missing courses reconcile atomically.
-                        if (alreadyBuilt) continue;
-
-                        NetPrefabInfo placedInfo = NetInfoOf(prefab);
-                        bool resolved = true;
-                        Entity resolvedTarget;
-                        float resolvedT;
-                        int resolvedKind;
-                        bool usedLocalSurface;
-                        if (HasExternalNativeTarget(command.Start.Kind))
+                        if (!alreadyBuilt)
                         {
-                            bool ok = TryResolveNativeEndpointWithLocalSurface(prefab,
-                                command.Start, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                ref heightData, ref waterData,
-                                out resolvedTarget, out resolvedT, out resolvedKind,
-                                out usedLocalSurface);
-                            resolved &= ok;
-                            if (ok && !TryClaimSplitTarget(command.Start, resolvedTarget, resolvedKind))
+                            if (startExternal && startResolved &&
+                                !TryClaimSplitTarget(command.Start, startTarget, startKind))
                                 aliasedSplitTarget = true;
-                        }
-                        if (HasExternalNativeTarget(command.End.Kind))
-                        {
-                            bool ok = TryResolveNativeEndpointWithLocalSurface(prefab,
-                                command.End, placedInfo,
-                                nodeEntities, nodeData, edgeEntities, edgeCurves,
-                                ownedNodeEntities, ownedNodeData, ownedEdgeEntities, ownedEdgeCurves,
-                                ref heightData, ref waterData,
-                                out resolvedTarget, out resolvedT, out resolvedKind,
-                                out usedLocalSurface);
-                            resolved &= ok;
-                            if (ok && !TryClaimSplitTarget(command.End, resolvedTarget, resolvedKind))
+                            if (endExternal && endResolved &&
+                                !TryClaimSplitTarget(command.End, endTarget, endKind))
                                 aliasedSplitTarget = true;
                         }
                         if (!resolved) unresolvedOperationTarget = true;
+
+                        if (geometryAlreadyBuilt && topologyNeedsReplay)
+                            Diagnostics.FlightRecorder.Note("net native topology replay op=" +
+                                command.OperationId + " course=" + command.CourseIndex);
+
+                        // A course whose geometry and endpoint topology are already present is this
+                        // operation's idempotent portion. Remaining missing courses still reconcile
+                        // atomically below.
+                        if (alreadyBuilt) continue;
                     }
 
                     if (alreadyBuiltCourses == work.Count)
@@ -879,6 +903,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private static bool HasExternalNativeTarget(NetEndpointTargetKind kind) =>
             kind == NetEndpointTargetKind.Node || kind == NetEndpointTargetKind.Edge ||
             kind == NetEndpointTargetKind.OwnedNode || kind == NetEndpointTargetKind.OwnedEdge;
+
+        private static bool IsEdgeNativeTarget(NetEndpointTargetKind kind) =>
+            kind == NetEndpointTargetKind.Edge || kind == NetEndpointTargetKind.OwnedEdge;
 
         /// <summary>
         /// Record that a resolved endpoint will split <paramref name="target"/>, and report whether

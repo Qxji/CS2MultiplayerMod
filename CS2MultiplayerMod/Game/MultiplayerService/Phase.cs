@@ -1,5 +1,6 @@
 using System;
 using Game.SceneFlow;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Core.Protocol.Messages;
 using CS2MultiplayerMod.Localization;
@@ -141,7 +142,10 @@ namespace CS2MultiplayerMod.Game
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: true);
-            _log.Info("[MP] Host requested: port=" + config.Port +
+            _log.Info("[MP] Host requested: transport=" + config.Transport +
+                      (config.Transport == TransportMode.SteamRelay
+                          ? " joinCode=" + RelayProvider.LocalJoinCode
+                          : " port=" + config.Port) +
                       " lanOnly=" + config.LanOnly +
                       " password=" + (config.Password.Length > 0 ? "SET" : "NONE") +
                       " maxPlayers=" + config.MaxPlayers +
@@ -159,7 +163,10 @@ namespace CS2MultiplayerMod.Game
             ResetCommandDiagnostics();
             _lastFault = null;
             var config = BuildConfig(settings, hosting: false);
-            _log.Info("[MP] Join requested: target=" + config.HostAddress + ":" + config.Port +
+            _log.Info("[MP] Join requested: transport=" + config.Transport +
+                      " target=" + (config.Transport == TransportMode.SteamRelay
+                          ? config.JoinCode
+                          : config.HostAddress + ":" + config.Port) +
                       " password=" + (config.Password.Length > 0 ? "SET" : "NONE") +
                       " name='" + config.PlayerName + "'" +
                       " mod=" + config.ModVersion + " game=" + config.GameVersion +
@@ -200,14 +207,23 @@ namespace CS2MultiplayerMod.Game
 
         private MultiplayerConfig BuildConfig(Setting settings, bool hosting)
         {
+            // Both sides pick their connection explicitly, so a player joining a relay
+            // host sees the same choice the host made rather than having it inferred.
+            TransportMode transport = hosting ? settings.HostTransport() : settings.JoinTransport();
+            bool relay = transport == TransportMode.SteamRelay;
+            string target = (settings.ServerAddress ?? "").Trim();
+            string joinCode = (settings.JoinCodeInput ?? "").Trim();
+
             string portText = hosting ? settings.HostPort : settings.JoinPort;
             int port;
             if (!int.TryParse((portText ?? "").Trim(), out port) || port <= 0 || port > 65535)
             {
                 // Never fall back silently: hosting on a different port than the user
                 // thinks they configured is exactly the kind of failure nobody can debug.
-                _log.Warn("[MP] Invalid " + (hosting ? "host" : "join") + " port '" + portText +
-                          "' - using default " + DefaultPort + " instead. Enter a number from 1 to 65535.");
+                // Relay sessions carry no port at all, so there is nothing to warn about.
+                if (!relay)
+                    _log.Warn("[MP] Invalid " + (hosting ? "host" : "join") + " port '" + portText +
+                              "' - using default " + DefaultPort + " instead. Enter a number from 1 to 65535.");
                 port = DefaultPort;
             }
 
@@ -233,12 +249,17 @@ namespace CS2MultiplayerMod.Game
             // crashed the host silently). Authentication is unaffected - the password
             // challenge-response never sends the password itself.
             return new MultiplayerConfig(
-                settings.PlayerName, (settings.ServerAddress ?? "").Trim(), port,
+                settings.PlayerName, target, port,
                 hosting ? settings.HostPassword : settings.JoinPassword,
-                settings.LanOnly, useEncryption: false, maxPlayers: maxPlayers,
+                // A relay session is not reachable from the network at all, so the LAN-only
+                // exposure control has nothing to restrict.
+                lanOnly: !relay && settings.LanOnly,
+                useEncryption: false, maxPlayers: maxPlayers,
                 modVersion: modVersion, gameVersion: gameVersion,
                 dlcList: dlcs,
-                requireJoinApproval: hosting && settings.RequireJoinApproval);
+                requireJoinApproval: hosting && settings.RequireJoinApproval,
+                transport: transport,
+                joinCode: relay && !hosting ? joinCode : "");
         }
 
     }

@@ -1,10 +1,13 @@
 using Colossal.IO.AssetDatabase;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
 using Game;
 using Game.Modding;
 using Game.SceneFlow;
 using Game.Settings;
+using Game.UI.Localization;
+using Game.UI.Widgets;
 
 namespace CS2MultiplayerMod
 {
@@ -30,8 +33,14 @@ namespace CS2MultiplayerMod
         public const string HostSetupGroup = "HostSetup";
         public const string HostActionGroup = "HostAction";
 
+        /// <summary>Values of <see cref="HostConnection"/>. Stored as strings so the UI binding is one plain value.</summary>
+        public const string ConnectionRelay = "relay";
+        public const string ConnectionDirect = "direct";
+
         private string _hostPort = "25001";
         private string _hostPassword = "";
+        private string _hostConnection = ConnectionRelay;
+        private string _joinConnection = ConnectionRelay;
 
         public Setting(IMod mod) : base(mod)
         {
@@ -69,6 +78,23 @@ namespace CS2MultiplayerMod
         public bool CannotStartHost()
         {
             return IsNotInGame() || !IsNotInSession();
+        }
+
+        /// <summary>Relay hosting opens no port, so the port and LAN controls do not apply.</summary>
+        public bool IsRelayHosting()
+        {
+            return HostConnection != ConnectionDirect;
+        }
+
+        public bool IsDirectHosting()
+        {
+            return !IsRelayHosting();
+        }
+
+        /// <summary>How this machine will be reached, resolved once at host/join time.</summary>
+        public TransportMode HostTransport()
+        {
+            return IsRelayHosting() ? TransportMode.SteamRelay : TransportMode.Direct;
         }
 
         // ---- General tab ------------------------------------------------------
@@ -127,7 +153,55 @@ namespace CS2MultiplayerMod
         // chosen values as soon as its selected city finishes loading. Only the
         // direct Host Session action still requires an already loaded city.
 
+        /// <summary>
+        /// Relay hosting needs no reachable port: Steam carries the traffic and players
+        /// join with the code below. Direct hosting is the original path and still needs
+        /// a forwarded port (or a LAN).
+        /// </summary>
+        [SettingsUIDropdown(typeof(Setting), nameof(GetHostConnectionValues))]
+        [SettingsUISection(HostTab, HostSetupGroup)]
+        [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
+        public string HostConnection
+        {
+            get { return _hostConnection; }
+            set
+            {
+                if (IsInSession()) return;
+                _hostConnection = value == ConnectionDirect ? ConnectionDirect : ConnectionRelay;
+            }
+        }
+
+        public static DropdownItem<string>[] GetHostConnectionValues()
+        {
+            return new[]
+            {
+                new DropdownItem<string>
+                {
+                    value = ConnectionRelay,
+                    displayName = LocalizedString.Value(L10n.T(L10n.Key.ConnectionRelay)),
+                },
+                new DropdownItem<string>
+                {
+                    value = ConnectionDirect,
+                    displayName = LocalizedString.Value(L10n.T(L10n.Key.ConnectionDirect)),
+                },
+            };
+        }
+
+        /// <summary>The code players type on their Join screen. Relay hosting only.</summary>
+        [SettingsUIHideByCondition(typeof(Setting), nameof(IsDirectHosting))]
+        [SettingsUISection(HostTab, HostSetupGroup)]
+        public string HostJoinCode
+        {
+            get
+            {
+                string code = RelayProvider.LocalJoinCode;
+                return string.IsNullOrEmpty(code) ? L10n.T(L10n.Key.JoinCodeUnavailable) : code;
+            }
+        }
+
         [SettingsUITextInput]
+        [SettingsUIHideByCondition(typeof(Setting), nameof(IsRelayHosting))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         [SettingsUIDisableByCondition(typeof(Setting), nameof(IsHosting))]
         public string HostPort
@@ -153,6 +227,7 @@ namespace CS2MultiplayerMod
             }
         }
 
+        [SettingsUIHideByCondition(typeof(Setting), nameof(IsRelayHosting))]
         [SettingsUISection(HostTab, HostSetupGroup)]
         public bool LanOnly { get; set; } = false;
 
@@ -200,11 +275,56 @@ namespace CS2MultiplayerMod
         // stay visible in the main menu and are only disabled mid-session.
 
         [SettingsUITextInput]
+        [SettingsUIHideByCondition(typeof(Setting), nameof(JoinIsRelay))]
         [SettingsUISection(JoinTab, JoinSetupGroup)]
         [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
         public string ServerAddress { get; set; } = "127.0.0.1";
 
+        /// <summary>
+        /// A join code addresses the host through the relay, so no address or port is
+        /// involved. Chosen explicitly rather than guessed from what was typed: the
+        /// joining player should see the same choice the host made.
+        /// </summary>
+        public bool JoinIsRelay()
+        {
+            return JoinConnection != ConnectionDirect;
+        }
+
+        public bool JoinIsDirect()
+        {
+            return !JoinIsRelay();
+        }
+
+        public TransportMode JoinTransport()
+        {
+            return JoinIsRelay() ? TransportMode.SteamRelay : TransportMode.Direct;
+        }
+
+        [SettingsUIDropdown(typeof(Setting), nameof(GetHostConnectionValues))]
+        [SettingsUISection(JoinTab, JoinSetupGroup)]
+        [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
+        public string JoinConnection
+        {
+            get { return _joinConnection; }
+            set
+            {
+                if (IsInSession()) return;
+                _joinConnection = value == ConnectionDirect ? ConnectionDirect : ConnectionRelay;
+            }
+        }
+
+        /// <summary>
+        /// The host's join code. Kept apart from <see cref="ServerAddress"/> so switching
+        /// between relay and direct does not overwrite whichever one is not in use.
+        /// </summary>
         [SettingsUITextInput]
+        [SettingsUIHideByCondition(typeof(Setting), nameof(JoinIsDirect))]
+        [SettingsUISection(JoinTab, JoinSetupGroup)]
+        [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
+        public string JoinCodeInput { get; set; } = "";
+
+        [SettingsUITextInput]
+        [SettingsUIHideByCondition(typeof(Setting), nameof(JoinIsRelay))]
         [SettingsUISection(JoinTab, JoinSetupGroup)]
         [SettingsUIDisableByCondition(typeof(Setting), nameof(IsInSession))]
         public string JoinPort { get; set; } = "25001";
@@ -248,6 +368,9 @@ namespace CS2MultiplayerMod
             VerboseLogging = false;
             PlayerName = "Player";
             ServerAddress = "127.0.0.1";
+            HostConnection = ConnectionRelay;
+            JoinConnection = ConnectionRelay;
+            JoinCodeInput = "";
             HostPort = "25001";
             JoinPort = "25001";
             HostPassword = "";

@@ -280,6 +280,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         // course committed by the next Apply frame. Capturing here preserves target/split/elevation
         // intent that no longer exists on the final Created edges.
         private readonly List<NetPlacementCommand> _cachedLocalCourses = new List<NetPlacementCommand>();
+        // A mixed placement/modify graph cannot use the native placement envelope as-is. Remember
+        // the live edges named by its rejected definitions until the actual Apply pulse; if they
+        // survive as Updated-only geometry, NetReplaceSync carries that half of the operation while
+        // CaptureNewEdges carries the newly created half.
+        private readonly List<Entity> _cachedFallbackOriginalEdges = new List<Entity>();
+        private bool _cachedNeedsFinalEdgeFallback;
+        private int _finalEdgeFallbackCapturedFrame = -1;
         private long _nextLocalNetOperationId = 1;
         private int _nativeApplyCapturedFrame = -1;
 
@@ -587,6 +594,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _remoteDeferred.Clear();
             _deferredSpanPieces.Clear();
             _cachedLocalCourses.Clear();
+            _cachedFallbackOriginalEdges.Clear();
+            _cachedNeedsFinalEdgeFallback = false;
+            _finalEdgeFallbackCapturedFrame = -1;
             _committedNetSideEffects.Clear();
             _nativeTargetDeadlines.Clear();
             _operationAssemblyDeadlines.Clear();

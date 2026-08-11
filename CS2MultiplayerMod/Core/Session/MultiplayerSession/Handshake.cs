@@ -106,8 +106,8 @@ namespace CS2MultiplayerMod.Core.Session
             // DLC preconditions (idea from CS2M): differing DLC ownership means
             // differing prefab catalogues — a placement of a DLC building would desync
             // or crash the other side. Both lists are canonical (sorted, client-side
-            // content excluded); either side sending an empty list means "unknown",
-            // and the check is skipped rather than locking such a build out.
+            // content excluded). Empty is a valid set (no content DLC), not a wildcard:
+            // accepting a client with six DLCs into a zero-DLC host still desynchronizes.
             string dlcMismatch = DescribeDlcMismatch(_config.DlcList, request.DlcList);
             if (dlcMismatch != null)
             {
@@ -237,15 +237,15 @@ namespace CS2MultiplayerMod.Core.Session
         }
 
         /// <summary>
-        /// Compare host and client DLC sets. Returns null when compatible (or when
-        /// either side could not produce a list), otherwise a human-readable summary
+        /// Compare host and client DLC sets. Returns null when compatible; otherwise
+        /// returns a human-readable summary
         /// naming exactly what differs - so the rejected player knows what to change
         /// instead of staring at a generic "incompatible" error.
         /// </summary>
         internal static string DescribeDlcMismatch(string[] hostDlcs, string[] clientDlcs)
         {
-            if (hostDlcs == null || hostDlcs.Length == 0 || clientDlcs == null || clientDlcs.Length == 0)
-                return null; // one side has no data — don't lock it out
+            if (hostDlcs == null) hostDlcs = Array.Empty<string>();
+            if (clientDlcs == null) clientDlcs = Array.Empty<string>();
 
             var host = new HashSet<string>(hostDlcs, StringComparer.Ordinal);
             var client = new HashSet<string>(clientDlcs, StringComparer.Ordinal);

@@ -1,4 +1,5 @@
 using System;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
 
@@ -66,8 +67,33 @@ namespace CS2MultiplayerMod.Game
         {
             get
             {
+                // A relay session has no exposure to describe: nothing on this machine is
+                // reachable, so the useful line is the code players need instead.
+                if (_session.UsesRelay && _session.Role == SessionRole.Host)
+                    return L10n.F(L10n.Key.ExposureRelay, RelayProvider.LocalJoinCode);
+                if (_session.UsesRelay && _session.Role == SessionRole.Client)
+                    return L10n.T(L10n.Key.ExposureRelayClient);
                 if (_session.Role == SessionRole.Host)
-                    return L10n.T(_session.PublicExposure ? L10n.Key.ExposureInternet : L10n.Key.ExposureLan);
+                {
+                    if (!_session.PublicExposure) return L10n.T(L10n.Key.ExposureLan);
+
+                    // A public host's real question is not "am I public" but "can anyone
+                    // actually reach me", which is what the router just answered.
+                    switch (_session.PortForwardStatus)
+                    {
+                        case Core.Networking.PortForwardState.Working:
+                            return L10n.T(L10n.Key.ExposureForwarding);
+                        case Core.Networking.PortForwardState.Open:
+                            return _session.PortForwardAddress != null
+                                ? L10n.F(L10n.Key.ExposureForwardedAt,
+                                         _session.PortForwardAddress + ":" + _session.Port)
+                                : L10n.T(L10n.Key.ExposureForwarded);
+                        case Core.Networking.PortForwardState.NoRouter:
+                        case Core.Networking.PortForwardState.Refused:
+                            return L10n.F(L10n.Key.ExposureForwardManually, _session.Port);
+                    }
+                    return L10n.T(L10n.Key.ExposureInternet);
+                }
                 if (_session.Role == SessionRole.Client) return L10n.T(L10n.Key.ConnectedToHost);
                 return L10n.T(L10n.Key.NoSession);
             }

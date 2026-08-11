@@ -1,5 +1,6 @@
 using Colossal.Serialization.Entities;
 using Colossal.UI.Binding;
+using CS2MultiplayerMod.Core.Networking;
 using CS2MultiplayerMod.Core.Session;
 using CS2MultiplayerMod.Localization;
 using Game;
@@ -142,6 +143,27 @@ namespace CS2MultiplayerMod.Game
             AddUpdateBinding(new GetterValueBinding<bool>(Group, "canHost",
                 () => Mod.Setting != null && !Mod.Setting.CannotStartHost() && MultiplayerService.ModEnabled));
 
+            // Connection mode: "relay" (default) or "direct". The join code is what a
+            // relay host hands out instead of an address and port.
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "hostConnection",
+                () => Mod.Setting != null ? Mod.Setting.HostConnection : Setting.ConnectionRelay));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "joinCode",
+                () => RelayProvider.LocalJoinCode));
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "relayAvailable",
+                () => RelayProvider.IsAvailable));
+            // What the running session actually uses, as opposed to what is configured
+            // for the next one.
+            AddUpdateBinding(new GetterValueBinding<bool>(Group, "sessionUsesRelay",
+                () => Mod.Service != null && Mod.Service.Session.UsesRelay));
+            // Empty while the relay is usable, otherwise why it is not.
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "relayUnavailableReason",
+                () => RelayProvider.IsAvailable ? "" : RelayProvider.UnavailableReason ?? ""));
+            // The joining player's own choice, and the code they will dial with.
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "joinConnection",
+                () => Mod.Setting != null ? Mod.Setting.JoinConnection : Setting.ConnectionRelay));
+            AddUpdateBinding(new GetterValueBinding<string>(Group, "joinCodeInput",
+                () => Mod.Setting != null ? Mod.Setting.JoinCodeInput : ""));
+
             AddUpdateBinding(new GetterValueBinding<string>(Group, "hostPort",
                 () => Mod.Setting != null ? Mod.Setting.HostPort : "25001"));
             AddUpdateBinding(new GetterValueBinding<string>(Group, "hostPassword",
@@ -157,6 +179,15 @@ namespace CS2MultiplayerMod.Game
 
             // Host setup edits. HostPort/HostPassword setters already refuse changes
             // mid-session inside Setting, so no extra guarding here.
+            AddBinding(new TriggerBinding<string>(Group, "setHostConnection",
+                value =>
+                {
+                    if (Mod.Setting == null) return;
+                    Mod.Setting.HostConnection = value;
+                    // Persist immediately: the host flow leaves this screen for the game's
+                    // world picker and only reads the setting back once that world is up.
+                    Mod.Setting.ApplyAndSave();
+                }));
             AddBinding(new TriggerBinding<string>(Group, "setHostPort",
                 value => { if (Mod.Setting != null) Mod.Setting.HostPort = value; }));
             AddBinding(new TriggerBinding<string>(Group, "setHostPassword",
@@ -199,6 +230,10 @@ namespace CS2MultiplayerMod.Game
             // Field edits: written straight into Setting (persisted on Join).
             AddBinding(new TriggerBinding<string>(Group, "setPlayerName",
                 value => { if (Mod.Setting != null) Mod.Setting.PlayerName = value; }));
+            AddBinding(new TriggerBinding<string>(Group, "setJoinConnection",
+                value => { if (Mod.Setting != null) Mod.Setting.JoinConnection = value; }));
+            AddBinding(new TriggerBinding<string>(Group, "setJoinCodeInput",
+                value => { if (Mod.Setting != null) Mod.Setting.JoinCodeInput = value; }));
             AddBinding(new TriggerBinding<string>(Group, "setJoinAddress",
                 value => { if (Mod.Setting != null) Mod.Setting.ServerAddress = value; }));
             AddBinding(new TriggerBinding<string>(Group, "setJoinPort",

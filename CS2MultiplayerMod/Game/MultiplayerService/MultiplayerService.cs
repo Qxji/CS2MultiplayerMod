@@ -236,7 +236,12 @@ namespace CS2MultiplayerMod.Game
                               _phase == ClientWorldPhase.WaitingForMap ||
                               _phase == ClientWorldPhase.LoadingMap ||
                               _phase == ClientWorldPhase.WaitingForResume;
-            if (recovering || now - _lastAutoRecoveryMs < AutoRecoveryCooldownMs)
+            // Guard the sentinel before subtracting it. `now - long.MinValue` wraps negative in
+            // unchecked arithmetic, which otherwise makes the first automatic recovery look as if
+            // it were inside the cooldown forever.
+            bool coolingDown = _lastAutoRecoveryMs != long.MinValue &&
+                               now - _lastAutoRecoveryMs < AutoRecoveryCooldownMs;
+            if (recovering || coolingDown)
             {
                 _log.Warn("[MP] Suppressed automatic world recovery (" + reason +
                           "): a recovery is already in progress or within the cooldown. The offending " +

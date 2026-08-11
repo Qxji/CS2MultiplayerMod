@@ -10,13 +10,9 @@
 		Play Cities: Skylines II together.
 
 		CS2 Multiplayer is a client-server multiplayer mod that allows multiple players to build and manage the same city in real time.
-
 		The mod is currently experimental. Please back up your saves and expect bugs, missing features or crashes while development continues.
-
 		To host a game, start a multiplayer world, optionally protect it with a password, and share your IP address with your friends.
-
 		If you encounter any issues or have feedback, our Discord server ( https://discord.gg/KFZTW2YSJt ) is the preferred place to get support and report bugs.
-
 		This project is not affiliated with, endorsed by, or sponsored by Colossal Order, Paradox Interactive, or Iceflake Studio.	
 	</LongDescription>
 	<!--Thumbnail-->
@@ -31,7 +27,7 @@
 	<!--Link to the forum post where the mod can be discussed-->
 	<ForumLink Value="" />
 	<!--Version of the mod-->
-	<ModVersion Value="0.1.4.1" />
+	<ModVersion Value="0.1.5" />
 	<!--Recommended version of the base game to use the mod-->
 	<GameVersion Value="1.6.*" />
 	<!--Dependency for the mod, can be set multiple times-->

@@ -45,6 +45,11 @@
         <Reference Include="Colossal.PSI.Common">
             <Private>false</Private>
         </Reference>
+        <!--Steamworks.NET, shipped with the game. Used only for the relay transport, and
+        only after a runtime probe: builds without it fall back to direct connections.-->
+        <Reference Include="com.rlabrecque.steamworks.net">
+            <Private>false</Private>
+        </Reference>
         <Reference Include="Unity.InputSystem">
             <Private>false</Private>
         </Reference>

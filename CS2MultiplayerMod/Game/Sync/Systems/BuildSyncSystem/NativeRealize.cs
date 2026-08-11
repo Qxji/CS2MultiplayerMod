@@ -368,6 +368,15 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 return NativeObjectResult.Rejected;
             }
 
+            // Permanent is local definition execution policy, not portable operation intent. New
+            // senders remove it during capture; normalize again here so an older or hostile peer
+            // cannot bypass the isolated Temp/apply/drain transaction or turn a resolvable command
+            // into an impossible ten-second retry.
+            int normalizedPermanentFlags = NormalizeRemoteObjectCreationFlags(command);
+            if (normalizedPermanentFlags > 0)
+                Diagnostics.FlightRecorder.Note("object operation normalized permanent flags=" +
+                                                  normalizedPermanentFlags);
+
             string unsafePrefab;
             if (TryFindUnsafeSimulationReference(command, out unsafePrefab))
             {
@@ -463,6 +472,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 " isolateMS=" + (generateStartTick - isolateStartTick) +
                 " generateMS=" + (System.Environment.TickCount - generateStartTick));
             return NativeObjectResult.Armed;
+        }
+
+        private static int NormalizeRemoteObjectCreationFlags(ObjectToolOperationCommand command)
+        {
+            int normalized = 0;
+            if (command == null || command.Definitions == null) return normalized;
+
+            for (int i = 0; i < command.Definitions.Length; i++)
+            {
+                ObjectToolDefinitionIntent definition = command.Definitions[i];
+                if (definition == null) continue;
+                CreationFlags flags = (CreationFlags)definition.CreationFlags;
+                if ((flags & CreationFlags.Permanent) == 0) continue;
+                definition.CreationFlags = (uint)(flags & ~CreationFlags.Permanent);
+                normalized++;
+            }
+
+            return normalized;
         }
 
         /// <summary>
@@ -884,11 +911,6 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
             {
                 ObjectToolDefinitionIntent definition = command.Definitions[i];
                 var target = new ResolvedObjectDefinition();
-                if (((CreationFlags)definition.CreationFlags & CreationFlags.Permanent) != 0)
-                {
-                    reason = "remote native definitions may not bypass transaction apply";
-                    return false;
-                }
                 if (!definition.PrefabIsNull &&
                     !_prefabIndex.TryResolve(definition.PrefabName,
                         candidate => ValidateDefinitionPrefab(definition.Kind, candidate),
@@ -1016,7 +1038,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 m_Original = resolved.Original,
                 m_Owner = resolved.Owner,
                 m_Attached = resolved.Attached,
-                m_Flags = (CreationFlags)source.CreationFlags,
+                // Defense in depth: remote definitions always enter through the coordinator's
+                // isolated transaction, even if a future caller skips the decode normalization.
+                m_Flags = (CreationFlags)source.CreationFlags & ~CreationFlags.Permanent,
                 m_RandomSeed = source.RandomSeed,
             });
             if (source.HasOwnerDefinition)

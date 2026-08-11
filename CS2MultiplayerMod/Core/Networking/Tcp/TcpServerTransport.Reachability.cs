@@ -33,9 +33,10 @@ namespace CS2MultiplayerMod.Core.Networking.Tcp
                     : "Could not find any local network address - is this machine connected to a network?");
 
                 if (!lanOnly)
-                    _log.Info("Players on the internet need your PUBLIC IP (ask a 'what is my IP' site) and TCP port " +
-                              port + " forwarded on your router to this machine, allowed through the Windows Firewall. " +
-                              "If their connect attempt times out, the port forward or a firewall is the problem.");
+                    _log.Info("Players on the internet need your PUBLIC IP and TCP port " + port +
+                              " reaching this machine through the Windows Firewall. The router is being asked " +
+                              "to forward it automatically - see the [upnp] lines below for whether it agreed. " +
+                              "If it did not, forward the port by hand or host over the Steam relay instead.");
             }
             catch (Exception ex)
             {

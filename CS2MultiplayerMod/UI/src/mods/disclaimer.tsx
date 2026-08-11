@@ -1,5 +1,5 @@
 import { bindValue, trigger, useValue } from "cs2/api";
-import { InputActionBarrier } from "cs2/input";
+import { AutoNavigationScope, InputActionBarrier, NavigationDirection } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { Button, Portal } from "cs2/ui";
 import { CSSProperties } from "react";
@@ -83,33 +83,40 @@ export const DisclaimerModal = ({ onAccept, onDecline }: {
     return (
         <Portal>
             <InputActionBarrier>
-                <div style={styles.overlay} onMouseDown={(e) => e.stopPropagation()}>
-                    <div style={styles.panel}>
-                        <div style={styles.title}>{t(LOC.title, "Before You Continue")}</div>
-                        <div style={styles.body}>
-                            {t(LOC.body,
-                                "Multiplayer is experimental beta software, provided for free \"as is\". " +
-                                "Only host or join sessions with people you trust. By continuing you accept " +
-                                "that you use this mod at your own risk and that the author is not liable for " +
-                                "any damage, data loss, or other issues arising from its use, except where " +
-                                "liability cannot be excluded by law.")}
-                        </div>
-                        <div style={styles.buttons}>
-                            <Button
-                                variant="primary"
-                                style={styles.button}
-                                onSelect={() => {
-                                    trigger(GROUP, "acceptDisclaimer");
-                                    onAccept();
-                                }}>
-                                {t(LOC.accept, "I Understand, Continue")}
-                            </Button>
-                            <Button variant="flat" style={styles.button} onSelect={onDecline}>
-                                {t(LOC.decline, "Cancel")}
-                            </Button>
+                <AutoNavigationScope
+                    debugName="CS2MP Disclaimer"
+                    direction={NavigationDirection.Horizontal}
+                    initialFocused="continue"
+                    allowLooping>
+                    <div style={styles.overlay} onMouseDown={(e) => e.stopPropagation()}>
+                        <div style={styles.panel}>
+                            <div style={styles.title}>{t(LOC.title, "Before You Continue")}</div>
+                            <div style={styles.body}>
+                                {t(LOC.body,
+                                    "Multiplayer is experimental beta software, provided for free \"as is\". " +
+                                    "Only host or join sessions with people you trust. By continuing you accept " +
+                                    "that you use this mod at your own risk and that the author is not liable for " +
+                                    "any damage, data loss, or other issues arising from its use, except where " +
+                                    "liability cannot be excluded by law.")}
+                            </div>
+                            <div style={styles.buttons}>
+                                <Button
+                                    variant="primary"
+                                    focusKey="continue"
+                                    style={styles.button}
+                                    onSelect={() => {
+                                        trigger(GROUP, "acceptDisclaimer");
+                                        onAccept();
+                                    }}>
+                                    {t(LOC.accept, "I Understand, Continue")}
+                                </Button>
+                                <Button focusKey="cancel" variant="flat" style={styles.button} onSelect={onDecline}>
+                                    {t(LOC.decline, "Cancel")}
+                                </Button>
+                            </div>
                         </div>
                     </div>
-                </div>
+                </AutoNavigationScope>
             </InputActionBarrier>
         </Portal>
     );
