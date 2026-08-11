@@ -38,7 +38,7 @@ There is two ways to host: **Steam Relay**, which is suited for everyone who own
 
 ### Direct Connection
 
-[Learn how to play via Direct Connection]() (recommended for local play and best performance)
+[Learn how to play via Direct Connection](help/direct_connection.md) (recommended for local play and best performance)
 
 ## Joining a game
 
