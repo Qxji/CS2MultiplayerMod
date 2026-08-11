@@ -22,6 +22,10 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
         private const int MaxRecentLocalObjectOperations = 32;
         private const long RecentLocalObjectOperationLifetimeMs = 5000;
+        private const float StrictCommittedRootMatchDistanceSq = 0.0001f;
+        private const float AttachedCommittedRootMatchRadiusSq = 64f;
+        private const float AttachedCommittedRootMatchHeight = 20f;
+        private const float StrictCommittedRootRotationDot = 0.99999f;
 
         private ObjectToolOperationCommand _cachedLocalObjectOperation;
         private readonly List<RecentLocalObjectOperation> _recentLocalObjectOperations =
@@ -691,15 +695,31 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
 
             float3 expectedPosition = new float3(root.Object.PosX, root.Object.PosY,
                 root.Object.PosZ);
-            // Generation copies the definition transform verbatim and ApplyObjectsSystem does not
-            // rewrite it for a new entity. Keep this tight so proximity is never the identity.
-            if (math.distancesq(expectedPosition, transform.m_Position) > 0.0001f)
-                return false;
+
+            // Ordinary objects preserve the definition transform verbatim. Road-attached objects
+            // are different: the attachment pass snaps and rotates the committed root after the
+            // definition was sampled. Prefab + random seed still provide the operation identity;
+            // bounded horizontal/vertical checks prevent an unrelated attachment from claiming it
+            // after a seed reuse while still allowing terrain and elevated-road height correction.
+            if (HasAttachedCommitIntent(root))
+                return math.distancesq(expectedPosition.xz, transform.m_Position.xz) <=
+                           AttachedCommittedRootMatchRadiusSq &&
+                       math.abs(expectedPosition.y - transform.m_Position.y) <=
+                           AttachedCommittedRootMatchHeight;
+
+            if (math.distancesq(expectedPosition, transform.m_Position) >
+                StrictCommittedRootMatchDistanceSq) return false;
 
             float4 expectedRotation = new float4(root.Object.RotX, root.Object.RotY,
                 root.Object.RotZ, root.Object.RotW);
-            return math.abs(math.dot(expectedRotation, transform.m_Rotation.value)) >= 0.99999f;
+            return math.abs(math.dot(expectedRotation, transform.m_Rotation.value)) >=
+                   StrictCommittedRootRotationDot;
         }
+
+        private static bool HasAttachedCommitIntent(ObjectToolDefinitionIntent root) =>
+            root.Attached.Kind != PortableEntityKind.None ||
+            !string.IsNullOrEmpty(root.AttachedPrefabName) ||
+            ((CreationFlags)root.CreationFlags & CreationFlags.Attach) != 0;
 
         private void NoteCommittedObjectGraphMiss(List<Entity> created)
         {
@@ -727,6 +747,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 seed = EntityManager.GetComponentData<PseudoRandomSeed>(entity).m_Seed.ToString();
 
             string newest = "none";
+            string matchingIdentity = string.Empty;
             if (_recentLocalObjectOperations.Count > 0)
             {
                 ObjectToolDefinitionIntent root;
@@ -734,10 +755,43 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                         _recentLocalObjectOperations[_recentLocalObjectOperations.Count - 1].Operation,
                         out root))
                     newest = root.PrefabName + "/" + unchecked((ushort)root.RandomSeed);
+
+                if (EntityManager.Exists(entity) &&
+                    EntityManager.HasComponent<global::Game.Objects.Transform>(entity) &&
+                    EntityManager.HasComponent<PseudoRandomSeed>(entity))
+                {
+                    ushort committedSeed = unchecked((ushort)
+                        EntityManager.GetComponentData<PseudoRandomSeed>(entity).m_Seed);
+                    global::Game.Objects.Transform committedTransform =
+                        EntityManager.GetComponentData<global::Game.Objects.Transform>(entity);
+                    for (int i = _recentLocalObjectOperations.Count - 1; i >= 0; i--)
+                    {
+                        if (!TryGetNewCommittedObjectRoot(
+                                _recentLocalObjectOperations[i].Operation, out root) ||
+                            !string.Equals(root.PrefabName, prefabName,
+                                System.StringComparison.Ordinal) ||
+                            unchecked((ushort)root.RandomSeed) != committedSeed)
+                            continue;
+
+                        float3 expected = new float3(root.Object.PosX, root.Object.PosY,
+                            root.Object.PosZ);
+                        float4 expectedRotation = new float4(root.Object.RotX,
+                            root.Object.RotY, root.Object.RotZ, root.Object.RotW);
+                        matchingIdentity = " identityCandidate[attached=" +
+                            HasAttachedCommitIntent(root) + " horizontalDelta=" +
+                            math.distance(expected.xz, committedTransform.m_Position.xz)
+                                .ToString("0.000") + "m heightDelta=" +
+                            math.abs(expected.y - committedTransform.m_Position.y)
+                                .ToString("0.000") + "m rotationDot=" +
+                            math.abs(math.dot(expectedRotation,
+                                committedTransform.m_Rotation.value)).ToString("0.00000") + "]";
+                        break;
+                    }
+                }
             }
             Diagnostics.FlightRecorder.Note("object graph match missed prefab=" + prefabName +
                 " seed=" + seed + " recent=" + _recentLocalObjectOperations.Count +
-                " newest=" + newest);
+                " newest=" + newest + matchingIdentity);
         }
 
         private bool TryBeginSpecializedAreaCapture(Entity recreate)
@@ -1380,7 +1434,11 @@ namespace CS2MultiplayerMod.Game.Sync.Systems
                 Kind = isObject ? ObjectToolDefinitionKind.Object :
                     isNet ? ObjectToolDefinitionKind.NetCourse : ObjectToolDefinitionKind.Area,
                 PrefabIsNull = creation.m_Prefab == Entity.Null,
-                CreationFlags = (uint)creation.m_Flags,
+                // Permanent is an execution-policy bit for definitions that are consumed on this
+                // machine without ToolOutputSystem's transaction. It is not object intent. Sending
+                // it made the receiver refuse the whole native batch because remote work must pass
+                // through the isolated Temp/apply/drain lifecycle.
+                CreationFlags = (uint)(creation.m_Flags & ~CreationFlags.Permanent),
                 RandomSeed = creation.m_RandomSeed,
             };
             if (creation.m_Prefab != Entity.Null &&

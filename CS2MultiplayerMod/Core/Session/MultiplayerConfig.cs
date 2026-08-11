@@ -55,9 +55,9 @@ namespace CS2MultiplayerMod.Core.Session
         public readonly string GameVersion;
 
         /// <summary>
-        /// Canonical (sorted) DLC names this machine owns. Compared as set during
-        /// handshake - differing DLCs mean differing prefab catalogues, desync. Empty
-        /// means "unknown/don't check", skipping validation for unknown DLC enumerations.
+        /// Canonical (sorted) DLC names this machine owns. Compared as a complete set
+        /// during the handshake because differing DLCs mean differing prefab catalogues.
+        /// An empty array is a real set: this machine owns no sync-relevant DLC.
         /// </summary>
         public readonly string[] DlcList;
 

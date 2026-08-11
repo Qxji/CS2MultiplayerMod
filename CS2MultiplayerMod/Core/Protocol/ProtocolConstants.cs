@@ -4,7 +4,11 @@ namespace CS2MultiplayerMod.Core.Protocol
     {
         /// <summary>
         /// Wire-format version. Bump when message layout changes to refuse handshake on mismatch.
-        /// Current v33 carries each endpoint's committed elevation on a geometry-only net placement,
+        /// Current v34 normalizes the sender-local Permanent creation flag out of native object
+        /// transactions, so every peer commits the batch through the same isolated apply lifecycle
+        /// instead of retrying an impossible condition and dropping the edit. It also treats an
+        /// empty DLC set as "owns no DLC", not as a compatibility wildcard. v33 carries each
+        /// endpoint's committed elevation on a geometry-only net placement,
         /// so a span replayed without captured tool intent keeps the height it was built at instead
         /// of being re-derived against the receiver's surface (over water: the lakebed).
         /// v32 sends a stamped intersection as the inputs its tool had - asset-stamp prefab,
@@ -52,7 +56,7 @@ namespace CS2MultiplayerMod.Core.Protocol
         /// islands) reattach on the receiver.
         /// See <see cref="Messages.HandshakeRequest"/> and version notes in doc/internals.
         /// </summary>
-        public const int ProtocolVersion = 33;
+        public const int ProtocolVersion = 34;
 
         /// <summary>
         /// Hard cap on a single payload, guarding against corrupt length prefixes.

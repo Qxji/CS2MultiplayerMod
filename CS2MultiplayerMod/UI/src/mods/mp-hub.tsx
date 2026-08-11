@@ -1,5 +1,5 @@
 import { bindValue, trigger, useValue } from "cs2/api";
-import { InputActionBarrier } from "cs2/input";
+import { AutoNavigationScope, InputActionBarrier, NavigationDirection } from "cs2/input";
 import { useLocalization } from "cs2/l10n";
 import { getModule } from "cs2/modding";
 import { Button, Portal, Tooltip } from "cs2/ui";
@@ -506,7 +506,7 @@ const styles: Record<string, CSSProperties> = {
     },
     sectionHeader: {
         display: "flex",
-        alignItems: "baseline",
+        alignItems: "center",
         justifyContent: "space-between",
         marginBottom: "5rem",
         color: "#9dc1de",
@@ -1100,6 +1100,11 @@ const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
     return (
         <Portal>
             <InputActionBarrier>
+                <AutoNavigationScope
+                    debugName="CS2MP Save World Copy"
+                    direction={NavigationDirection.Both}
+                    initialFocused={saved ? "close" : "save-copy"}
+                    allowLooping>
                 <div
                     style={styles.saveDialogOverlay}
                     onMouseDown={(event) => event.stopPropagation()}>
@@ -1142,13 +1147,14 @@ const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
                         </div>
                         <div style={styles.saveDialogButtons}>
                             {saved ? (
-                                <Button variant="primary" style={styles.saveDialogButton} onSelect={onClose}>
+                                <Button focusKey="close" variant="primary" style={styles.saveDialogButton} onSelect={onClose}>
                                     {t(LOC.close, "Close")}
                                 </Button>
                             ) : (
                                 <>
                                     <Button
                                         variant="primary"
+                                        focusKey="save-copy"
                                         style={styles.saveDialogButton}
                                         disabled={!canSave || saving || !draft.trim()}
                                         onSelect={submit}>
@@ -1158,6 +1164,7 @@ const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
                                     </Button>
                                     <Button
                                         variant="flat"
+                                        focusKey="cancel"
                                         style={styles.saveDialogButton}
                                         disabled={saving}
                                         onSelect={onClose}>
@@ -1168,6 +1175,7 @@ const ClientWorldSaveDialog = ({ onClose }: { onClose: () => void }) => {
                         </div>
                     </div>
                 </div>
+                </AutoNavigationScope>
             </InputActionBarrier>
         </Portal>
     );
@@ -1464,26 +1472,34 @@ const JoinRequestModal = () => {
             <div style={styles.joinAnchor}>
                 {pending.map((join) => (
                     <InputActionBarrier key={join.id}>
-                        <div style={styles.joinCard} onMouseDown={(e) => e.stopPropagation()}>
-                            <div style={styles.joinCardTitle}>{t(LOC.joinRequestTitle, "Join Request")}</div>
-                            <div style={styles.joinCardBody}>
-                                {t(LOC.joinRequestBody, "{0} wants to join your session.").replace("{0}", join.name)}
+                        <AutoNavigationScope
+                            debugName="CS2MP Join Request"
+                            direction={NavigationDirection.Horizontal}
+                            initialFocused="accept"
+                            allowLooping>
+                            <div style={styles.joinCard} onMouseDown={(e) => e.stopPropagation()}>
+                                <div style={styles.joinCardTitle}>{t(LOC.joinRequestTitle, "Join Request")}</div>
+                                <div style={styles.joinCardBody}>
+                                    {t(LOC.joinRequestBody, "{0} wants to join your session.").replace("{0}", join.name)}
+                                </div>
+                                <div style={styles.joinCardButtons}>
+                                    <Button
+                                        variant="primary"
+                                        focusKey="accept"
+                                        style={styles.joinCardButton}
+                                        onSelect={() => trigger(GROUP, "approveJoin", join.id)}>
+                                        {t(LOC.accept, "Accept")}
+                                    </Button>
+                                    <Button
+                                        variant="flat"
+                                        focusKey="decline"
+                                        style={styles.joinCardButton}
+                                        onSelect={() => trigger(GROUP, "declineJoin", join.id)}>
+                                        {t(LOC.decline, "Decline")}
+                                    </Button>
+                                </div>
                             </div>
-                            <div style={styles.joinCardButtons}>
-                                <Button
-                                    variant="primary"
-                                    style={styles.joinCardButton}
-                                    onSelect={() => trigger(GROUP, "approveJoin", join.id)}>
-                                    {t(LOC.accept, "Accept")}
-                                </Button>
-                                <Button
-                                    variant="flat"
-                                    style={styles.joinCardButton}
-                                    onSelect={() => trigger(GROUP, "declineJoin", join.id)}>
-                                    {t(LOC.decline, "Decline")}
-                                </Button>
-                            </div>
-                        </div>
+                        </AutoNavigationScope>
                     </InputActionBarrier>
                 ))}
             </div>

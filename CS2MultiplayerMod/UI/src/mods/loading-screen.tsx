@@ -184,7 +184,7 @@ const styles: Record<string, CSSProperties> = {
     barHeader: {
         display: "flex",
         justifyContent: "space-between",
-        alignItems: "baseline",
+        alignItems: "center",
         marginBottom: "8rem",
     },
     phase: {

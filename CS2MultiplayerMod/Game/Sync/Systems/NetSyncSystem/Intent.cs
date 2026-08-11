@@ -33,6 +33,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             if (!(active is global::Game.Tools.NetToolSystem))
             {
                 _cachedLocalCourses.Clear();
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
                 return;
             }
 
@@ -43,6 +45,8 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 .HasNewTopLevelObjectRoot(EntityManager, definitions))
             {
                 _cachedLocalCourses.Clear();
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
                 return;
             }
 
@@ -56,6 +60,7 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             // so the missing courses would never reach the other machines at all.
             string rejection = null;
             int rejected = 0;
+            var rejectedOriginalEdges = new List<Entity>();
             for (int i = 0; i < definitions.Length; i++)
             {
                 Entity entity = definitions[i];
@@ -68,6 +73,13 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                 {
                     rejected++;
                     rejection = rejection ?? "reference an original/owner or use a non-placement mode";
+                    Entity original = definition.m_Original;
+                    if (original != Entity.Null && EntityManager.Exists(original) &&
+                        EntityManager.HasComponent<Edge>(original) &&
+                        EntityManager.HasComponent<Curve>(original) &&
+                        EntityManager.HasComponent<PrefabRef>(original) &&
+                        !rejectedOriginalEdges.Contains(original))
+                        rejectedOriginalEdges.Add(original);
                     continue;
                 }
 
@@ -111,14 +123,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
             _cachedLocalCourses.Clear();
             if (rejection == null)
             {
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
                 _cachedLocalCourses.AddRange(next);
                 return;
             }
 
+            _cachedFallbackOriginalEdges.Clear();
+            _cachedFallbackOriginalEdges.AddRange(rejectedOriginalEdges);
+            _cachedNeedsFinalEdgeFallback = true;
+
             Mod.log.Warn("[MP] NetSync: local net operation cannot be replayed as one atomic apply (" +
                          rejected + " of " + (rejected + next.Count) + " courses " + rejection +
                          "); falling back to final-edge capture, which rebuilds it segment by segment " +
-                         "on the other machines.");
+                         "on the other machines" +
+                         (_cachedFallbackOriginalEdges.Count > 0
+                             ? "; " + _cachedFallbackOriginalEdges.Count +
+                               " Updated-only original edge(s) will use replacement capture."
+                             : "."));
             Diagnostics.FlightRecorder.Note("net native capture voided rejected=" + rejected + "/" +
                                               (rejected + next.Count));
         }
@@ -147,7 +169,9 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
         private void CaptureLocalNetApply(bool refreshStandingDefinitions, bool barrierRecovery)
         {
             MultiplayerService service = Mod.Service;
-            if (service == null || !service.GameplaySyncReady || _nativeApplyCapturedFrame == _realizeFrame)
+            if (service == null || !service.GameplaySyncReady ||
+                _nativeApplyCapturedFrame == _realizeFrame ||
+                _finalEdgeFallbackCapturedFrame == _realizeFrame)
                 return;
 
             global::Game.Tools.ToolBaseSystem active = _toolSystem != null ? _toolSystem.activeTool : null;
@@ -173,7 +197,24 @@ namespace CS2MultiplayerMod.Game.Sync.Systems.Net
                     definitions.Dispose();
                 }
             }
-            if (_cachedLocalCourses.Count == 0) return;
+            if (_cachedLocalCourses.Count == 0)
+            {
+                if (!_cachedNeedsFinalEdgeFallback) return;
+
+                global::CS2MultiplayerMod.Game.Sync.Systems.NetReplaceSyncSystem replaceSync =
+                    World.GetOrCreateSystemManaged<
+                        global::CS2MultiplayerMod.Game.Sync.Systems.NetReplaceSyncSystem>();
+                for (int i = 0; i < _cachedFallbackOriginalEdges.Count; i++)
+                    replaceSync.ExpectMixedLocalGeometryChange(_cachedFallbackOriginalEdges[i]);
+
+                Diagnostics.FlightRecorder.Note("net mixed fallback armed originals=" +
+                                                  _cachedFallbackOriginalEdges.Count +
+                                                  (barrierRecovery ? " source=barrier" : string.Empty));
+                _cachedFallbackOriginalEdges.Clear();
+                _cachedNeedsFinalEdgeFallback = false;
+                _finalEdgeFallbackCapturedFrame = _realizeFrame;
+                return;
+            }
 
             // When a remote batch is armed, BeginRealizeFrame has already Disabled its Temps and
             // restored the local preview for this Apply frame. The local operation therefore commits
