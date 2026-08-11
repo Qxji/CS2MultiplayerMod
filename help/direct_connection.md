@@ -14,7 +14,7 @@ For playing with friends that are not connected to your local network, you need 
 2. Find out your IP Address ([Link](https://api.ipify.org/))
 3. Share the IP Address and the port you forwarded with your friends.
 
-**Issues? Check [Troubleshooting](help/forwarding_troubleshoot.md).**
+**Issues? Check [Troubleshooting](/help/forwarding_troubleshoot.md).**
 
 ---
 
