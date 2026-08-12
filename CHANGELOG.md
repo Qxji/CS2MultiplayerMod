@@ -4,7 +4,9 @@ Newest Changelog and developments on Discord: https://discord.gg/KFZTW2YSJt
 
 ## V 0.1.5h2
 Hotfix V0.1.5h2
+
 - Fixed mod not loading for non steam players
+
 Make sure you update to the latest version of the mod and have fun! 🎉
 
 ## V 0.1.5h1
