@@ -37,7 +37,7 @@ Further troubleshooting:
 
 ### Host
 
-Make sure that you have set up port forwarding. [Learn how to set up port forwarding.](/help/forwarding.md).
+Make sure that you have set up port forwarding. [Learn how to set up port forwarding](/help/forwarding.md).
 
 [Issues with Port Forwarding?](/help/forwarding_troubleshoot.md)
 
